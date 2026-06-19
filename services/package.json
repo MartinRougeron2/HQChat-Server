@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "ioredis": "^5.8.2",
+    "stripe": "^20.1.0"
+  },
+  "devDependencies": {
+    "@types/ioredis": "^4.28.10",
+    "@types/stripe": "^8.0.416"
+  }
+}
