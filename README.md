@@ -28,7 +28,7 @@ server (no federation yet). Run your own server and it's a self-contained networ
 
 ## Configure
 
-Copy `../../deploy/.env.example` to `.env` and fill it in. Key settings:
+Copy `deploy/.env.example` to `.env` and fill it in. Key settings:
 
 - `ADMISSION_POLICY` — `open` (default), `allowlist`, or `stripe`.
   - `open`: anyone who passes HQC auth. Best for self-hosting.
