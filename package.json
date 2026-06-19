@@ -7,7 +7,8 @@
     "start": "tsx server.ts",
     "bot": "tsx bot/bot.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "test:e2e": "node --import tsx --test test/e2e.test.ts"
   },
   "repository": {
     "type": "git",

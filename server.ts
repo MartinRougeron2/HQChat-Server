@@ -144,6 +144,55 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  if (req.url && req.url.startsWith("/account")) {
+    if (req.method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "text/html",
+        "X-Content-Type-Options": "nosniff",
+        "Access-Control-Allow-Origin": "*",
+      });
+      return res.end(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>DissQus — Account</title>
+</head>
+<body>
+  <h1>DissQus — Account</h1>
+  <p>Welcome to your DissQus account!</p>
+  <div>
+    <p>Input your subscription code below to see your subscription status:</p>
+    <form id="subscription-form">
+      <input type="text" id="subscription-code" name="subscription-code" placeholder="Enter your subscription code" required>
+      <button type="submit">Check Subscription</button>
+    </form>
+  </div>
+</body>
+</html>`);
+    }
+    if (req.method === "POST") {
+      const url = new URL(req.url || "/", "http://localhost");
+
+      let code = url.searchParams.get("code") || "";
+      if (!code) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        return res.end("Missing subscription code");
+      }
+      const blindedPk = code.trim().toLowerCase();
+      req.on("end", async () => {
+        const customerId = await StripeService.getCustomerId(blindedPk);
+        if (!customerId) {
+          res.writeHead(404, { "Content-Type": "text/plain" });
+          return res.end("Subscription not found");
+        }
+        const customerPageUrl = await StripeService.getCustomerPageUrl(customerId);
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        return res.end(customerPageUrl);
+      });
+    }
+  }
+
+
   res.writeHead(404);
   res.end();
 });
@@ -271,7 +320,7 @@ const Handlers = {
     // Validate the public key shape BEFORE any expensive work — pkHex is
     // attacker-controlled and gets passed to HQC and (after auth) Stripe.
     if (!/^[0-9a-fA-F]+$/.test(pkHex) ||
-        pkHex.length !== HQC_CONSTANTS.PUBLIC_KEY_BYTES * 2) {
+      pkHex.length !== HQC_CONSTANTS.PUBLIC_KEY_BYTES * 2) {
       return ws.close();
     }
 
@@ -655,7 +704,7 @@ const Handlers = {
 
     // Heal older friendships that only stored a blind hash, so presence works
     // on the next reconnect (fire-and-forget — must not delay the message).
-    DB.ensureFriendLink(ws.auth.publicKey!, targetPk).catch(() => {});
+    DB.ensureFriendLink(ws.auth.publicKey!, targetPk).catch(() => { });
 
     const envelope = {
       type: MessageTypesToReceive.DIRECT_MESSAGE,
@@ -703,7 +752,7 @@ const Handlers = {
       ws.send(JSON.stringify({ type: MessageTypesToReceive.ERROR, payload: "NOT_FRIENDS" }));
       return;
     }
-    DB.ensureFriendLink(ws.auth.publicKey!, targetPk).catch(() => {});
+    DB.ensureFriendLink(ws.auth.publicKey!, targetPk).catch(() => { });
 
     const envelope = {
       type: MessageTypesToReceive.IMAGE_MESSAGE,
@@ -1034,8 +1083,7 @@ const Handlers = {
       ws.mediaRelayCount = (ws.mediaRelayCount || 0) + 1;
       if (ws.mediaRelayCount <= 3 || ws.mediaRelayCount % 100 === 0) {
         console.log(
-          `🔀 [${sender}→${targetUsername}] relay CALL_MEDIA_CHUNK #${ws.mediaRelayCount} (${
-            typeof payload === "string" ? payload.length : "?"
+          `🔀 [${sender}→${targetUsername}] relay CALL_MEDIA_CHUNK #${ws.mediaRelayCount} (${typeof payload === "string" ? payload.length : "?"
           } chars)`
         );
       }

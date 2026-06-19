@@ -6,11 +6,17 @@ require('dotenv').config();
 // default localhost connection for local development.
 const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : new Redis();
 
+const usernamesBlacklist = new Set([
+  'admin', 'administrator', 'root', 'system', 'support', 'help', 'contact',
+  'info', 'security', 'test', 'tester', 'bot', 'moderator', 'mod',
+  'staff', 'team', 'owner', 'founder'
+]);
+
 export const DB = {
   // ============================================================
   // 1. IDENTITY & USER MANAGEMENT
   // ============================================================
-  
+
   async createUser(pk: string, username: string) {
     const isTaken = await redis.sismember('usernames:taken', username);
     if (isTaken) throw new Error(`Username '${username}' is already taken.`);
@@ -45,7 +51,7 @@ export const DB = {
    * Optional: Retrieves a directory of users (Username + PK)
    * Useful for a "User Discovery" feature.
    */
-  async getUserDirectory(): Promise<{username: string, pk: string}[]> {
+  async getUserDirectory(): Promise<{ username: string, pk: string }[]> {
     const usernames = await this.getAllUsernames();
     if (usernames.length === 0) return [];
 
@@ -70,6 +76,16 @@ export const DB = {
   },
 
   async setUsername(pk: string, newUsername: string) {
+    // check new username 
+    if (!newUsername || newUsername.length < 3 || newUsername.length > 32) {
+      throw new Error("Username must be between 3 and 32 characters.");
+    }
+    if (!/^[a-zA-Z0-9_]+$/.test(newUsername)) {
+      throw new Error("Username can only contain letters, numbers, and underscores.");
+    }
+    if (usernamesBlacklist.has(newUsername.toLowerCase())) {
+      throw new Error("This username is not allowed.");
+    }
     // Who currently owns this name (if anyone)?
     const currentOwner = await this.getPkByUsername(newUsername);
 
@@ -114,7 +130,7 @@ export const DB = {
     const tier = await redis.hget(`user:${pk}`, 'tier');
     return tier || 'free';
   },
-  
+
   async getStripeId(pk: string): Promise<string | null> {
     return await redis.hget(`user:${pk}`, 'stripe_customer_id');
   },
@@ -137,14 +153,14 @@ export const DB = {
   async getMyInvites(myPk: string) {
     const raw = await redis.hgetall(`invites:${myPk}`);
     const enriched = [];
-    
+
     for (const [senderPk, timestamp] of Object.entries(raw)) {
-        const username = await this.getUsername(senderPk);
-        enriched.push({
-            pk: senderPk,
-            username: username || "Unknown",
-            sent_at: parseInt(timestamp)
-        });
+      const username = await this.getUsername(senderPk);
+      enriched.push({
+        pk: senderPk,
+        username: username || "Unknown",
+        sent_at: parseInt(timestamp)
+      });
     }
     return enriched;
   },
@@ -164,7 +180,7 @@ export const DB = {
     pipeline.sadd(`friends:${myPk}`, fromPk);
     pipeline.sadd(`friends:${fromPk}`, myPk);
     pipeline.hdel(`invites:${myPk}`, fromPk);
-    
+
     const results = await pipeline.exec();
     return !!results;
   },
@@ -178,9 +194,9 @@ export const DB = {
     const usernames = await pipeline.exec();
 
     return friendPks.map((pk, index) => {
-        //@ts-ignore
-        const username = usernames ? usernames[index][1] : null;
-        return { pk, username: (username as string) || 'Anonymous' };
+      //@ts-ignore
+      const username = usernames ? usernames[index][1] : null;
+      return { pk, username: (username as string) || 'Anonymous' };
     });
   },
 
@@ -200,11 +216,11 @@ export const DB = {
     const pipeline = redis.pipeline();
     pipeline.srem(`friends:${fromPk}`, toPk);
     pipeline.srem(`friends:${toPk}`, fromPk);
-    
+
     // Also remove the friendship hash
     const hash = this.getFriendshipHash(fromPk, toPk);
     pipeline.del(`friendship:${hash}`);
-    
+
     const results = await pipeline.exec();
     return !!results;
   },

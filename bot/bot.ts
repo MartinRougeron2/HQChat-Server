@@ -86,7 +86,7 @@ function send(obj: object) {
 
 function connect() {
   console.log(`🤖 [bot] connecting to ${WS_URL} as "${USERNAME}"`);
-  console.log(`🤖 [bot] public key: ${pkHex}|  (add full key to EXEMPT_PUBLIC_KEYS)`);
+  console.log(`🤖 [bot] public key: ${pkHex.substring(0, 8)}…${pkHex.substring(pkHex.length - 8)}`);
   txKey = null;
   rxKey = null;
   ws = new WebSocket(WS_URL);
