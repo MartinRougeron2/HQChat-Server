@@ -15,6 +15,8 @@
  * EXEMPT_PUBLIC_KEYS so it skips the Stripe gate.
  */
 
+// First import: loads .env and resolves *_FILE Docker secrets (e.g. BOT_SEED_FILE).
+import "../lib/config";
 import WebSocket from "ws";
 import * as fs from "fs";
 import * as path from "path";

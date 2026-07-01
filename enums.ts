@@ -24,7 +24,8 @@ enum MessageTypesToSent {
     CALL_ACCEPT = 'call_accept',
     CALL_REJECT = 'call_reject',
     CALL_END = 'call_end',
-    CALL_MEDIA_CHUNK = 'call_media_chunk'
+    CALL_MEDIA_CHUNK = 'call_media_chunk',
+    DELETE_ACCOUNT = 'delete_account' // user-initiated, irreversible server-side purge
 }
 
 enum MessageTypesToReceive {
@@ -71,7 +72,8 @@ enum MessageTypesToReceive {
     USER_ONLINE = 'user_online',
     USER_OFFLINE = 'user_offline',
     ERROR = 'error',
-    HEARTBEAT_PING = 'heartbeat_ping'
+    HEARTBEAT_PING = 'heartbeat_ping',
+    ACCOUNT_DELETED = 'account_deleted' // confirmation that the server purged the account
 }
 
 /**

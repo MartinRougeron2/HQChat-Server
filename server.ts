@@ -1,11 +1,16 @@
+// Must be first: loads .env, resolves *_FILE Docker secrets, and prepares
+// process.env before any service module reads it (assertConfig is called below).
+import { assertConfig } from "./lib/config";
 import { WebSocketServer, WebSocket } from "ws";
 import * as http from "http";
 import * as crypto from "crypto";
 import { HqcWrapper, HQC_CONSTANTS } from "./lib/hqc";
 import { DB } from "./services/db/api"; // See DB changes below
 import { StripeService } from "./services/stripe/api";
+import { StoreKitService } from "./services/storekit/api";
 import { ApnsService } from "./services/apns/api";
 import { handleSubscribe } from "./services/web/subscribe";
+import { blindedPk } from "./lib/crypto-utils";
 import { MessageTypesToSent, MessageTypesToReceive } from "./enums";
 import {
   aesEncrypt,
@@ -70,6 +75,10 @@ async function checkAdmission(pkHex: string): Promise<Admission> {
 
   switch (ADMISSION_POLICY) {
     case "stripe": {
+      // A StoreKit (iOS in-app purchase) OR a Stripe (web/macOS) subscription
+      // both count as paid. Check the cheap StoreKit flag first so a verified
+      // App Store subscriber isn't gated by the Stripe lookup.
+      if (await DB.isStoreKitPremium(blindedPk(pkHex))) return { ok: true };
       const sub = await StripeService.syncAndGetStatus(pkHex);
       return sub.active ? { ok: true } : { ok: false, reason: "payment", checkoutUrl: sub.checkoutUrl };
     }
@@ -139,6 +148,27 @@ const httpServer = http.createServer((req, res) => {
       if (!res.headersSent) {
         res.writeHead(500);
         res.end("error");
+      }
+    });
+    return;
+  }
+
+  // StoreKit (iOS in-app purchase) receipt verification. The app POSTs the
+  // signed App Store transaction; we verify it with Apple, bind it to the pk,
+  // and flip the account to premium. Then the app reconnects and is admitted.
+  if (req.method === "POST" && req.url === "/storekit/verify") {
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      try {
+        const { pk, transaction } = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        const active = await StoreKitService.verifyAndApply(transaction, pk);
+        res.writeHead(active ? 200 : 402, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ active }));
+      } catch (e: any) {
+        console.error(`❌ [storekit] ${e.message}`);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
       }
     });
     return;
@@ -1108,6 +1138,29 @@ const Handlers = {
     await DB.setPushToken(ws.auth.publicKey, platform, token);
     console.log(`🔔 [${ws.auth.username || "?"}] push token registered (${platform})`);
   },
+
+  /** Irreversibly delete the caller's account (App Store Guideline 5.1.1(v)).
+   *  Purges all server-side data, tells online friends we've gone offline,
+   *  confirms, and closes the socket. Local device data is wiped by the client. */
+  async onDeleteAccount(ws: ChatSocket) {
+    const pk = ws.auth.publicKey;
+    if (!pk) return;
+    const username = ws.auth.username;
+    console.log(`🗑️  [${username || pk.substring(0, 8)}] DELETE_ACCOUNT`);
+
+    // Announce offline to friends BEFORE the friend set is purged.
+    if (username) {
+      await broadcastPresence(pk, username, false).catch(() => {});
+    }
+
+    // Stop routing to this socket, then purge everything we store.
+    if (username) onlineUsers.delete(username);
+    onlinePks.delete(pk);
+    await DB.deleteUser(pk);
+
+    ws.send(JSON.stringify({ type: MessageTypesToReceive.ACCOUNT_DELETED }));
+    ws.close();
+  },
 };
 
 // --- SERVER LOOP ---
@@ -1233,6 +1286,9 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
         case MessageTypesToSent.REGISTER_PUSH_TOKEN:
           await Handlers.onRegisterPushToken(socket, msg.payload);
           break;
+        case MessageTypesToSent.DELETE_ACCOUNT:
+          await Handlers.onDeleteAccount(socket);
+          break;
       }
     } catch (e) {
       console.error(e);
@@ -1282,6 +1338,7 @@ const heartbeat = setInterval(() => {
 
 wss.on("close", () => clearInterval(heartbeat));
 
+assertConfig();
 httpServer.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT} — WS at /ws, Stripe webhook at /stripe/webhook`);
 });

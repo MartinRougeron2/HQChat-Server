@@ -1,15 +1,33 @@
 import Redis from 'ioredis';
-import { friendshipHash } from '../../lib/crypto-utils';
+import { friendshipHash, blindedPk } from '../../lib/crypto-utils';
 require('dotenv').config();
 
 // Use REDIS_URL when provided (production, with password); fall back to a
 // default localhost connection for local development.
-const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : new Redis();
+//
+// lazyConnect: don't open a socket until the first command is issued. Importing
+// this module (e.g. from a unit test with no Redis running) then does NOT dial
+// Redis — which avoids ioredis' "Unhandled error event" reconnect spam and an
+// open handle that keeps the test process alive. The server/bot issue commands,
+// which connect on demand.
+const redisOptions = { lazyConnect: true } as const;
+const redis = process.env.REDIS_URL
+  ? new Redis(process.env.REDIS_URL, redisOptions)
+  : new Redis(redisOptions);
+
+// Attach an error listener so a connection problem is logged as one line rather
+// than surfacing as Node's noisy "Unhandled error event" (which only fires when
+// no 'error' listener is registered). With lazyConnect this stays silent in
+// tests that never touch Redis.
+redis.on('error', (err) => console.error(`[redis] ${err.message}`));
 
 const usernamesBlacklist = new Set([
   'admin', 'administrator', 'root', 'system', 'support', 'help', 'contact',
   'info', 'security', 'test', 'tester', 'bot', 'moderator', 'mod',
-  'staff', 'team', 'owner', 'founder'
+  'staff', 'team', 'owner', 'founder',
+  // The helper bot's handle — the server auto-friends it to every user, so it
+  // must not be reclaimable by a normal account (would hijack that routing).
+  'helper', 'dissqus'
 ]);
 
 export const DB = {
@@ -43,27 +61,11 @@ export const DB = {
     return await redis.get(`username:${username}`);
   },
 
-  async getAllUsernames(): Promise<string[]> {
-    return await redis.smembers('usernames:taken');
-  },
-
-  /**
-   * Optional: Retrieves a directory of users (Username + PK)
-   * Useful for a "User Discovery" feature.
-   */
-  async getUserDirectory(): Promise<{ username: string, pk: string }[]> {
-    const usernames = await this.getAllUsernames();
-    if (usernames.length === 0) return [];
-
-    const pipeline = redis.pipeline();
-    usernames.forEach(name => pipeline.get(`username:${name}`));
-    const pks = await pipeline.exec();
-
-    return usernames.map((name, i) => ({
-      username: name,
-      pk: (pks?.[i]?.[1] as string) || 'unknown'
-    }));
-  },
+  // NOTE: the bulk user directory (getUserDirectory / getAllUsernames) was
+  // removed. Returning every username + pk to any authenticated user was a
+  // social-graph enumeration leak, and pk → SHA-256(pk) → billing/linking code
+  // (M3). Discovery is now exact-username lookup only (getPkByUsername), used by
+  // the GET_ALL_USERS handler in server.ts.
 
   /**
    * Helper used by the server to handle inputs that could be either a PK or Username
@@ -93,11 +95,17 @@ export const DB = {
     // (previously this threw "Username taken." against your own pk).
     if (currentOwner === pk) return;
 
-    // Reclaim: if a *different* pk holds the name, transfer it to the requester.
-    // The origin is trusted (testing), so this lets a client whose identity
-    // changed — notably the helper bot after its seed/keypair was regenerated —
-    // take its name back instead of being stuck in a "Username taken." loop.
+    // A name owned by a *different* pk may NOT be transferred — blindly handing
+    // it over let any authenticated user take over (impersonate) another user or
+    // the helper bot (H3). The only exception is an explicitly allowlisted key:
+    // the helper bot legitimately needs to reclaim its handle after a seed/keypair
+    // regeneration. Everything else is refused.
     if (currentOwner && currentOwner !== pk) {
+      const botKeys = (process.env.BOT_PUBLIC_KEY || '')
+        .split(',').map((s) => s.trim()).filter(Boolean);
+      if (!botKeys.includes(pk)) {
+        throw new Error('USERNAME_TAKEN');
+      }
       await redis.hdel(`user:${currentOwner}`, 'username');
     }
 
@@ -112,6 +120,46 @@ export const DB = {
       pipeline.del(`username:${oldUsername}`);
       pipeline.srem('usernames:taken', oldUsername);
     }
+    await pipeline.exec();
+  },
+
+  /**
+   * Permanently delete a user and everything we store about them — used by the
+   * in-app "Delete Account" flow (App Store Guideline 5.1.1(v)). Removes the
+   * identity record, frees the username, tears down both sides of every
+   * friendship (friend sets + blind hashes), and drops invites, the offline
+   * queue, and the push token. The tier record is keyed by the blinded pk, so
+   * we clear that too. End-to-end message content lives only on devices, so
+   * this purges the user's entire server-side footprint.
+   */
+  async deleteUser(pk: string): Promise<void> {
+    const username = await this.getUsername(pk);
+    const friendPks = await redis.smembers(`friends:${pk}`);
+
+    const pipeline = redis.pipeline();
+
+    // Free the username binding + reservation.
+    if (username) {
+      pipeline.del(`username:${username}`);
+      pipeline.srem('usernames:taken', username);
+    }
+
+    // Tear down each friendship from BOTH sides (set link + blind hash).
+    for (const friendPk of friendPks) {
+      pipeline.srem(`friends:${friendPk}`, pk);
+      pipeline.del(`friendship:${friendshipHash(pk, friendPk)}`);
+    }
+
+    // Drop everything keyed by this pk.
+    pipeline.del(`friends:${pk}`);
+    pipeline.del(`invites:${pk}`);
+    pipeline.del(`pending:${pk}`);
+    pipeline.del(`push:${pk}`);
+    pipeline.del(`user:${pk}`);
+    // Subscription/tier is stored under the blinded pk.
+    pipeline.del(`user:${blindedPk(pk)}`);
+    pipeline.del(`storekit:${blindedPk(pk)}`);
+
     await pipeline.exec();
   },
 
@@ -133,6 +181,29 @@ export const DB = {
 
   async getStripeId(pk: string): Promise<string | null> {
     return await redis.hget(`user:${pk}`, 'stripe_customer_id');
+  },
+
+  /**
+   * Record a verified StoreKit (App Store) subscription for the blinded pk.
+   * Stored as a key with a TTL set to the subscription's expiry so it lapses
+   * automatically if no renewal/refresh arrives. `expiresMs = 0` clears it.
+   * Kept separate from the Stripe `tier` so the two payment paths don't clobber
+   * each other in checkAdmission.
+   */
+  async setStoreKitPremium(blindedPk: string, expiresMs: number) {
+    const key = `storekit:${blindedPk}`;
+    if (!expiresMs || expiresMs <= Date.now()) {
+      await redis.del(key);
+      return;
+    }
+    const ttl = Math.ceil((expiresMs - Date.now()) / 1000);
+    // Small grace window so a brief renewal gap doesn't lock the user out.
+    await redis.set(key, String(expiresMs), 'EX', ttl + 86_400);
+  },
+
+  /** Whether the blinded pk has an active StoreKit subscription on record. */
+  async isStoreKitPremium(blindedPk: string): Promise<boolean> {
+    return (await redis.exists(`storekit:${blindedPk}`)) === 1;
   },
 
   // ============================================================

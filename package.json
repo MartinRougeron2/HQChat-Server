@@ -17,19 +17,21 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "crypto": "^1.0.1",
     "dotenv": "^17.2.3",
     "ioredis": "^5.4.1",
     "koffi": "^2.15.0",
     "stripe": "^17.5.0",
+    "tsx": "^4.21.0",
     "ws": "^8.18.3"
+  },
+  "optionalDependencies": {
+    "@apple/app-store-server-library": "^1.4.0"
   },
   "devDependencies": {
     "@types/ffi-napi": "^4.0.10",
     "@types/node": "^25.0.3",
     "@types/ref-napi": "^3.0.12",
     "@types/ws": "^8.18.1",
-    "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }
 }
