@@ -1,6 +1,11 @@
 // Must be first: loads .env, resolves *_FILE Docker secrets, and prepares
 // process.env before any service module reads it (assertConfig is called below).
 import { assertConfig } from "./lib/config";
+// Second: init Sentry + global crash handlers before anything else can throw.
+import { initObservability } from "./lib/observability";
+initObservability("server");
+import { logger } from "./lib/logger";
+import { healthMonitor } from "./lib/health-monitor";
 import { WebSocketServer, WebSocket } from "ws";
 import * as http from "http";
 import * as crypto from "crypto";
@@ -16,8 +21,8 @@ import {
   aesEncrypt,
   unwrap,
   deriveSessionKeys,
-  freshSessionSeed,
-  hqcEncryptSeed,
+  encapsulateSession,
+  authProof,
 } from "./lib/secure-transport";
 
 // --- TYPES ---
@@ -25,7 +30,10 @@ interface AuthState {
   step: "INIT" | "CHALLENGE_SENT" | "AUTHENTICATED";
   publicKey?: string;
   username?: string; // Cache username after auth/set
-  expectedNonce?: Buffer | undefined;
+  // KEM auth (§KM-1): the proof we expect the client to return — HKDF(ss,"auth")
+  // where ss is the shared secret only the sk-holder can decapsulate. We never
+  // send ss or any decrypted plaintext, so there is no decryption oracle.
+  expectedProof?: Buffer | undefined;
   // Per-connection transport-encryption keys (per direction). Once set (right
   // after auth), outgoing frames are AES-GCM encrypted with txKey (s2c) and
   // incoming frames decrypted with rxKey (c2s). See deriveSessionKeys.
@@ -73,6 +81,16 @@ async function checkAdmission(pkHex: string): Promise<Admission> {
     .split(",").map((s) => s.trim()).filter(Boolean);
   if (exempt.includes(pkHex)) return { ok: true };
 
+  // Self-registered exemptions (the helper bot writes its own pk on startup; see
+  // messages/bot/bot.ts). Survives the bot's identity/seed changing without any
+  // operator editing EXEMPT_PUBLIC_KEYS. Best-effort: a Redis blip here must not
+  // hard-fail admission for paying users, so fall through to the policy check.
+  try {
+    if (await DB.isAdmissionExempt(pkHex)) return { ok: true };
+  } catch (e: any) {
+    logger.error(`[admission] exempt-set lookup failed: ${e.message}`);
+  }
+
   switch (ADMISSION_POLICY) {
     case "stripe": {
       // A StoreKit (iOS in-app purchase) OR a Stripe (web/macOS) subscription
@@ -98,6 +116,46 @@ const httpServer = http.createServer((req, res) => {
     return res.end("ok");
   }
 
+  // Crash early-warning metrics. Returns the same snapshot the alerting uses, so
+  // the stress test (and any external monitor) can read the leading indicators
+  // — event-loop lag, rss, ws clients, active handles, and Redis query latency
+  // (p50/p99/max + slowest ops) — and tune thresholds.
+  // Optional bearer guard: set METRICS_TOKEN to require ?token= / Authorization.
+  if (req.method === "GET" && req.url && req.url.startsWith("/metrics")) {
+    const token = process.env.METRICS_TOKEN; // resolved from METRICS_TOKEN_FILE by config.ts
+    // Fail closed in production (SRV-2): /metrics leaks health/vitals topology,
+    // so an unauthenticated prod endpoint is refused rather than served. nginx
+    // does not proxy /metrics (localhost:8080 only), but this is defence in depth
+    // for any future exposure. Set METRICS_TOKEN(_FILE) to enable authenticated
+    // scraping in prod; dev/test (NODE_ENV!=production) stays open when unset.
+    if (!token && process.env.NODE_ENV === "production") {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "not found" }));
+    }
+    if (token) {
+      const u = new URL(req.url, "http://localhost");
+      const provided =
+        u.searchParams.get("token") ||
+        (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+      if (provided !== token) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "unauthorized" }));
+      }
+    }
+    const snap = healthMonitor.getSnapshot();
+    res.writeHead(snap ? 200 : 503, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    });
+    return res.end(
+      JSON.stringify(
+        snap
+          ? { ...snap, thresholds: healthMonitor.getThresholds() }
+          : { status: "starting" }
+      )
+    );
+  }
+
   // Server discovery: lets a client validate a URL, learn the admission policy
   // (so it can show/hide the subscription UI), and check protocol compatibility.
   if (req.method === "GET" && req.url === "/info") {
@@ -117,6 +175,16 @@ const httpServer = http.createServer((req, res) => {
     );
   }
 
+  if (
+    ADMISSION_POLICY !== "stripe" &&
+    req.url &&
+    (req.url === "/stripe/webhook" || req.url.startsWith("/subscribe"))
+  ) {
+    res.writeHead(404);
+    res.end("Not found");
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/stripe/webhook") {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
@@ -133,7 +201,7 @@ const httpServer = http.createServer((req, res) => {
         res.writeHead(200);
         res.end("ok");
       } catch (e: any) {
-        console.error(`❌ [stripe-webhook] ${e.message}`);
+        logger.error(`❌ [stripe-webhook] ${e.message}`);
         res.writeHead(400);
         res.end(`Webhook Error: ${e.message}`);
       }
@@ -144,7 +212,7 @@ const httpServer = http.createServer((req, res) => {
   // Web subscription flow (the iOS "linking code" model).
   if (req.url && req.url.startsWith("/subscribe")) {
     handleSubscribe(req, res).catch((e) => {
-      console.error("[subscribe] handler error", e);
+      logger.error("[subscribe] handler error", e);
       if (!res.headersSent) {
         res.writeHead(500);
         res.end("error");
@@ -166,7 +234,7 @@ const httpServer = http.createServer((req, res) => {
         res.writeHead(active ? 200 : 402, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ active }));
       } catch (e: any) {
-        console.error(`❌ [storekit] ${e.message}`);
+        logger.error(`❌ [storekit] ${e.message}`);
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: e.message }));
       }
@@ -235,6 +303,22 @@ const wss = new WebSocketServer({
   maxPayload: 4 * 1024 * 1024,
 });
 
+// CRASH FIX: without this listener, an "error" emitted on the WebSocketServer
+// (e.g. an upgrade/handshake failure under a connection flood) is re-thrown and
+// takes the whole process down. Capture instead. (Per-socket "error" listeners
+// are attached in the connection handler below — that was the actual killer.)
+wss.on("error", (err) => {
+  healthMonitor.noteError();
+  logger.error("[wss] server error", err);
+});
+
+// The HTTP server can also emit "error" (e.g. EADDRINUSE, client socket resets
+// on the upgrade path). Same rule: capture, don't crash.
+httpServer.on("error", (err) => {
+  healthMonitor.noteError();
+  logger.error("[http] server error", err);
+});
+
 // Map<Username, ChatSocket> - For routing by Username
 const onlineUsers = new Map<string, ChatSocket>();
 // Map<PublicKey, ChatSocket> - For cleanup/auth
@@ -245,13 +329,49 @@ const onlinePks = new Map<string, ChatSocket>();
 // has proven its identity. Behind Cloudflare/nginx the real client IP is in
 // x-forwarded-for. Not a substitute for an edge WAF, but a cheap first line.
 const RATE_WINDOW_MS = 60_000;
-const MAX_CONNECTIONS_PER_WINDOW = 30; // new sockets per IP per minute
+// New sockets per IP per minute. Overridable (env) so a load test — where every
+// synthetic client shares one source IP — can raise the ceiling; the default
+// stays 30 for real deployments.
+const MAX_CONNECTIONS_PER_WINDOW = Number(process.env.MAX_CONNECTIONS_PER_WINDOW) || 30;
 const MAX_PREAUTH_MSGS = 20;           // frames allowed before AUTHENTICATED
 const ipConnections = new Map<string, { count: number; windowStart: number }>();
 
+// Resolve the client IP used for per-IP rate limiting (SRV-1). The naive
+// "first X-Forwarded-For token" is fully client-controlled: anyone who can reach
+// the origin directly can spoof it and evade the limits entirely. Our ingress is
+// locked to Cloudflare-only (deploy/scripts/harden-vm.sh) and fronted by nginx,
+// which applies `real_ip_header CF-Connecting-IP` from Cloudflare's ranges, so we
+// trust — in order — only values our own edge sets:
+//
+//   1. `CF-Connecting-IP` — set by Cloudflare and *overwritten* on every request,
+//      so a client can't forge it. Present only if the origin is hit directly by
+//      CF (no nginx hop); nginx does not forward it upstream. Disable with
+//      TRUST_CF_CONNECTING_IP=false for a non-Cloudflare deployment.
+//   2. `X-Real-IP` — nginx sets this to the resolved real client IP ($remote_addr
+//      after the CF real-ip rewrite): a single, clean, trusted value.
+//   3. The Nth X-Forwarded-For token counted from the RIGHT, where N =
+//      TRUSTED_PROXY_HOPS (the number of proxies WE operate; nginx = 1). The
+//      rightmost token is the one nginx appends and can't be spoofed past it; the
+//      leftmost tokens are attacker-supplied and must never be trusted.
+//   4. The raw socket address as a last resort.
+const TRUSTED_PROXY_HOPS = Math.max(1, Number(process.env.TRUSTED_PROXY_HOPS) || 1);
 function clientIp(req: http.IncomingMessage): string {
-  const xff = (req.headers["x-forwarded-for"] as string) || "";
-  return xff.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
+  if (process.env.TRUST_CF_CONNECTING_IP !== "false") {
+    const cf = ((req.headers["cf-connecting-ip"] as string) || "").trim();
+    if (cf) return cf;
+  }
+  const realIp = ((req.headers["x-real-ip"] as string) || "").trim();
+  if (realIp) return realIp;
+
+  const xff = ((req.headers["x-forwarded-for"] as string) || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (xff.length) {
+    const idx = Math.max(0, xff.length - TRUSTED_PROXY_HOPS);
+    return xff[idx] ?? req.socket.remoteAddress ?? "unknown";
+  }
+  return req.socket.remoteAddress || "unknown";
 }
 
 function allowConnection(ip: string): boolean {
@@ -302,16 +422,20 @@ async function ensureBotFriend(ws: ChatSocket) {
     JSON.stringify({ type: MessageTypesToReceive.FRIEND_ADDED, username: BOT, pk: botPk })
   );
 
-  // Tell the bot about this user (so it handshakes back), if online.
+  // Tell the bot about this user (so it handshakes back). Queue it when the bot
+  // is offline so it learns the user — with pk — on its next reconnect and can
+  // initiate the handshake. Without this, a user who joins while the bot is down
+  // never gets a secure channel (the bot never hears about them).
+  const friendAdded = {
+    type: MessageTypesToReceive.FRIEND_ADDED,
+    username: ws.auth.username,
+    pk: ws.auth.publicKey,
+  };
   const botSock = onlineUsers.get(BOT);
   if (botSock && botSock.readyState === WebSocket.OPEN) {
-    botSock.send(
-      JSON.stringify({
-        type: MessageTypesToReceive.FRIEND_ADDED,
-        username: ws.auth.username,
-        pk: ws.auth.publicKey,
-      })
-    );
+    botSock.send(JSON.stringify(friendAdded));
+  } else {
+    await DB.enqueuePending(botPk, friendAdded);
   }
 }
 
@@ -345,7 +469,7 @@ async function isVerifiedFriend(ws: ChatSocket, targetUsername: string): Promise
 const Handlers = {
   async onAuthInit(ws: ChatSocket, pkHex: string) {
     const senderId = pkHex.substring(0, 8);
-    console.log(`📤 [${senderId}] Sending: AUTH_INIT`);
+    logger.debug(`📤 [${senderId}] Sending: AUTH_INIT`);
 
     // Validate the public key shape BEFORE any expensive work — pkHex is
     // attacker-controlled and gets passed to HQC and (after auth) Stripe.
@@ -354,39 +478,44 @@ const Handlers = {
       return ws.close();
     }
 
-    // HQC Challenge. NOTE: the Stripe subscription gate runs in onAuthVerify,
-    // AFTER the client proves it owns this key — so an unauthenticated attacker
-    // spraying random pks can't trigger Stripe customer creation / rate limits.
-    const nonce = crypto.randomBytes(HQC_CONSTANTS.PARAM_K);
-    const theta = crypto.randomBytes(HQC_CONSTANTS.SEED_BYTES);
-    const ciphertext = HqcWrapper.encrypt(
-      Buffer.from(pkHex, "hex"),
-      nonce,
-      theta
-    );
+    // HQC KEM challenge (§KM-1): encapsulate to the client's public key. Only the
+    // holder of the matching secret key can decapsulate the same shared secret
+    // `ss`; it then proves possession by returning HKDF(ss,"auth") — we never send
+    // ss nor echo any decrypted plaintext, so there is no decryption oracle. A
+    // chosen/garbled ciphertext yields a pseudo-random ss (CCA2) → a wrong proof.
+    // NOTE: the Stripe subscription gate still runs in onAuthVerify, AFTER the
+    // client proves it owns this key, so pk-spraying can't trigger Stripe/rate.
+    const { ct, ss } = HqcWrapper.encapsulate(Buffer.from(pkHex, "hex"));
 
     ws.auth.step = "CHALLENGE_SENT";
     ws.auth.publicKey = pkHex;
-    ws.auth.expectedNonce = nonce;
+    ws.auth.expectedProof = authProof(ss);
 
     ws.send(
       JSON.stringify({
         type: MessageTypesToReceive.AUTH_CHALLENGE,
-        payload: ciphertext.toString("base64"),
+        payload: ct.toString("base64"),
       })
     );
-    console.log(`📥 [${senderId}] Receiving: AUTH_CHALLENGE`);
+    logger.debug(`📥 [${senderId}] Receiving: AUTH_CHALLENGE`);
   },
 
   async onAuthVerify(ws: ChatSocket, solutionBase64: string) {
     if (ws.auth.step !== "CHALLENGE_SENT") return;
     const senderId = ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(`📤 [${senderId}] Sending: AUTH_VERIFY`);
+    logger.debug(`📤 [${senderId}] Sending: AUTH_VERIFY`);
 
     const solution = Buffer.from(solutionBase64, "base64");
 
-    if (ws.auth.expectedNonce && solution.equals(ws.auth.expectedNonce)) {
-      ws.auth.expectedNonce = undefined;
+    // Constant-time proof check (§KM-1). timingSafeEqual requires equal lengths,
+    // so guard the length first (a wrong-length solution is simply a failure).
+    const expected = ws.auth.expectedProof;
+    if (
+      expected &&
+      solution.length === expected.length &&
+      crypto.timingSafeEqual(solution, expected)
+    ) {
+      ws.auth.expectedProof = undefined;
 
       // Admission gate — now that the client has PROVEN it owns this key.
       // Deferred to here (not onAuthInit) so unauthenticated key-spraying can't
@@ -400,12 +529,12 @@ const Handlers = {
               checkoutUrl: admission.checkoutUrl,
             })
           );
-          console.log(`📥 [${senderId}] Receiving: PAYMENT_REQUIRED`);
+          logger.debug(`📥 [${senderId}] Receiving: PAYMENT_REQUIRED`);
         } else {
           ws.send(
             JSON.stringify({ type: MessageTypesToReceive.ERROR, payload: "NOT_ADMITTED" })
           );
-          console.log(`📥 [${senderId}] Receiving: ERROR (NOT_ADMITTED)`);
+          logger.debug(`📥 [${senderId}] Receiving: ERROR (NOT_ADMITTED)`);
         }
         return ws.close();
       }
@@ -420,30 +549,27 @@ const Handlers = {
       }
       onlinePks.set(ws.auth.publicKey!, ws);
 
-      // Establish the per-connection transport key via a dedicated HQC key
-      // exchange (separate from the auth nonce above). SESSION_KEY is sent
-      // plaintext (the key isn't set yet); from the moment we set sessionKey,
-      // the send override encrypts every subsequent frame — including the
-      // AUTH_SUCCESS just below and all presence/queue/relay traffic.
-      const sessionSeed = freshSessionSeed();
-      const sessionCt = hqcEncryptSeed(
-        Buffer.from(ws.auth.publicKey!, "hex"),
-        sessionSeed
-      );
+      // Establish the per-connection transport key via a dedicated HQC KEM
+      // encapsulation (§KM-1, separate from the auth challenge above). SESSION_KEY
+      // carries the KEM ciphertext, sent plaintext (the key isn't set yet); from
+      // the moment we set sessionKey, the send override encrypts every subsequent
+      // frame — including the AUTH_SUCCESS just below and all relay traffic. The
+      // client decapsulates the ciphertext to recover the same 32-byte `ss`.
+      const session = encapsulateSession(Buffer.from(ws.auth.publicKey!, "hex"));
       ws.send(
         JSON.stringify({
           type: MessageTypesToReceive.SESSION_KEY,
-          payload: sessionCt.toString("base64"),
+          payload: session.ct.toString("base64"),
         })
       );
-      const sessionKeys = deriveSessionKeys(sessionSeed);
+      const sessionKeys = deriveSessionKeys(session.ss);
       ws.auth.txKey = sessionKeys.s2c; // server→client
       ws.auth.rxKey = sessionKeys.c2s; // client→server
-      console.log(`🔐 [${senderId}] transport session keys established`);
+      logger.debug(`🔐 [${senderId}] transport session keys established`);
 
       ws.send(JSON.stringify({ type: MessageTypesToReceive.AUTH_SUCCESS }));
-      console.log(`✅ Auth: ${username || ws.auth.publicKey?.substring(0, 8)}`);
-      console.log(`📥 [${username || senderId}] Receiving: AUTH_SUCCESS`);
+      logger.debug(`✅ Auth: ${username || ws.auth.publicKey?.substring(0, 8)}`);
+      logger.debug(`📥 [${username || senderId}] Receiving: AUTH_SUCCESS`);
 
       // Presence: learn which friends are already online, and announce
       // ourselves to our online friends so calls become available both ways.
@@ -456,7 +582,7 @@ const Handlers = {
       // Flush any messages queued while this user was offline.
       const pending = await DB.flushPending(ws.auth.publicKey!);
       if (pending.length > 0) {
-        console.log(`📬 [${username || senderId}] Delivering ${pending.length} queued message(s)`);
+        logger.debug(`📬 [${username || senderId}] Delivering ${pending.length} queued message(s)`);
         for (const envelope of pending) {
           ws.send(JSON.stringify(envelope));
 
@@ -475,7 +601,7 @@ const Handlers = {
             const senderSock = onlineUsers.get(env.sender);
             if (senderSock && senderSock.readyState === WebSocket.OPEN) {
               senderSock.send(JSON.stringify(receipt));
-              console.log(`✅ [${env.sender}] queued→delivered (${env.messageId})`);
+              logger.debug(`✅ [${env.sender}] queued→delivered (${env.messageId})`);
             } else {
               // Sender offline too — queue the receipt for their next sign-in.
               const senderPk = await DB.getPkByUsername(env.sender);
@@ -491,7 +617,7 @@ const Handlers = {
           payload: "AUTH_FAILED",
         })
       );
-      console.log(`📥 [${senderId}] Receiving: ERROR (AUTH_FAILED)`);
+      logger.debug(`📥 [${senderId}] Receiving: ERROR (AUTH_FAILED)`);
       ws.close();
     }
   },
@@ -499,7 +625,7 @@ const Handlers = {
   async onSetUsername(ws: ChatSocket, newUsername: string) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(`📤 [${sender}] Sending: SET_USERNAME`);
+    logger.debug(`📤 [${sender}] Sending: SET_USERNAME`);
     try {
       if (ws.auth.username) onlineUsers.delete(ws.auth.username);
       await DB.setUsername(ws.auth.publicKey!, newUsername);
@@ -513,7 +639,7 @@ const Handlers = {
           payload: newUsername,
         })
       );
-      console.log(`📥 [${newUsername}] Receiving: USERNAME_UPDATED`);
+      logger.debug(`📥 [${newUsername}] Receiving: USERNAME_UPDATED`);
 
       // First login often sets the username after auth — announce presence and
       // auto-friend the bot now (a new user has no username at auth time).
@@ -527,14 +653,14 @@ const Handlers = {
           payload: e.message,
         })
       );
-      console.log(`📥 [${sender}] Receiving: ERROR (${e.message})`);
+      logger.debug(`📥 [${sender}] Receiving: ERROR (${e.message})`);
     }
   },
 
   async onAddFriend(ws: ChatSocket, targetUsername: string) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: ADD_FRIEND (target: ${targetUsername})`
     );
 
@@ -547,7 +673,7 @@ const Handlers = {
           payload: "USER_NOT_FOUND",
         })
       );
-      console.log(`📥 [${sender}] Receiving: ERROR (USER_NOT_FOUND)`);
+      logger.debug(`📥 [${sender}] Receiving: ERROR (USER_NOT_FOUND)`);
       return;
     }
 
@@ -563,12 +689,12 @@ const Handlers = {
     const peer = onlineUsers.get(targetUsername);
     if (peer) {
       peer.send(JSON.stringify(requestEnvelope));
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: FRIEND_REQUEST (from: ${sender})`
       );
     } else {
       await DB.enqueuePending(targetPk, requestEnvelope);
-      console.log(`📦 [${targetUsername}] Queued: FRIEND_REQUEST (from: ${sender})`);
+      logger.debug(`📦 [${targetUsername}] Queued: FRIEND_REQUEST (from: ${sender})`);
     }
 
     ws.send(
@@ -578,13 +704,13 @@ const Handlers = {
         payload: `Invite sent to ${targetUsername}`,
       })
     );
-    console.log(`📥 [${sender}] Receiving: DIRECT_MESSAGE (from: SYSTEM)`);
+    logger.debug(`📥 [${sender}] Receiving: DIRECT_MESSAGE (from: SYSTEM)`);
   },
 
   async onAcceptInvite(ws: ChatSocket, targetUsername: string) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: ACCEPT_INVITE (target: ${targetUsername})`
     );
 
@@ -596,7 +722,7 @@ const Handlers = {
           payload: "USER_NOT_FOUND",
         })
       );
-      console.log(`📥 [${sender}] Receiving: ERROR (USER_NOT_FOUND)`);
+      logger.debug(`📥 [${sender}] Receiving: ERROR (USER_NOT_FOUND)`);
       return;
     }
 
@@ -611,7 +737,7 @@ const Handlers = {
         pk: targetPk,
       })
     );
-    console.log(
+    logger.debug(
       `📥 [${sender}] Receiving: FRIEND_ADDED (username: ${targetUsername})`
     );
 
@@ -624,12 +750,12 @@ const Handlers = {
     const peer = onlineUsers.get(targetUsername);
     if (peer) {
       peer.send(JSON.stringify(addedEnvelope));
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: FRIEND_ADDED (username: ${sender})`
       );
     } else {
       await DB.enqueuePending(targetPk, addedEnvelope);
-      console.log(`📦 [${targetUsername}] Queued: FRIEND_ADDED (username: ${sender})`);
+      logger.debug(`📦 [${targetUsername}] Queued: FRIEND_ADDED (username: ${sender})`);
     }
 
     // 4. Exchange presence immediately. Presence is otherwise only sent at
@@ -655,7 +781,7 @@ const Handlers = {
   async onRemoveFriend(ws: ChatSocket, targetUsername: string) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: REMOVE_FRIEND (target: ${targetUsername})`
     );
 
@@ -667,7 +793,7 @@ const Handlers = {
           payload: "USER_NOT_FOUND",
         })
       );
-      console.log(`📥 [${sender}] Receiving: ERROR (USER_NOT_FOUND)`);
+      logger.debug(`📥 [${sender}] Receiving: ERROR (USER_NOT_FOUND)`);
       return;
     }
 
@@ -680,7 +806,7 @@ const Handlers = {
           payload: "NOT_FRIENDS",
         })
       );
-      console.log(`📥 [${sender}] Receiving: ERROR (NOT_FRIENDS)`);
+      logger.debug(`📥 [${sender}] Receiving: ERROR (NOT_FRIENDS)`);
       return;
     }
 
@@ -691,7 +817,7 @@ const Handlers = {
         username: targetUsername,
       })
     );
-    console.log(
+    logger.debug(
       `📥 [${sender}] Receiving: FRIEND_REMOVED (username: ${targetUsername})`
     );
 
@@ -705,16 +831,16 @@ const Handlers = {
             ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown",
         })
       );
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: FRIEND_REMOVED (username: ${sender})`
       );
     }
   },
 
-  async onMessage(ws: ChatSocket, targetUsername: string, payload: any, messageId?: string) {
+  async onMessage(ws: ChatSocket, targetUsername: string, payload: any, messageId?: string, epoch?: number, idx?: number) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(`📤 [${sender}] Sending: MESSAGE (target: ${targetUsername})`);
+    logger.debug(`📤 [${sender}] Sending: MESSAGE (target: ${targetUsername})`);
 
     const targetPk = await DB.getPkByUsername(targetUsername);
     if (!targetPk) return; // Silent fail or error
@@ -728,7 +854,7 @@ const Handlers = {
           payload: "NOT_FRIENDS",
         })
       );
-      console.log(`📥 [${sender}] Receiving: ERROR (NOT_FRIENDS)`);
+      logger.debug(`📥 [${sender}] Receiving: ERROR (NOT_FRIENDS)`);
       return;
     }
 
@@ -741,11 +867,16 @@ const Handlers = {
       sender: ws.auth.username, // Send Username, Client resolves PK locally
       payload,
       messageId, // carried so a queued message can ack its sender on flush
+      // Opaque key-rotation header (epoch ≥ 1). Relayed as-is; the server never
+      // interprets it. Absent (undefined → dropped by JSON.stringify) for the
+      // legacy static-key path, keeping epoch-0 frames byte-identical.
+      epoch,
+      idx,
     };
     const peer = onlineUsers.get(targetUsername);
     if (peer && peer.readyState === WebSocket.OPEN) {
       peer.send(JSON.stringify(envelope));
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: DIRECT_MESSAGE (from: ${sender})`
       );
       // Receipt: delivered to the recipient's live socket.
@@ -755,7 +886,7 @@ const Handlers = {
     } else {
       // Recipient offline: queue for delivery on next auth.
       await DB.enqueuePending(targetPk, envelope);
-      console.log(`📦 [${targetUsername}] Queued: DIRECT_MESSAGE (from: ${sender})`);
+      logger.debug(`📦 [${targetUsername}] Queued: DIRECT_MESSAGE (from: ${sender})`);
       // Wake the recipient's device so they see it now.
       ApnsService.send(targetPk, ws.auth.username || "New message", "Sent you a message");
       // Receipt: stored server-side until the recipient reconnects.
@@ -769,10 +900,10 @@ const Handlers = {
   // sender's already-encrypted image (AES under the per-friend key — NOT the
   // HQC-per-block wrapping text uses, which would explode an image's size). We
   // relay live or queue it offline + send the sender a delivery receipt.
-  async onImageMessage(ws: ChatSocket, targetUsername: string, payload: any, messageId?: string) {
+  async onImageMessage(ws: ChatSocket, targetUsername: string, payload: any, messageId?: string, epoch?: number) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(`📤 [${sender}] Sending: IMAGE_MESSAGE (target: ${targetUsername})`);
+    logger.debug(`📤 [${sender}] Sending: IMAGE_MESSAGE (target: ${targetUsername})`);
 
     const targetPk = await DB.getPkByUsername(targetUsername);
     if (!targetPk) return;
@@ -789,17 +920,18 @@ const Handlers = {
       sender: ws.auth.username,
       payload,
       messageId,
+      epoch, // per-epoch media key selector; undefined on the legacy path
     };
     const peer = onlineUsers.get(targetUsername);
     if (peer && peer.readyState === WebSocket.OPEN) {
       peer.send(JSON.stringify(envelope));
-      console.log(`📥 [${targetUsername}] Receiving: IMAGE_MESSAGE (from: ${sender})`);
+      logger.debug(`📥 [${targetUsername}] Receiving: IMAGE_MESSAGE (from: ${sender})`);
       if (messageId) {
         ws.send(JSON.stringify({ type: MessageTypesToReceive.MESSAGE_DELIVERED, messageId }));
       }
     } else {
       await DB.enqueuePending(targetPk, envelope);
-      console.log(`📦 [${targetUsername}] Queued: IMAGE_MESSAGE (from: ${sender})`);
+      logger.debug(`📦 [${targetUsername}] Queued: IMAGE_MESSAGE (from: ${sender})`);
       ApnsService.send(targetPk, ws.auth.username || "New photo", "Sent you a photo");
       if (messageId) {
         ws.send(JSON.stringify({ type: MessageTypesToReceive.MESSAGE_QUEUED, messageId }));
@@ -807,10 +939,10 @@ const Handlers = {
     }
   },
 
-  async onAudio(ws: ChatSocket, targetUsername: string, payload: any) {
+  async onAudio(ws: ChatSocket, targetUsername: string, payload: any, epoch?: number) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: AUDIO_MESSAGE (target: ${targetUsername})`
     );
 
@@ -826,7 +958,7 @@ const Handlers = {
           payload: "NOT_FRIENDS",
         })
       );
-      console.log(`📥 [${sender}] Receiving: ERROR (NOT_FRIENDS)`);
+      logger.debug(`📥 [${sender}] Receiving: ERROR (NOT_FRIENDS)`);
       return;
     }
 
@@ -834,17 +966,18 @@ const Handlers = {
       type: MessageTypesToReceive.AUDIO_MESSAGE,
       sender: ws.auth.username, // Send Username, Client resolves PK locally
       payload,
+      epoch, // per-epoch media key selector; undefined on the legacy path
     };
     const peer = onlineUsers.get(targetUsername);
     if (peer && peer.readyState === WebSocket.OPEN) {
       peer.send(JSON.stringify(envelope));
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: AUDIO_MESSAGE (from: ${sender})`
       );
     } else {
       // Recipient offline: queue for delivery on next auth.
       await DB.enqueuePending(targetPk, envelope);
-      console.log(`📦 [${targetUsername}] Queued: AUDIO_MESSAGE (from: ${sender})`);
+      logger.debug(`📦 [${targetUsername}] Queued: AUDIO_MESSAGE (from: ${sender})`);
     }
   },
 
@@ -855,7 +988,7 @@ const Handlers = {
   ) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: AUDIO_STREAM_START (target: ${targetUsername})`
     );
 
@@ -914,7 +1047,7 @@ const Handlers = {
   async onAudioStreamEnd(ws: ChatSocket, targetUsername: string, payload: any) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: AUDIO_STREAM_END (target: ${targetUsername})`
     );
 
@@ -943,7 +1076,7 @@ const Handlers = {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
     const q = (typeof query === "string" ? query : "").trim().toLowerCase();
-    console.log(`📤 [${sender}] Sending: GET_ALL_USERS (query: "${q}")`);
+    logger.debug(`📤 [${sender}] Sending: GET_ALL_USERS (query: "${q}")`);
 
     let results: { username: string; pk: string }[] = [];
     if (q.length > 0) {
@@ -956,35 +1089,71 @@ const Handlers = {
         payload: results,
       })
     );
-    console.log(`📥 [${sender}] Receiving: USER_LIST_RESPONSE (${results.length})`);
+    logger.debug(`📥 [${sender}] Receiving: USER_LIST_RESPONSE (${results.length})`);
   },
 
   // AES is treated just like a message, but logic is handled by client
   async onAes(ws: ChatSocket, targetUsername: string, payload: any) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(`📤 [${sender}] Sending: AES (target: ${targetUsername})`);
+    logger.debug(`📤 [${sender}] Sending: AES (target: ${targetUsername})`);
 
     // Only friends may push handshake material — blocks unsolicited handshakes.
     if (!(await isVerifiedFriend(ws, targetUsername))) return;
 
+    const envelope = {
+      type: MessageTypesToReceive.AES,
+      sender: ws.auth.username,
+      payload,
+    };
     const peer = onlineUsers.get(targetUsername);
     if (peer && peer.readyState === WebSocket.OPEN) {
-      peer.send(
-        JSON.stringify({
-          type: MessageTypesToReceive.AES,
-          sender: ws.auth.username,
-          payload,
-        })
-      );
-      console.log(`📥 [${targetUsername}] Receiving: AES (from: ${sender})`);
+      peer.send(JSON.stringify(envelope));
+      logger.debug(`📥 [${targetUsername}] Receiving: AES (from: ${sender})`);
+    } else {
+      // Recipient offline: queue the handshake seed (like onMessage does for
+      // messages). The AES handshake must complete before any message can be
+      // sent, so dropping it here stranded anyone who handshook while their peer
+      // — e.g. the helper bot mid-restart — was offline.
+      const targetPk = await DB.getPkByUsername(targetUsername);
+      if (targetPk) await DB.enqueuePending(targetPk, envelope);
+      logger.debug(`📦 [${targetUsername}] Queued: AES (from: ${sender})`);
+    }
+  },
+
+  // Tier-1 epoch re-handshake. Identical relay/queue semantics to onAes: the
+  // payload is a fresh per-epoch seed HQC-encrypted to the peer (server-opaque);
+  // `epoch` names the target epoch. Must be durably queued when the peer is
+  // offline — a dropped rotation would strand messages sent under the new epoch.
+  async onKeyRotate(ws: ChatSocket, targetUsername: string, payload: any, epoch?: number) {
+    const sender =
+      ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
+    logger.debug(`📤 [${sender}] Sending: KEY_ROTATE (target: ${targetUsername}, epoch: ${epoch})`);
+
+    // Only friends may push rotation material — blocks unsolicited rotations.
+    if (!(await isVerifiedFriend(ws, targetUsername))) return;
+
+    const envelope = {
+      type: MessageTypesToReceive.KEY_ROTATE,
+      sender: ws.auth.username,
+      payload,
+      epoch,
+    };
+    const peer = onlineUsers.get(targetUsername);
+    if (peer && peer.readyState === WebSocket.OPEN) {
+      peer.send(JSON.stringify(envelope));
+      logger.debug(`📥 [${targetUsername}] Receiving: KEY_ROTATE (from: ${sender})`);
+    } else {
+      const targetPk = await DB.getPkByUsername(targetUsername);
+      if (targetPk) await DB.enqueuePending(targetPk, envelope);
+      logger.debug(`📦 [${targetUsername}] Queued: KEY_ROTATE (from: ${sender})`);
     }
   },
 
   async onCallInitiate(ws: ChatSocket, targetUsername: string, payload: any) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: CALL_INITIATE (target: ${targetUsername})`
     );
 
@@ -1011,7 +1180,7 @@ const Handlers = {
           payload,
         })
       );
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: CALL_INCOMING (from: ${sender})`
       );
     } else {
@@ -1029,7 +1198,7 @@ const Handlers = {
   async onCallAccept(ws: ChatSocket, targetUsername: string, payload: any) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: CALL_ACCEPT (target: ${targetUsername})`
     );
 
@@ -1042,7 +1211,7 @@ const Handlers = {
           sender: ws.auth.username,
         })
       );
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: CALL_ACCEPTED (from: ${sender})`
       );
     }
@@ -1051,7 +1220,7 @@ const Handlers = {
   async onCallReject(ws: ChatSocket, targetUsername: string, payload: any) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(
+    logger.debug(
       `📤 [${sender}] Sending: CALL_REJECT (target: ${targetUsername})`
     );
 
@@ -1064,7 +1233,7 @@ const Handlers = {
           sender: ws.auth.username,
         })
       );
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: CALL_REJECTED (from: ${sender})`
       );
     }
@@ -1073,7 +1242,7 @@ const Handlers = {
   async onCallEnd(ws: ChatSocket, targetUsername: string, payload: any) {
     const sender =
       ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
-    console.log(`📤 [${sender}] Sending: CALL_END (target: ${targetUsername})`);
+    logger.debug(`📤 [${sender}] Sending: CALL_END (target: ${targetUsername})`);
 
     if (!(await isVerifiedFriend(ws, targetUsername))) return;
     const peer = onlineUsers.get(targetUsername);
@@ -1084,7 +1253,7 @@ const Handlers = {
           sender: ws.auth.username,
         })
       );
-      console.log(
+      logger.debug(
         `📥 [${targetUsername}] Receiving: CALL_ENDED (from: ${sender})`
       );
     }
@@ -1112,7 +1281,7 @@ const Handlers = {
       // Throttled relay trace (chunks fly ~20/sec).
       ws.mediaRelayCount = (ws.mediaRelayCount || 0) + 1;
       if (ws.mediaRelayCount <= 3 || ws.mediaRelayCount % 100 === 0) {
-        console.log(
+        logger.debug(
           `🔀 [${sender}→${targetUsername}] relay CALL_MEDIA_CHUNK #${ws.mediaRelayCount} (${typeof payload === "string" ? payload.length : "?"
           } chars)`
         );
@@ -1121,7 +1290,7 @@ const Handlers = {
       // Recipient not connected → chunk is dropped (calls need both online).
       ws.mediaDropCount = (ws.mediaDropCount || 0) + 1;
       if (ws.mediaDropCount <= 3 || ws.mediaDropCount % 100 === 0) {
-        console.log(
+        logger.debug(
           `⚠️ [${sender}→${targetUsername}] DROP CALL_MEDIA_CHUNK #${ws.mediaDropCount} — recipient offline`
         );
       }
@@ -1136,7 +1305,7 @@ const Handlers = {
     const platform = payload.substring(0, idx);
     const token = payload.substring(idx + 1);
     await DB.setPushToken(ws.auth.publicKey, platform, token);
-    console.log(`🔔 [${ws.auth.username || "?"}] push token registered (${platform})`);
+    logger.debug(`🔔 [${ws.auth.username || "?"}] push token registered (${platform})`);
   },
 
   /** Irreversibly delete the caller's account (App Store Guideline 5.1.1(v)).
@@ -1146,11 +1315,11 @@ const Handlers = {
     const pk = ws.auth.publicKey;
     if (!pk) return;
     const username = ws.auth.username;
-    console.log(`🗑️  [${username || pk.substring(0, 8)}] DELETE_ACCOUNT`);
+    logger.debug(`🗑️  [${username || pk.substring(0, 8)}] DELETE_ACCOUNT`);
 
     // Announce offline to friends BEFORE the friend set is purged.
     if (username) {
-      await broadcastPresence(pk, username, false).catch(() => {});
+      await broadcastPresence(pk, username, false).catch(() => { });
     }
 
     // Stop routing to this socket, then purge everything we store.
@@ -1171,10 +1340,19 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
   socket.isAlive = true;
   socket.preAuthMsgs = 0;
 
+  // CRASH FIX (root cause of the stress-test crash): a `ws` socket that emits
+  // "error" with no listener re-throws on the process and kills Node. Under a
+  // flood, ECONNRESET/EPIPE on individual sockets are routine. Attach a listener
+  // to EVERY socket so those become logged, counted events — never a crash.
+  socket.on("error", (err) => {
+    healthMonitor.noteError();
+    logger.debug(`[socket] error (${socket.auth?.username || "unauth"}): ${(err as Error).message}`);
+  });
+
   // Per-IP connection rate limit (pre-auth flood guard).
   const ip = clientIp(req);
   if (!allowConnection(ip)) {
-    console.log(`⛔ [${ip}] connection rate-limited`);
+    logger.debug(`⛔ [${ip}] connection rate-limited`);
     return socket.close();
   }
 
@@ -1196,12 +1374,13 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
 
   socket.on("message", async (data) => {
     try {
+      healthMonitor.noteMessage();
       // Pre-auth flood guard: bound how many frames a socket may send before
       // it authenticates.
       if (socket.auth.step !== "AUTHENTICATED") {
         socket.preAuthMsgs = (socket.preAuthMsgs || 0) + 1;
         if (socket.preAuthMsgs > MAX_PREAUTH_MSGS) {
-          console.log(`⛔ pre-auth message flood — closing socket`);
+          logger.debug(`⛔ pre-auth message flood — closing socket`);
           return socket.close();
         }
       }
@@ -1220,7 +1399,7 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
         socket.auth.username ||
         socket.auth.publicKey?.substring(0, 8) ||
         "Unknown";
-      console.log(`📨 [${sender}] Received message type: ${msg.type}`);
+      logger.debug(`📨 [${sender}] Received message type: ${msg.type}`);
 
       switch (msg.type) {
         case MessageTypesToSent.AUTH_INIT:
@@ -1242,13 +1421,13 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
           await Handlers.onRemoveFriend(socket, msg.payload);
           break;
         case MessageTypesToSent.MESSAGE:
-          await Handlers.onMessage(socket, msg.targetPk, msg.payload, msg.messageId); // msg.targetPk here acts as username field container
+          await Handlers.onMessage(socket, msg.targetPk, msg.payload, msg.messageId, msg.epoch, msg.idx); // msg.targetPk here acts as username field container
           break;
         case MessageTypesToSent.IMAGE_MESSAGE:
-          await Handlers.onImageMessage(socket, msg.targetPk, msg.payload, msg.messageId);
+          await Handlers.onImageMessage(socket, msg.targetPk, msg.payload, msg.messageId, msg.epoch);
           break;
         case MessageTypesToSent.AUDIO_MESSAGE:
-          await Handlers.onAudio(socket, msg.targetPk, msg.payload); // msg.targetPk here acts as username field container
+          await Handlers.onAudio(socket, msg.targetPk, msg.payload, msg.epoch); // msg.targetPk here acts as username field container
           break;
         case MessageTypesToSent.AUDIO_STREAM_START:
           await Handlers.onAudioStreamStart(socket, msg.targetPk, msg.payload);
@@ -1261,6 +1440,9 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
           break;
         case MessageTypesToSent.AES:
           await Handlers.onAes(socket, msg.targetPk, msg.payload);
+          break;
+        case MessageTypesToSent.KEY_ROTATE:
+          await Handlers.onKeyRotate(socket, msg.targetPk, msg.payload, msg.epoch);
           break;
         case MessageTypesToSent.GET_ALL_USERS:
           await Handlers.onListUsers(socket, msg.payload);
@@ -1291,7 +1473,8 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
           break;
       }
     } catch (e) {
-      console.error(e);
+      healthMonitor.noteError();
+      logger.error(e);
     }
   });
 
@@ -1304,7 +1487,7 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
     // Then tell online friends we went offline.
     if (username && pk) {
       broadcastPresence(pk, username, false).catch((e) =>
-        console.error("[presence] offline broadcast failed", e)
+        logger.error("[presence] offline broadcast failed", e)
       );
     }
   });
@@ -1321,7 +1504,7 @@ const heartbeat = setInterval(() => {
     if (socket.auth.step !== "AUTHENTICATED") return;
 
     if (socket.isAlive === false) {
-      console.log(`💔 Terminating stale connection: ${socket.auth.username || "Unknown"}`);
+      logger.debug(`💔 Terminating stale connection: ${socket.auth.username || "Unknown"}`);
       return socket.terminate();
     }
 
@@ -1339,6 +1522,11 @@ const heartbeat = setInterval(() => {
 wss.on("close", () => clearInterval(heartbeat));
 
 assertConfig();
+
+// Start the crash early-warning monitor. It reads wss.clients for connection /
+// backpressure pressure; MAX_BUFFERED matches the client-side soft cap.
+healthMonitor.start(wss, 4 * 1024 * 1024);
+
 httpServer.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT} — WS at /ws, Stripe webhook at /stripe/webhook`);
+  logger.startup(`🚀 Server running on port ${PORT} — WS at /ws, metrics at /metrics, Stripe webhook at /stripe/webhook`);
 });

@@ -1,43 +1,27 @@
 import * as crypto from "crypto";
 import { HqcWrapper, HQC_CONSTANTS } from "../lib/hqc";
 
-const { PARAM_K, SEED_BYTES, CIPHERTEXT_SIZE_BYTES } = HQC_CONSTANTS;
+const { SHARED_SECRET_BYTES } = HQC_CONSTANTS;
 
-// ── HQC (matches the Swift HQCService chunking) ──────────────────────────────
-// Encrypt: split into 24-byte blocks, zero-pad the last, one HQC block each,
-// concatenated. Decrypt: per-block, concat, trim trailing zeros.
+// ── HQC IND-CCA2 KEM (SECURITY_AUDIT §KM-1) ──────────────────────────────────
+// The old 24-byte PKE chunking is gone. Key agreement is now a KEM encapsulation:
+// encapsulate to the peer's public key → (ct, ss); the peer decapsulates ct with
+// its secret key to recover the same 32-byte shared secret `ss`. Callers stretch
+// `ss` with HKDF (see deriveSharedKey / the domain-separated session/auth KDFs).
+//
+// Migration note: wherever the old flow did `hqcEncrypt(peerPk, freshSeed())` to
+// contribute a seed, encapsulate instead — the transported value is `ct` and the
+// contributed secret is `ss` (which the peer recovers by decapsulating). The
+// mutual-key derivation (deriveSharedKey of the two shared secrets) is unchanged.
 
-export function hqcEncrypt(pk: Buffer, message: Buffer): Buffer {
-  const blocks: Buffer[] = [];
-  for (let off = 0; off < message.length; off += PARAM_K) {
-    let chunk = message.subarray(off, off + PARAM_K);
-    if (chunk.length < PARAM_K) {
-      const padded = Buffer.alloc(PARAM_K);
-      chunk.copy(padded);
-      chunk = padded;
-    }
-    const theta = crypto.randomBytes(SEED_BYTES);
-    blocks.push(HqcWrapper.encrypt(pk, Buffer.from(chunk), theta));
-  }
-  return Buffer.concat(blocks);
+/** Encapsulate to a peer public key → { ct (relay this), ss (keep secret) }. */
+export function hqcEncapsulate(pk: Buffer): { ct: Buffer; ss: Buffer } {
+  return HqcWrapper.encapsulate(pk);
 }
 
-export function hqcDecrypt(sk: Buffer, ciphertext: Buffer, trim = true): Buffer {
-  if (ciphertext.length % CIPHERTEXT_SIZE_BYTES !== 0) {
-    throw new Error("HQC ciphertext size not a multiple of block size");
-  }
-  const chunks: Buffer[] = [];
-  for (let off = 0; off < ciphertext.length; off += CIPHERTEXT_SIZE_BYTES) {
-    const block = ciphertext.subarray(off, off + CIPHERTEXT_SIZE_BYTES);
-    chunks.push(HqcWrapper.decrypt(sk, Buffer.from(block)));
-  }
-  let out = Buffer.concat(chunks);
-  if (trim) {
-    let end = out.length;
-    while (end > 0 && out[end - 1] === 0) end--;
-    out = out.subarray(0, end);
-  }
-  return out;
+/** Decapsulate a peer's KEM ciphertext with our secret key → the 32-byte ss. */
+export function hqcDecapsulate(sk: Buffer, ct: Buffer): Buffer {
+  return HqcWrapper.decapsulate(sk, ct);
 }
 
 // ── AES-256-GCM (matches Swift AESService: [IV 12][tag 16][ct], base64) ───────
@@ -60,26 +44,20 @@ export function aesDecrypt(b64: string, key: Buffer): string {
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
 }
 
-// ── Shared key (HKDF-SHA256 of sorted seeds, salt="salt", info="info") ────────
-
-export function deriveSharedKey(seedA: Buffer, seedB: Buffer): Buffer {
-  const [s1, s2] = Buffer.compare(seedA, seedB) <= 0 ? [seedA, seedB] : [seedB, seedA];
+// ── Shared key (HKDF-SHA256 of the two sorted shared secrets) ─────────────────
+// Inputs are now 32-byte KEM shared secrets (were 24-byte seeds). Sorting keeps
+// the derivation order-independent, so both peers compute the same key regardless
+// of who initiated. `info` gives domain separation (§KM-2): pass a per-channel
+// context like `channel:<sorted-peer-pk>` for content keys; the legacy default
+// "info" is the epoch-0 static-key context (see lib/ratchet.ts / §KM-5).
+export function deriveSharedKey(ssA: Buffer, ssB: Buffer, info = "info"): Buffer {
+  const [s1, s2] = Buffer.compare(ssA, ssB) <= 0 ? [ssA, ssB] : [ssB, ssA];
   const combined = Buffer.concat([s1, s2]);
-  const dk = crypto.hkdfSync(
-    "sha256",
-    combined,
-    Buffer.from("salt", "utf8"),
-    Buffer.from("info", "utf8"),
-    32
-  );
+  const dk = crypto.hkdfSync("sha256", combined, Buffer.from("salt", "utf8"), Buffer.from(info, "utf8"), 32);
   return Buffer.from(dk);
 }
 
-/** A 24-byte seed whose last byte is non-zero (so it survives null-trimming). */
+/** Fresh 32-byte value (e.g. an explicit epoch seed contribution). */
 export function freshSeed(): Buffer {
-  let seed: Buffer;
-  do {
-    seed = crypto.randomBytes(PARAM_K);
-  } while (seed[PARAM_K - 1] === 0);
-  return seed;
+  return crypto.randomBytes(SHARED_SECRET_BYTES);
 }

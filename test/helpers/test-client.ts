@@ -1,10 +1,11 @@
 /**
  * TestClient — a full DissQus protocol client for end-to-end tests.
  *
- * It speaks exactly what the Swift apps speak: HQC challenge/response auth, the
- * per-direction transport session keys, the per-friend AES handshake, and the
- * message/image crypto (inner AES + outer HQC for text; AES-only for images).
- * Two of these driven against a running server reproduce the real user journey.
+ * It speaks exactly what the Swift apps speak (SECURITY_AUDIT §KM-1): the HQC KEM
+ * auth (decapsulate → HKDF proof), the per-direction transport session keys, the
+ * per-friend mutual-encapsulation AES handshake, and the message/image crypto
+ * (AES-GCM under the ratchet/channel key — no per-message HQC). Two of these
+ * driven against a running server reproduce the real user journey.
  *
  * Needs the native HQC lib, so it only runs where that lib is present
  * (Linux/CI/VPS). Callers should skip when `loadCrypto()` throws.
@@ -14,15 +15,19 @@ import { MessageTypesToSent as Out, MessageTypesToReceive as In } from "../../en
 
 type Crypto = {
   HqcWrapper: typeof import("../../lib/hqc").HqcWrapper;
-  PARAM_K: number;
-  hqcEncrypt: typeof import("../../bot/crypto").hqcEncrypt;
-  hqcDecrypt: typeof import("../../bot/crypto").hqcDecrypt;
+  hqcEncapsulate: typeof import("../../bot/crypto").hqcEncapsulate;
+  hqcDecapsulate: typeof import("../../bot/crypto").hqcDecapsulate;
   aesEncrypt: typeof import("../../bot/crypto").aesEncrypt;
   aesDecrypt: typeof import("../../bot/crypto").aesDecrypt;
   deriveSharedKey: typeof import("../../bot/crypto").deriveSharedKey;
   freshSeed: typeof import("../../bot/crypto").freshSeed;
   deriveSessionKeys: typeof import("../../lib/secure-transport").deriveSessionKeys;
+  authProof: typeof import("../../lib/secure-transport").authProof;
   unwrap: typeof import("../../lib/secure-transport").unwrap;
+  deriveEpoch: typeof import("../../lib/ratchet").deriveEpoch;
+  messageKey: typeof import("../../lib/ratchet").messageKey;
+  chainNext: typeof import("../../lib/ratchet").chainNext;
+  ratchetTo: typeof import("../../lib/ratchet").ratchetTo;
 };
 
 /** Load the crypto modules; throws where the native HQC lib is unavailable. */
@@ -30,25 +35,42 @@ export async function loadCrypto(): Promise<Crypto> {
   const hqc = await import("../../lib/hqc");
   const botCrypto = await import("../../bot/crypto");
   const transport = await import("../../lib/secure-transport");
+  const ratchet = await import("../../lib/ratchet");
   return {
     HqcWrapper: hqc.HqcWrapper,
-    PARAM_K: hqc.HQC_CONSTANTS.PARAM_K,
-    hqcEncrypt: botCrypto.hqcEncrypt,
-    hqcDecrypt: botCrypto.hqcDecrypt,
+    hqcEncapsulate: botCrypto.hqcEncapsulate,
+    hqcDecapsulate: botCrypto.hqcDecapsulate,
     aesEncrypt: botCrypto.aesEncrypt,
     aesDecrypt: botCrypto.aesDecrypt,
     deriveSharedKey: botCrypto.deriveSharedKey,
     freshSeed: botCrypto.freshSeed,
     deriveSessionKeys: transport.deriveSessionKeys,
+    authProof: transport.authProof,
     unwrap: transport.unwrap,
+    deriveEpoch: ratchet.deriveEpoch,
+    messageKey: ratchet.messageKey,
+    chainNext: ratchet.chainNext,
+    ratchetTo: ratchet.ratchetTo,
   };
 }
 
+interface EpochState {
+  epoch: number;
+  sendCK: Buffer;
+  sendIdx: number;
+  recvCK: Buffer;
+  recvIdx: number;
+  skipped: Record<string, Buffer>;
+}
 interface FriendState {
   pk: string;
-  mySeed?: Buffer;
-  peerSeed?: Buffer;
+  mySeed?: Buffer; // our contributed shared secret (ss)
+  myCt?: Buffer;   // the KEM ciphertext we sent for mySeed (resent on re-handshake)
+  peerSeed?: Buffer; // ss decapsulated from the peer's ciphertext
   sharedKey?: Buffer;
+  cur?: EpochState;
+  prev?: EpochState;
+  rot?: { epoch: number; mySeed?: Buffer; myCt?: Buffer; peerSeed?: Buffer };
 }
 
 interface Waiter {
@@ -79,7 +101,7 @@ export class TestClient {
 
   constructor(private readonly c: Crypto, private readonly wsUrl: string, seed?: Buffer) {
     const s = seed ?? require("crypto").randomBytes(32);
-    const kp = c.HqcWrapper.generateKeypair(s);
+    const kp = c.HqcWrapper.keypairFromSeed(s);
     this.pk = kp.pk;
     this.sk = kp.sk;
     this.pkHex = kp.pk.toString("hex");
@@ -128,14 +150,49 @@ export class TestClient {
 
   // --- messaging ------------------------------------------------------------
 
-  /** Send a text message (inner AES + outer HQC, like the apps). */
+  /** Send a text message (AES-GCM under the ratchet/static key — no outer HQC,
+   *  §KM-1 step 5). At epoch ≥ 1 the key is a per-message ratchet key and the
+   *  frame carries epoch/idx. */
   sendMessage(username: string, text: string, messageId = require("crypto").randomUUID()) {
     const f = this.friends[username];
-    if (!f?.sharedKey || !f.pk) throw new Error(`no secure channel with ${username}`);
-    const aesB64 = this.c.aesEncrypt(text, f.sharedKey);
-    const ct = this.c.hqcEncrypt(Buffer.from(f.pk, "hex"), Buffer.from(aesB64, "utf8"));
-    this.send({ type: Out.MESSAGE, targetPk: username, payload: ct.toString("base64"), messageId });
+    if (!f?.pk) throw new Error(`no secure channel with ${username}`);
+    let key: Buffer, epoch: number | undefined, idx: number | undefined;
+    if (f.cur) {
+      key = this.c.messageKey(f.cur.sendCK);
+      epoch = f.cur.epoch;
+      idx = f.cur.sendIdx;
+      f.cur.sendCK = this.c.chainNext(f.cur.sendCK);
+      f.cur.sendIdx++;
+    } else {
+      if (!f.sharedKey) throw new Error(`no secure channel with ${username}`);
+      key = f.sharedKey;
+    }
+    const aesB64 = this.c.aesEncrypt(text, key);
+    this.send({ type: Out.MESSAGE, targetPk: username, payload: aesB64, messageId, epoch, idx });
     return messageId;
+  }
+
+  /** Current key-rotation epoch with `username` (0 = legacy static key). */
+  currentEpoch(username: string) { return this.friends[username]?.cur?.epoch ?? 0; }
+
+  /** Initiate a Tier-1 rotation to the next epoch (encapsulates our contribution). */
+  rotateKeys(username: string) {
+    const f = this.friends[username];
+    if (!f?.pk) throw new Error(`no friend ${username}`);
+    const nextEpoch = this.currentEpoch(username) + 1;
+    const { ct, ss } = this.c.hqcEncapsulate(Buffer.from(f.pk, "hex"));
+    f.rot = { epoch: nextEpoch, mySeed: ss, myCt: ct };
+    this.send({ type: Out.KEY_ROTATE, targetPk: username, payload: ct.toString("base64"), epoch: nextEpoch });
+  }
+
+  /** Resolve once the epoch with `username` reaches at least `epoch`. */
+  async waitForEpoch(username: string, epoch: number, timeoutMs = 15000): Promise<void> {
+    if (this.currentEpoch(username) >= epoch) return;
+    await this.once(
+      (m) => m.type === In.KEY_ROTATE && this.currentEpoch(username) >= epoch,
+      timeoutMs,
+      `epoch ${epoch} with ${username}`
+    );
   }
 
   /** Send a photo (AES-only on the channel key, like the apps). `content` is the
@@ -199,13 +256,14 @@ export class TestClient {
   private handle(msg: any) {
     switch (msg.type) {
       case In.AUTH_CHALLENGE: {
-        const nonce = this.c.hqcDecrypt(this.sk, Buffer.from(msg.payload, "base64"), false).subarray(0, this.c.PARAM_K);
-        this.rawSend({ type: Out.AUTH_VERIFY, payload: nonce.toString("base64") });
+        // §KM-1: decapsulate → ss, return HKDF(ss,"auth"). No plaintext echoed.
+        const ss = this.c.hqcDecapsulate(this.sk, Buffer.from(msg.payload, "base64"));
+        this.rawSend({ type: Out.AUTH_VERIFY, payload: this.c.authProof(ss).toString("base64") });
         break;
       }
       case In.SESSION_KEY: {
-        const seed = this.c.hqcDecrypt(this.sk, Buffer.from(msg.payload, "base64"), false).subarray(0, this.c.PARAM_K);
-        const keys = this.c.deriveSessionKeys(seed);
+        const ss = this.c.hqcDecapsulate(this.sk, Buffer.from(msg.payload, "base64"));
+        const keys = this.c.deriveSessionKeys(ss);
         this.txKey = keys.c2s;
         this.rxKey = keys.s2c;
         break;
@@ -227,7 +285,7 @@ export class TestClient {
         const sender = msg.sender as string;
         const f = this.friends[sender];
         if (!f) break;
-        f.peerSeed = this.c.hqcDecrypt(this.sk, Buffer.from(msg.payload, "base64"), false).subarray(0, this.c.PARAM_K);
+        f.peerSeed = this.c.hqcDecapsulate(this.sk, Buffer.from(msg.payload, "base64"));
         this.sendAesSeed(sender);
         if (f.mySeed && f.peerSeed) f.sharedKey = this.c.deriveSharedKey(f.mySeed, f.peerSeed);
         break;
@@ -235,11 +293,37 @@ export class TestClient {
       case In.DIRECT_MESSAGE: {
         const sender = msg.sender as string;
         const f = this.friends[sender];
-        if (!f?.sharedKey || sender === "SYSTEM") break;
+        if (!f || sender === "SYSTEM") break;
+        const epoch = Number.isInteger(msg.epoch) ? Number(msg.epoch) : 0;
         try {
-          const aesB64 = this.c.hqcDecrypt(this.sk, Buffer.from(msg.payload, "base64"), true).toString("utf8");
-          this.inbox.push({ from: sender, text: this.c.aesDecrypt(aesB64, f.sharedKey) });
+          // §KM-1 step 5: the payload is the AES-GCM base64 directly.
+          const aesB64 = msg.payload as string;
+          let key: Buffer | undefined;
+          if (epoch >= 1) key = this.obtainRecvKey(f, epoch, Number(msg.idx));
+          else key = f.sharedKey;
+          if (!key) break;
+          this.inbox.push({ from: sender, text: this.c.aesDecrypt(aesB64, key) });
         } catch { /* ignore undecryptable */ }
+        break;
+      }
+      case In.KEY_ROTATE: {
+        const sender = msg.sender as string;
+        const f = this.friends[sender];
+        if (!f?.pk) break;
+        const epoch = Number(msg.epoch);
+        if (!Number.isInteger(epoch) || epoch <= this.currentEpoch(sender)) break;
+        try {
+          const peerSs = this.c.hqcDecapsulate(this.sk, Buffer.from(msg.payload, "base64"));
+          if (!f.rot || f.rot.epoch !== epoch) f.rot = { epoch };
+          f.rot.peerSeed = peerSs;
+          if (!f.rot.mySeed) {
+            const { ct, ss } = this.c.hqcEncapsulate(Buffer.from(f.pk, "hex"));
+            f.rot.mySeed = ss;
+            f.rot.myCt = ct;
+            this.send({ type: Out.KEY_ROTATE, targetPk: sender, payload: ct.toString("base64"), epoch });
+          }
+          if (f.rot.mySeed && f.rot.peerSeed) this.installEpoch(f, epoch, f.rot.mySeed, f.rot.peerSeed);
+        } catch { /* ignore */ }
         break;
       }
       case In.IMAGE_MESSAGE: {
@@ -257,8 +341,32 @@ export class TestClient {
   private sendAesSeed(username: string) {
     const f = this.friends[username];
     if (!f?.pk) return;
-    if (!f.mySeed) f.mySeed = this.c.freshSeed();
-    const ct = this.c.hqcEncrypt(Buffer.from(f.pk, "hex"), f.mySeed);
-    this.send({ type: Out.AES, payload: ct.toString("base64"), targetPk: username });
+    // Encapsulate once and remember (ss, ct); resend the stored ct on re-handshake.
+    if (!f.mySeed || !f.myCt) {
+      const { ct, ss } = this.c.hqcEncapsulate(Buffer.from(f.pk, "hex"));
+      f.mySeed = ss;
+      f.myCt = ct;
+    }
+    this.send({ type: Out.AES, payload: f.myCt.toString("base64"), targetPk: username });
+  }
+
+  private installEpoch(f: FriendState, epoch: number, mySeed: Buffer, peerSeed: Buffer) {
+    const k = this.c.deriveEpoch(mySeed, peerSeed);
+    if (f.cur) f.prev = f.cur;
+    f.cur = { epoch, sendCK: k.sendCK, sendIdx: 0, recvCK: k.recvCK, recvIdx: 0, skipped: {} };
+    delete f.rot;
+  }
+
+  private obtainRecvKey(f: FriendState, epoch: number, idx: number): Buffer | undefined {
+    const es = f.cur?.epoch === epoch ? f.cur : (f.prev?.epoch === epoch ? f.prev : undefined);
+    if (!es || !Number.isInteger(idx) || idx < 0) return undefined;
+    const cached = es.skipped[String(idx)];
+    if (cached) { delete es.skipped[String(idx)]; return cached; }
+    if (idx < es.recvIdx) return undefined;
+    const step = this.c.ratchetTo(es.recvCK, es.recvIdx, idx);
+    for (const s of step.skipped) es.skipped[String(s.idx)] = s.key;
+    es.recvCK = step.ck;
+    es.recvIdx = step.nextIdx;
+    return step.messageKey;
   }
 }

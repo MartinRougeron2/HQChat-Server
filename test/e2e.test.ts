@@ -90,6 +90,31 @@ test("e2e: two clients, full journey over a live server", async (t) => {
       assert.ok(m.imageContent!.startsWith("IMAGE_ONCE:"));
     });
 
+    await t.test("key rotation to epoch 1 relays end-to-end; messages decrypt under the ratchet", async () => {
+      const aliceRotated = alice.waitForEpoch(bobName, 1);
+      const bobRotated = bob.waitForEpoch(aliceName, 1);
+      alice.rotateKeys(bobName);
+      await Promise.all([aliceRotated, bobRotated]);
+      assert.equal(alice.currentEpoch(bobName), 1);
+      assert.equal(bob.currentEpoch(aliceName), 1);
+
+      alice.sendMessage(bobName, "post-rotation A→B 🔁");
+      const m1 = await bob.nextMessage();
+      assert.equal(m1.from, aliceName);
+      assert.equal(m1.text, "post-rotation A→B 🔁");
+
+      bob.sendMessage(aliceName, "post-rotation B→A 🔁");
+      const m2 = await alice.nextMessage();
+      assert.equal(m2.from, bobName);
+      assert.equal(m2.text, "post-rotation B→A 🔁");
+    });
+
+    await t.test("second ratchet message advances the chain (distinct keys per message)", async () => {
+      alice.sendMessage(bobName, "msg idx 1");
+      const m = await bob.nextMessage();
+      assert.equal(m.text, "msg idx 1");
+    });
+
     await t.test("/info advertises protocol + admission", async () => {
       const httpUrl = WS_URL.replace(/^ws/, "http").replace(/\/ws$/, "") + "/info";
       const res = await fetch(httpUrl);

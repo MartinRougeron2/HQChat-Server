@@ -8,23 +8,19 @@
  * the control plane (instructions/metadata) from anyone who breaks TLS, while
  * the inner client-to-client payload stays sealed end-to-end.
  *
- * Key establishment is a dedicated HQC key exchange (separate from the auth
- * nonce): after auth, the server generates a fresh 24-byte seed, HQC-encrypts it
- * to the client's public key, and both sides derive
- *   sessionKey = HKDF-SHA256(seed, salt="salt", info="session", 32).
+ * Key establishment is a dedicated HQC KEM encapsulation (SECURITY_AUDIT §KM-1,
+ * separate from the auth handshake): after auth, the server encapsulates to the
+ * client's public key → (ct, ss), sends the KEM ciphertext `ct`, the client
+ * decapsulates it to recover the same 32-byte shared secret `ss`, and both sides
+ * derive per-direction transport keys
+ *   sessionKey_dir = HKDF-SHA256(ss, salt="salt", info="session-"+dir, 32).
+ * The "session-c2s"/"session-s2c" info values are the transport domain (§KM-2).
  *
  * Wire format once the key exists: `{"enc":"<base64 AES-GCM>"}` where the
  * AES-GCM blob is `[IV 12][tag 16][ciphertext]` — identical to the Swift
  * AESService / bot crypto, so client, server, and bot interoperate.
  */
 import * as crypto from "crypto";
-
-// HQC params (mirror HQC_CONSTANTS in ./hqc). Hardcoded here so this module can
-// be imported without loading the native HQC lib — only hqcEncryptSeed needs it,
-// and it lazy-loads it at call time. Lets the AES/HKDF/envelope code (and its
-// tests) run on platforms without the Linux .so.
-const PARAM_K = 24;
-const SEED_BYTES = 32;
 
 // AES-256-GCM, [IV 12][tag 16][ct], base64 — matches Swift AESService.
 export function aesEncrypt(plaintext: string, key: Buffer): string {
@@ -62,23 +58,24 @@ export function deriveSessionKeys(seed: Buffer): { c2s: Buffer; s2c: Buffer } {
   return { c2s: deriveOne(seed, "c2s"), s2c: deriveOne(seed, "s2c") };
 }
 
-/** A 24-byte session seed whose last byte is non-zero, so the HQC null-trim on
- *  the receiving side leaves it intact. */
-export function freshSessionSeed(): Buffer {
-  let s: Buffer;
-  do {
-    s = crypto.randomBytes(PARAM_K);
-  } while (s[PARAM_K - 1] === 0);
-  return s;
+/** Auth proof from a KEM shared secret (§KM-1/§KM-2). One-way HKDF with the
+ *  "auth" domain: proves possession of `ss` without revealing it, and can't be
+ *  replayed as the transport ("session-*") or channel key. The server stores this
+ *  as the expected value; the client returns the identical value computed from
+ *  its decapsulated `ss`. Shared here so server and client can't drift. */
+export function authProof(ss: Buffer): Buffer {
+  return Buffer.from(
+    crypto.hkdfSync("sha256", ss, Buffer.from("salt", "utf8"), Buffer.from("auth", "utf8"), 32)
+  );
 }
 
-/** HQC-encrypt a 24-byte session seed to a public key (single block). Lazy-loads
- *  the native HQC lib so this module is importable where the lib is absent. */
-export function hqcEncryptSeed(pk: Buffer, seed: Buffer): Buffer {
-  if (seed.length !== PARAM_K) throw new Error("session seed must be PARAM_K bytes");
+/** Encapsulate a fresh transport shared secret to the client's public key.
+ *  Returns the KEM ciphertext `ct` to send to the client and the 32-byte shared
+ *  secret `ss` to derive the session keys from. Lazy-loads the native HQC lib so
+ *  this module is importable where the lib is absent (AES/HKDF tests). */
+export function encapsulateSession(pk: Buffer): { ct: Buffer; ss: Buffer } {
   const { HqcWrapper } = require("./hqc") as typeof import("./hqc");
-  const theta = crypto.randomBytes(SEED_BYTES);
-  return HqcWrapper.encrypt(pk, Buffer.from(seed), theta);
+  return HqcWrapper.encapsulate(pk);
 }
 
 /** Encrypt an already-serialized JSON string into a transport envelope. When no

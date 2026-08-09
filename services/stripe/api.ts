@@ -1,3 +1,4 @@
+import { logger } from '../../lib/logger';
 import Stripe from 'stripe';
 import { DB } from '../db/api';
 import { blindedPk as hashPk } from '../../lib/crypto-utils';
@@ -146,11 +147,11 @@ export const StripeService = {
     const customer = await stripeClient().customers.retrieve(customerId);
     const blindedPk = (customer as any)?.metadata?.blinded_pk as string | undefined;
     if (!blindedPk) {
-      console.log(`⚠️ [stripe] No blinded_pk on customer ${customerId}; ignoring`);
+      logger.debug(`⚠️ [stripe] No blinded_pk on customer ${customerId}; ignoring`);
       return;
     }
     await DB.updateUserTier(blindedPk, active ? 'premium' : 'free');
-    console.log(`💳 [stripe] ${blindedPk.substring(0, 8)} → ${active ? 'premium' : 'free'}`);
+    logger.debug(`💳 [stripe] ${blindedPk.substring(0, 8)} → ${active ? 'premium' : 'free'}`);
   },
 
   async getCustomerId(blindedPk: string): Promise<string | null> {

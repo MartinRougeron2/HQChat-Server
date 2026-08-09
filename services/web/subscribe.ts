@@ -1,3 +1,4 @@
+import { logger } from "../../lib/logger";
 import { IncomingMessage, ServerResponse } from "http";
 import { StripeService } from "../stripe/api";
 
@@ -117,7 +118,7 @@ export async function handleSubscribe(req: IncomingMessage, res: ServerResponse)
     res.end();
     return;
   } catch (e: any) {
-    console.error("[subscribe] error:", e?.message || e);
+    logger.error("[subscribe] error:", e?.message || e);
     return send(res, 500, page("Error", `<h1>Something went wrong</h1>
       <p>Please try again in a moment.</p>`));
   }

@@ -1,162 +1,96 @@
-import {load, IKoffiLib, array, struct, decode, encode} from 'koffi';
+import { logger } from './logger';
+import koffi, { load, IKoffiLib } from 'koffi';
 
 // ==========================================
-// 1. CONFIGURATION & CONSTANTS
+// HQC IND-CCA2 KEM binding (SECURITY_AUDIT §KM-1)
 // ==========================================
-const PARAM_N = 57637;
-const VEC_N_SIZE_64 = Math.ceil(PARAM_N / 64); // 901
+// The bare IND-CPA PKE (encrypt-a-seed) is gone. This binds the three native KEM
+// wrappers from implement/lib/src/low_wrap.c:
+//   • hqc_kem_keypair_wrap(seed) -> (pk, sk)   — deterministic from a 32-byte seed
+//   • hqc_kem_enc_wrap(pk)       -> (ct, ss)   — encapsulate, fresh OS entropy
+//   • hqc_kem_dec_wrap(ct, sk)   -> ss          — decapsulate (constant-time)
+// The shared secret `ss` is 32 bytes; callers stretch it with HKDF + a per-use
+// `info` (domain separation, §KM-2). KM-3 hygiene: the wrappers write into
+// CALLER-allocated Buffers and return an int status, so there is no malloc on the
+// native side and no cross-module `free()` here (the old libc `free` binding is
+// removed).
 
 export const HQC_CONSTANTS = {
-  PARAM_K: 24,                    
   SEED_BYTES: 32,
   PUBLIC_KEY_BYTES: 7237,
   SECRET_KEY_BYTES: 7333,
-  VEC_N_SIZE_64: VEC_N_SIZE_64,
-  // Ciphertext size = 2 arrays * 901 uint64s * 8 bytes
-  CIPHERTEXT_SIZE_BYTES: 2 * VEC_N_SIZE_64 * 8 
+  CIPHERTEXT_BYTES: 14421, // CRYPTO_CIPHERTEXTBYTES (HQC-256 KEM)
+  SHARED_SECRET_BYTES: 32, // CRYPTO_BYTES
 };
 
 // ==========================================
-// 2. LOAD LIBRARIES
+// Load the native library
 // ==========================================
-
-// A. Load your HQC Library
 let libHQC: IKoffiLib;
 try {
-  libHQC = load("./lib/libhqc_x86.so");
+  libHQC = load('./lib/libhqc_x86.so');
 } catch (e) {
-  console.error("Could not load hqc lib.", e);
+  logger.error('Could not load hqc lib.', e);
   throw e;
 }
 
-// B. Load Standard C Library (for 'free')
-// We need this to free the memory allocated by malloc in your C code.
-let libC: IKoffiLib;
+// Output buffers are pre-allocated in JS and passed as koffi.out pointers; koffi
+// copies the native-written bytes back after the call. `seed`/`pk`/`ct`/`sk`
+// inputs are plain `uint8*`.
+const outU8 = koffi.out(koffi.pointer('uint8'));
 
-try {
-  libC = load('libc.so.6');
-} catch (e) {
-  console.warn("Could not load libc for free(). Memory leaks may occur.", e);
-  // Fallback: If your libhqc.so exports 'free' dynamically, we try to use that.
-  libC = libHQC; 
-}
+// int hqc_kem_keypair_wrap(const uint8_t seed[32], uint8_t pk[7237], uint8_t sk[7333]);
+const hqc_kem_keypair_wrap = libHQC.func('hqc_kem_keypair_wrap', 'int', ['uint8*', outU8, outU8]);
+// int hqc_kem_enc_wrap(uint8_t ct[14421], uint8_t ss[32], const uint8_t pk[7237]);
+const hqc_kem_enc_wrap = libHQC.func('hqc_kem_enc_wrap', 'int', [outU8, outU8, 'uint8*']);
+// int hqc_kem_dec_wrap(uint8_t ss[32], const uint8_t ct[14421], const uint8_t sk[7333]);
+const hqc_kem_dec_wrap = libHQC.func('hqc_kem_dec_wrap', 'int', [outU8, 'uint8*', 'uint8*']);
 
 // ==========================================
-// 3. DEFINE TYPES & FUNCTIONS
+// Wrapper class
 // ==========================================
-
-// Define the 'free' function signature
-const c_free = libC.func("free", "void", ["void*"]);
-
-// Define HQC Structs
-const CiphertextPkeStruct = struct("ciphertext_pke_t", {
-  u: array("uint64", HQC_CONSTANTS.VEC_N_SIZE_64),
-  v: array("uint64", HQC_CONSTANTS.VEC_N_SIZE_64),
-});
-
-const HqcKeypairStruct = struct("hqc_keypair_t", {
-  pk: "uint8*", 
-  sk: "uint8*", 
-});
-
-// 2. Define Function (Returns a Pointer to the struct)
-const hqc_keygen_wrap = libHQC.func("hqc_keygen_wrap", "hqc_keypair_t*", ["uint8*"]);
-// ciphertext_pke_t* hqc_encrypt_wrap(const uint8_t pk[], const uint8_t msg[], const uint8_t theta[]);
-const hqc_encrypt_wrap = libHQC.func("hqc_encrypt_wrap", "ciphertext_pke_t*", ["uint8*", "uint8*", "uint8*"]);
-const hqc_decrypt_wrap = libHQC.func("hqc_decrypt_wrap", "uint8*", ["uint8*", "ciphertext_pke_t*"]);
-// ==========================================
-// 4. WRAPPER CLASS
-// ==========================================
-
 export class HqcWrapper {
-  
-  static generateKeypair(seed: Buffer | number[]) {
-    // FIX 1: Input must be a TypedArray (Buffer or Uint8Array)
-    // Koffi cannot pass a plain JS Array [1, 2...] to a C pointer.
-    const seedTyped = new Uint8Array(seed);
-
-    if (seedTyped.length !== HQC_CONSTANTS.SEED_BYTES) {
+  /**
+   * Deterministic KEM keypair from a 32-byte identity seed. The public key is
+   * byte-identical to the pre-KEM build for the same seed (stable identity).
+   */
+  static keypairFromSeed(seed: Buffer | Uint8Array | number[]): { pk: Buffer; sk: Buffer } {
+    const seedBuf = Buffer.from(seed as any);
+    if (seedBuf.length !== HQC_CONSTANTS.SEED_BYTES) {
       throw new Error(`Seed must be ${HQC_CONSTANTS.SEED_BYTES} bytes`);
     }
-
-    // Call C Function
-    // returns: a pointer (External object)
-    const keypairPtr = hqc_keygen_wrap(seedTyped);
-
-    if (!keypairPtr) throw new Error("HQC Keygen failed (returned null pointer)");
-
-    try {
-      // FIX 2: Decode the Pointer to get the Struct
-      // We read 'HqcKeypairStruct' from the memory address 'keypairPtr'
-      const keypair = decode(keypairPtr, "hqc_keypair_t");
-
-      // Now 'keypair' is a JS Object: { pk: [External], sk: [External] }
-      // FIX 3: Decode the inner pointers (pk/sk) to get the actual bytes
-      const pkBytes = decode(keypair.pk, "uint8", HQC_CONSTANTS.PUBLIC_KEY_BYTES);
-      const skBytes = decode(keypair.sk, "uint8", HQC_CONSTANTS.SECRET_KEY_BYTES);
-
-      return {
-        pk: Buffer.from(pkBytes),
-        sk: Buffer.from(skBytes),
-      };
-
-    } finally {
-      // FIX 4: Free the main struct pointer
-      // (Assuming the C function malloc'd this struct and expects you to free it)
-      c_free(keypairPtr);
-    }
+    const pk = Buffer.alloc(HQC_CONSTANTS.PUBLIC_KEY_BYTES);
+    const sk = Buffer.alloc(HQC_CONSTANTS.SECRET_KEY_BYTES);
+    const rc = hqc_kem_keypair_wrap(seedBuf, pk, sk);
+    if (rc !== 0) throw new Error(`HQC keypair failed (rc=${rc})`);
+    return { pk, sk };
   }
 
-  static encrypt(pk: Buffer, message: Buffer, theta: Buffer) {
-    if (pk.length !== HQC_CONSTANTS.PUBLIC_KEY_BYTES) throw new Error("Invalid PK length");
-    if (message.length !== HQC_CONSTANTS.PARAM_K) throw new Error("Invalid Message length");
-    if (theta.length !== HQC_CONSTANTS.SEED_BYTES) throw new Error("Invalid Theta length");
-
-    // 1. Call C Function
-    const ctPtr = hqc_encrypt_wrap(pk, message, theta);
-
-    if (!ctPtr) throw new Error("HQC Encrypt failed");
-
-    try {
-      // 2. Extract Data
-      // Decode the entire struct memory into a raw byte array
-      const rawBytes = decode(ctPtr, "uint8", HQC_CONSTANTS.CIPHERTEXT_SIZE_BYTES);
-      
-      return Buffer.from(rawBytes);
-
-    } finally {
-      // 3. CLEANUP: Free the ciphertext struct
-      c_free(ctPtr);
-    }
+  /**
+   * Encapsulate to a public key. Returns the KEM ciphertext and the 32-byte
+   * shared secret. Fresh, unpredictable per call (native draws OS entropy).
+   */
+  static encapsulate(pk: Buffer): { ct: Buffer; ss: Buffer } {
+    if (pk.length !== HQC_CONSTANTS.PUBLIC_KEY_BYTES) throw new Error('Invalid PK length');
+    const ct = Buffer.alloc(HQC_CONSTANTS.CIPHERTEXT_BYTES);
+    const ss = Buffer.alloc(HQC_CONSTANTS.SHARED_SECRET_BYTES);
+    const rc = hqc_kem_enc_wrap(ct, ss, pk);
+    if (rc !== 0) throw new Error(`HQC encapsulate failed (rc=${rc})`);
+    return { ct, ss };
   }
 
- static decrypt(sk: Buffer, ciphertext: Buffer): Buffer {
-    if (sk.length !== HQC_CONSTANTS.SECRET_KEY_BYTES) throw new Error("Invalid SK length");
-    if (ciphertext.length !== HQC_CONSTANTS.CIPHERTEXT_SIZE_BYTES) throw new Error("Invalid Ciphertext length");
-
-    // 1. Decode Ciphertext Buffer back into a Pointer
-    // Koffi can automatically cast a Buffer to a pointer for "uint8*", 
-    // but for a struct pointer ("ciphertext_pke_t*"), we must be careful.
-    // Since 'ciphertext' is just a byte array matching the struct layout, 
-    // we can pass the buffer directly. Koffi treats Buffer as a memory address.
-    
-    // 2. Call C Function
-    // The C function allocates memory for the result and returns a pointer.
-    const msgPtr = hqc_decrypt_wrap(sk, ciphertext);
-
-    if (!msgPtr) throw new Error("HQC Decrypt failed (returned null pointer)");
-
-    try {
-      // 3. Extract Data
-      // We know the output message length is exactly PARAM_K
-      const msgBytes = decode(msgPtr, "uint8", HQC_CONSTANTS.PARAM_K);
-
-      // Return a Node.js Buffer (deep copy)
-      return Buffer.from(msgBytes);
-
-    } finally {
-      // 4. CLEANUP: Free the message memory allocated by C
-      c_free(msgPtr);
-    }
+  /**
+   * Decapsulate a KEM ciphertext with the secret key. Returns the 32-byte shared
+   * secret. Constant-time: a malformed/attacker-chosen ciphertext yields a
+   * pseudo-random secret (which won't match the sender's), never an error — so
+   * there is no decryption oracle to probe.
+   */
+  static decapsulate(sk: Buffer, ct: Buffer): Buffer {
+    if (sk.length !== HQC_CONSTANTS.SECRET_KEY_BYTES) throw new Error('Invalid SK length');
+    if (ct.length !== HQC_CONSTANTS.CIPHERTEXT_BYTES) throw new Error('Invalid Ciphertext length');
+    const ss = Buffer.alloc(HQC_CONSTANTS.SHARED_SECRET_BYTES);
+    const rc = hqc_kem_dec_wrap(ss, ct, sk);
+    if (rc !== 0) throw new Error(`HQC decapsulate failed (rc=${rc})`);
+    return ss;
   }
 }

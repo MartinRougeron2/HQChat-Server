@@ -6,6 +6,7 @@ import * as path from "path";
 import { exec } from "child_process";
 import { MessageTypesToSent, MessageTypesToReceive } from "./enums";
 import { HqcWrapper, HQC_CONSTANTS } from "./lib/hqc";
+import { authProof } from "./lib/secure-transport";
 
 const PORT = 8080;
 
@@ -29,63 +30,21 @@ interface AudioStream {
   startTime: Date;
 }
 
-/**
- * OUTER LAYER: HQC Encryption
- * Takes the AES ciphertext string and wraps it in HQC blocks.
- */
-function HqcEncrypt(publicKey: string, encryptedAESBase64: string): string {
-  const K = HQC_CONSTANTS.PARAM_K; // 24 bytes
-  const bufferPk = Buffer.from(publicKey, "hex");
-  // We treat the AES Base64 string as the plaintext for HQC
-  const dataToHide = Buffer.from(encryptedAESBase64, "utf8");
-
-  const chunks: Buffer[] = [];
-
-  for (let i = 0; i < dataToHide.length; i += K) {
-    let chunk = dataToHide.subarray(i, i + K);
-
-    // Pad the last chunk with zeros if it's less than 24 bytes
-    if (chunk.length < K) {
-      const padded = Buffer.alloc(K, 0);
-      chunk.copy(padded);
-      chunk = padded;
-    }
-
-    const theta = crypto.randomBytes(HQC_CONSTANTS.SEED_BYTES);
-    const encryptedBlock = HqcWrapper.encrypt(bufferPk, chunk, theta);
-    chunks.push(encryptedBlock);
-  }
-
-  return Buffer.concat(chunks).toString("base64");
+// §KM-1 step 5: the per-message outer HQC layer is gone — text/media are AES-GCM
+// only under the per-friend channel key. These wrappers are now identity
+// pass-throughs so the many call sites below stay unchanged (the payload is the
+// AES-GCM base64 both ways).
+function HqcEncrypt(_publicKey: string, encryptedAESBase64: string): string {
+  return encryptedAESBase64;
 }
-
-/**
- * OUTER LAYER: HQC Decryption
- * Slices the incoming HQC stream and recovers the AES ciphertext string.
- */
-function HqcDecrypt(privateKey: string, hqcPayloadBase64: string): string {
-  const bufferSk = Buffer.from(privateKey, "hex");
-  const fullCt = Buffer.from(hqcPayloadBase64, "base64");
-  const CT_SIZE = HQC_CONSTANTS.CIPHERTEXT_SIZE_BYTES; // 14416
-
-  if (fullCt.length % CT_SIZE !== 0) throw new Error("Malformed HQC payload");
-
-  const decryptedChunks: Buffer[] = [];
-
-  for (let i = 0; i < fullCt.length; i += CT_SIZE) {
-    const block = fullCt.subarray(i, i + CT_SIZE);
-    const decryptedBlock = HqcWrapper.decrypt(bufferSk, block);
-    decryptedChunks.push(decryptedBlock);
-  }
-
-  // Join chunks and remove trailing null padding characters
-  return Buffer.concat(decryptedChunks).toString("utf8").replace(/\0+$/, "");
+function HqcDecrypt(_privateKey: string, aesPayloadBase64: string): string {
+  return aesPayloadBase64;
 }
 
 export function createClient(hexSeed: string) {
   const SERVER_URL = `wss://chat.martinrougeron.me/ws`;
   const seed = Buffer.from(hexSeed, "hex");
-  const keys = HqcWrapper.generateKeypair(seed);
+  const keys = HqcWrapper.keypairFromSeed(seed);
   const MY_PK = keys.pk.toString("hex");
   const MY_SK = keys.sk.toString("hex");
 
@@ -417,14 +376,15 @@ export function createClient(hexSeed: string) {
 
     switch (msg.type) {
       case MessageTypesToReceive.AUTH_CHALLENGE:
-        const sol = HqcWrapper.decrypt(
+        // §KM-1: decapsulate → ss, return HKDF(ss,"auth"). No plaintext echoed.
+        const ss = HqcWrapper.decapsulate(
           Buffer.from(MY_SK, "hex"),
           Buffer.from(msg.payload, "base64")
         );
         ws.send(
           JSON.stringify({
             type: MessageTypesToSent.AUTH_VERIFY,
-            payload: sol.toString("base64"),
+            payload: authProof(ss).toString("base64"),
           })
         );
         break;
@@ -458,13 +418,9 @@ export function createClient(hexSeed: string) {
         friendsMap.set(username, { pk: pk, aes: {} });
         console.log("set: ", pk);
 
-        // 2. Initiate HQC-to-AES Handshake
-        // Generate my seed
-        const mySeed = crypto.randomBytes(HQC_CONSTANTS.PARAM_K);
-        const theta = crypto.randomBytes(HQC_CONSTANTS.SEED_BYTES);
-
-        // Encrypt seed with THEIR PK
-        const ct = HqcWrapper.encrypt(Buffer.from(pk, "hex"), mySeed, theta);
+        // 2. Initiate the KEM handshake: encapsulate to THEIR PK → (ct, ss).
+        //    Keep ss (our contribution); send the ciphertext.
+        const { ct, ss: mySeed } = HqcWrapper.encapsulate(Buffer.from(pk, "hex"));
 
         // Update local state
         friendsMap.get(username)!.aes!.mySeed = mySeed;
@@ -497,21 +453,17 @@ export function createClient(hexSeed: string) {
 
         const cipherSeed = Buffer.from(msg.payload, "base64");
         try {
-          // Decrypt their seed with MY SK
-          const peerSeed = HqcWrapper.decrypt(
+          // Decapsulate their ciphertext with MY SK → the secret they contributed.
+          const peerSeed = HqcWrapper.decapsulate(
             Buffer.from(MY_SK, "hex"),
             cipherSeed
           );
           friend.aes!.peerSeed = peerSeed;
 
-          // If I haven't sent mine, send it now
+          // If I haven't contributed yet, encapsulate to them and send our ct.
           if (!friend.aes!.mySeed) {
-            const newSeed = crypto.randomBytes(HQC_CONSTANTS.PARAM_K);
-            const newTheta = crypto.randomBytes(HQC_CONSTANTS.SEED_BYTES);
-            const newCt = HqcWrapper.encrypt(
-              Buffer.from(friend.pk, "hex"),
-              newSeed,
-              newTheta
+            const { ct: newCt, ss: newSeed } = HqcWrapper.encapsulate(
+              Buffer.from(friend.pk, "hex")
             );
 
             friend.aes!.mySeed = newSeed;

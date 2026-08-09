@@ -1,5 +1,8 @@
+import { logger } from '../../lib/logger';
 import Redis from 'ioredis';
 import { friendshipHash, blindedPk } from '../../lib/crypto-utils';
+import { queryMetrics } from '../../lib/metrics';
+import { performance } from 'perf_hooks';
 require('dotenv').config();
 
 // Use REDIS_URL when provided (production, with password); fall back to a
@@ -19,7 +22,7 @@ const redis = process.env.REDIS_URL
 // than surfacing as Node's noisy "Unhandled error event" (which only fires when
 // no 'error' listener is registered). With lazyConnect this stays silent in
 // tests that never touch Redis.
-redis.on('error', (err) => console.error(`[redis] ${err.message}`));
+redis.on('error', (err) => logger.error(`[redis] ${err.message}`));
 
 const usernamesBlacklist = new Set([
   'admin', 'administrator', 'root', 'system', 'support', 'help', 'contact',
@@ -30,7 +33,7 @@ const usernamesBlacklist = new Set([
   'helper', 'dissqus'
 ]);
 
-export const DB = {
+const DBImpl = {
   // ============================================================
   // 1. IDENTITY & USER MANAGEMENT
   // ============================================================
@@ -86,7 +89,13 @@ export const DB = {
       throw new Error("Username can only contain letters, numbers, and underscores.");
     }
     if (usernamesBlacklist.has(newUsername.toLowerCase())) {
-      throw new Error("This username is not allowed.");
+      // Reserved handles (incl. the bot's 'helper'/'dissqus') are blocked for
+      // normal users. A trusted service identity that self-registered in the
+      // `admission:exempt` set — i.e. the helper bot — is allowed to claim its
+      // reserved handle; that's the whole reason the handle is reserved.
+      if (!(await this.isAdmissionExempt(pk))) {
+        throw new Error("This username is not allowed.");
+      }
     }
     // Who currently owns this name (if anyone)?
     const currentOwner = await this.getPkByUsername(newUsername);
@@ -97,13 +106,17 @@ export const DB = {
 
     // A name owned by a *different* pk may NOT be transferred — blindly handing
     // it over let any authenticated user take over (impersonate) another user or
-    // the helper bot (H3). The only exception is an explicitly allowlisted key:
-    // the helper bot legitimately needs to reclaim its handle after a seed/keypair
-    // regeneration. Everything else is refused.
+    // the helper bot (H3). The only exception is a trusted service identity: the
+    // helper bot legitimately needs to reclaim its handle after a seed/keypair
+    // regeneration (e.g. its state volume was lost). We recognise it by the same
+    // self-registered `admission:exempt` set it writes on startup — so this needs
+    // no manual, stale-prone BOT_PUBLIC_KEY list. The static env is still honoured
+    // as an optional override. Everything else is refused.
     if (currentOwner && currentOwner !== pk) {
       const botKeys = (process.env.BOT_PUBLIC_KEY || '')
         .split(',').map((s) => s.trim()).filter(Boolean);
-      if (!botKeys.includes(pk)) {
+      const trusted = botKeys.includes(pk) || (await this.isAdmissionExempt(pk));
+      if (!trusted) {
         throw new Error('USERNAME_TAKEN');
       }
       await redis.hdel(`user:${currentOwner}`, 'username');
@@ -204,6 +217,23 @@ export const DB = {
   /** Whether the blinded pk has an active StoreKit subscription on record. */
   async isStoreKitPremium(blindedPk: string): Promise<boolean> {
     return (await redis.exists(`storekit:${blindedPk}`)) === 1;
+  },
+
+  /**
+   * Self-registered admission exemptions. The helper bot writes its own pk here
+   * on startup (see messages/bot/bot.ts) so it's admitted under any policy
+   * without an operator hand-copying its key into EXEMPT_PUBLIC_KEYS — which
+   * would go stale whenever the bot's seed/identity changes. Being exempt only
+   * waives the payment/allowlist gate; the caller still had to pass HQC auth,
+   * so only the holder of that private key benefits.
+   */
+  async addAdmissionExempt(pk: string) {
+    await redis.sadd('admission:exempt', pk.toLowerCase());
+  },
+
+  /** Whether this pk self-registered an admission exemption. */
+  async isAdmissionExempt(pk: string): Promise<boolean> {
+    return (await redis.sismember('admission:exempt', pk.toLowerCase())) === 1;
   },
 
   // ============================================================
@@ -383,3 +413,44 @@ export const DB = {
 
   disconnect() { redis.disconnect(); }
 };
+
+// Wrap every DB method so its wall-clock time is recorded (see lib/metrics.ts).
+// Only async methods (the ones that hit Redis) are timed; sync helpers and plain
+// value members pass straight through. `this` is bound to the raw impl so a
+// method that calls a sibling (e.g. resolveToPk → getPkByUsername) records only
+// the top-level operation, not a double-counted nested one.
+function instrument<T extends object>(impl: T): T {
+  return new Proxy(impl, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== 'function') return value;
+      const op = String(prop);
+      return (...args: unknown[]) => {
+        const start = performance.now();
+        let out: unknown;
+        try {
+          out = (value as (...a: unknown[]) => unknown).apply(target, args);
+        } catch (e) {
+          queryMetrics.record(op, performance.now() - start, false);
+          throw e;
+        }
+        // Only time genuine promises; sync helpers keep their return value.
+        if (out && typeof (out as any).then === 'function') {
+          return (out as Promise<unknown>).then(
+            (r) => {
+              queryMetrics.record(op, performance.now() - start, true);
+              return r;
+            },
+            (e) => {
+              queryMetrics.record(op, performance.now() - start, false);
+              throw e;
+            }
+          );
+        }
+        return out;
+      };
+    },
+  });
+}
+
+export const DB = instrument(DBImpl);

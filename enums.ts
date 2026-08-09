@@ -9,6 +9,7 @@ enum MessageTypesToSent {
     AUDIO_STREAM_CHUNK = 'audio_stream_chunk',
     AUDIO_STREAM_END = 'audio_stream_end',
     AES = 'aes',
+    KEY_ROTATE = 'key_rotate', // Tier-1 epoch re-handshake (relayed like AES)
     GET_FRIENDS = 'get_friends',
     ADD_FRIEND = 'add_friend',   // Actually triggers DB.invite
     ACCEPT_INVITE = 'accept_invite',
@@ -55,6 +56,7 @@ enum MessageTypesToReceive {
     AUDIO_STREAM_CHUNK = 'audio_stream_chunk',
     AUDIO_STREAM_END = 'audio_stream_end',
     AES = 'aes',
+    KEY_ROTATE = 'key_rotate', // Tier-1 epoch re-handshake (relayed like AES)
     ROOM_MESSAGE = 'room_message',
 
     // Calls

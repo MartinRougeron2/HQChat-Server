@@ -2,11 +2,11 @@ import { test } from "node:test";
 import { strict as assert } from "node:assert";
 import * as nodeCrypto from "node:crypto";
 
-// Exercises the bot's crypto against the real HQC library. The lib is Linux/x86
-// only, so on other platforms (e.g. the dev Mac) these are skipped rather than
-// crashing on import. In CI (ubuntu) they run for real.
+// Exercises the bot's KEM crypto against the real HQC library. The lib is
+// Linux/x86 only, so on other platforms (e.g. the dev Mac) these are skipped
+// rather than crashing on import. In CI (ubuntu) they run for real.
 
-test("bot HQC + AES + HKDF round-trip", async (t) => {
+test("bot HQC KEM + AES + HKDF round-trip", async (t) => {
   let botCrypto: typeof import("../bot/crypto");
   let hqc: typeof import("../lib/hqc");
   try {
@@ -16,16 +16,21 @@ test("bot HQC + AES + HKDF round-trip", async (t) => {
     return t.skip("HQC native lib unavailable on this platform");
   }
 
-  const { hqcEncrypt, hqcDecrypt, aesEncrypt, aesDecrypt, deriveSharedKey, freshSeed } = botCrypto;
+  const { hqcEncapsulate, hqcDecapsulate, aesEncrypt, aesDecrypt, deriveSharedKey, freshSeed } = botCrypto;
   const { HqcWrapper } = hqc;
 
-  // Keypair from a random seed.
-  const { pk, sk } = HqcWrapper.generateKeypair(nodeCrypto.randomBytes(32));
+  // Deterministic keypair from a seed; the public key is reproducible.
+  const seed = nodeCrypto.randomBytes(32);
+  const { pk, sk } = HqcWrapper.keypairFromSeed(seed);
+  assert.ok(HqcWrapper.keypairFromSeed(seed).pk.equals(pk), "keygen is deterministic (stable pk)");
 
-  // HQC chunking round-trips a multi-block message (>24 bytes).
-  const msg = Buffer.from("the quick brown fox jumps over the lazy dog — 1234567890");
-  const recovered = hqcDecrypt(sk, hqcEncrypt(pk, msg), true);
-  assert.equal(recovered.toString("utf8"), msg.toString("utf8"), "HQC round-trip");
+  // KEM: encapsulate → (ct, ss); decapsulate recovers the same 32-byte secret.
+  const { ct, ss } = hqcEncapsulate(pk);
+  assert.equal(ss.length, 32, "shared secret is 32 bytes");
+  assert.ok(hqcDecapsulate(sk, ct).equals(ss), "KEM encapsulate/decapsulate agree");
+
+  // A different encapsulation yields a different (fresh) shared secret.
+  assert.ok(!hqcEncapsulate(pk).ss.equals(ss), "each encapsulation is fresh");
 
   // AES-GCM (the Swift [IV][tag][ct] layout) round-trips, incl. emoji.
   const key = nodeCrypto.randomBytes(32);
