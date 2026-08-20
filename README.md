@@ -1,55 +1,79 @@
-# DissQus Server
+# hqchat server
 
-The open-source server component for **DissQus**, a privacy-first, post-quantum
-secure messenger. It is a thin **relay**: it routes messages by username and
-queues offline delivery, but it never holds the keys needed to read message
-content or call media — those are end-to-end encrypted between clients (AES-256-GCM
-under a per-friend key exchanged via HQC). Control-plane frames (the action type,
-routing metadata) are additionally encrypted hop-by-hop with a per-connection,
-per-direction key derived from a dedicated HQC key exchange.
+The server half of [hqchat](https://github.com/MartinRougeron2/HQCAT), an
+end-to-end encrypted messenger with a post-quantum handshake.
 
-Licensed under **AGPL-3.0** (see [LICENSE](./LICENSE)). The DissQus client apps are
-separate and not covered by this license.
+It is not a relay in the usual sense: **it never sees a message.** It proves that
+a client holds a private key, decides who may publish to which topic, and lets
+EMQX fan out ciphertext it has no key for. The interesting code is all in the
+first two of those.
 
-## Topology
+Licensed **AGPL-3.0** ([LICENSE](./LICENSE)).
 
-Each server is its own **island**: a profile talks only to users on the same
-server (no federation yet). Run your own server and it's a self-contained network.
+## Services
 
-## Requirements
+One image, several entrypoints. All of them run on one VM today.
 
-- Node.js 20+
-- Redis
-- The **HQC native library** (`lib/libhqc_x86.so`, Linux/x86). HQC is a
-  post-quantum KEM; its source and build are external to this repo — build the
-  shared library from the HQC reference implementation and place it at
-  `lib/libhqc_x86.so`. (Tip: do this inside a Docker image so self-hosters never
-  touch the native toolchain.)
+| Service | Entrypoint | Owns |
+|---|---|---|
+| **auth** | `auth/main.ts` | the HQC-KEM handshake, session + MQTT tokens, admission, and the EMQX authn hook |
+| **app-api** | `api/main.ts` | directory, friend graph (which writes the broker's topic ACL), push tokens, account deletion, payments |
+| **push-bridge** | `push/main.ts` | subscribes to every conversation, sends a content-free APNs wake to offline members |
+| **broker-watch** | `ops/broker-watch.ts` | polls EMQX and Redis health, escalates transitions to Sentry |
+| **helper bot** | `bot/bot.ts` | the account every new user starts with — an ordinary MQTT client, no special privileges |
 
-## Configure
+Plus **EMQX** (messaging, per-topic ACL, offline sessions) and **Redis** (tokens,
+ACL, friend graph, directory), neither of which is in this repo.
 
-Copy `deploy/.env.example` to `.env` and fill it in. Key settings:
+`legacy/` is the retired single-WebSocket monolith. It does not run; it is kept
+for its end-to-end tests. See [legacy/README.md](legacy/README.md).
 
-- `ADMISSION_POLICY` — `open` (default), `allowlist`, or `stripe`.
-  - `open`: anyone who passes HQC auth. Best for self-hosting.
-  - `allowlist`: only public keys in `ADMISSION_ALLOWLIST`.
-  - `stripe`: requires an active Stripe subscription (the official server).
-- `EXEMPT_PUBLIC_KEYS` — always bypass admission (e.g. the helper bot).
-- `SERVER_NAME`, `PUBLIC_BASE_URL` — advertised at `GET /info`.
-- `REDIS_URL`, `PORT`. Stripe/APNs only as needed.
+## Running it
 
-## Run
-
-```sh
+```bash
 npm ci
 npm run typecheck && npm test
-npx tsx server.ts          # or via PM2: deploy/ecosystem.config.js
+
+# the whole stack, including EMQX and Redis
+docker compose -f ../../infra/deploy/docker-compose.yml up -d
 ```
 
-## Endpoints
+Individual services: `npm run auth`, `npm run api`, `npm run push`,
+`npm run bot`, `npm run broker-watch`. Each needs Redis; `auth` and the bot also
+need the native HQC library (see below).
 
-- `GET /health` — liveness.
-- `GET /info` — `{ name, version, protocolVersion, admission, features }`. Clients
-  probe this to validate a URL and learn whether a subscription is required.
-- `WS /ws` — the app protocol.
-- `POST /stripe/webhook`, `/subscribe*` — only used with `ADMISSION_POLICY=stripe`.
+Configuration is environment variables — see `infra/deploy/.env.example`. There
+are no defaults pointing at anyone's deployment: unset means unset, and the
+services say so at startup.
+
+## The native HQC library
+
+`lib/hqc.ts` dlopens a native shared library built from the HQC reference
+implementation (`lib/libhqc_x86.so`, linux/x86_64, glibc — which is why the
+Docker image is Debian-based and not Alpine). The wrapper's source lives in the
+monorepo under `native/hqc/`.
+
+## How it fits together
+
+- [Authentication](https://github.com/MartinRougeron2/HQCAT/blob/main/docs/architecture/auth-flow.md) — the handshake, and why there are two tokens
+- [Messaging](https://github.com/MartinRougeron2/HQCAT/blob/main/docs/architecture/message-flow.md) — one message end to end, and what each hop can see
+- [The topic ACL](https://github.com/MartinRougeron2/HQCAT/blob/main/docs/architecture/emqx-acl.md) — the only thing between a stranger and a conversation
+- [Audits](https://github.com/MartinRougeron2/HQCAT/tree/main/docs/audits) — including the open findings
+
+## Where this code lives
+
+This repository is a mirror. The server is developed in the
+[HQCAT monorepo](https://github.com/MartinRougeron2/HQCAT) alongside the Apple
+clients and the infrastructure, and published here as a `git subtree` from
+`services/server/`.
+
+Issues and pull requests are welcome here. A PR against this repo is pulled back
+into the monorepo with `git subtree pull`, so nothing is lost — but if you are
+changing something that touches the clients too, the monorepo is the easier place
+to do it.
+
+## Security
+
+Please report vulnerabilities privately — see
+[SECURITY.md](https://github.com/MartinRougeron2/HQCAT/blob/main/SECURITY.md).
+Known open findings are listed in the audits linked above; check there first.

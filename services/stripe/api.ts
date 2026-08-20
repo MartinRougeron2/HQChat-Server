@@ -18,7 +18,7 @@ function stripeClient(): Stripe {
 
 const PRICE_ID = 'price_1TjySfKdAg16VdMqoBBdqisu';
 // Public origin for Stripe redirect URLs (was a myapp.com placeholder).
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://chat.martinrougeron.me';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://chat.example.com';
 
 export const StripeService = {
 

@@ -11,31 +11,31 @@
  * (Linux/CI/VPS). Callers should skip when `loadCrypto()` throws.
  */
 import WebSocket from "ws";
-import { MessageTypesToSent as Out, MessageTypesToReceive as In } from "../../enums";
+import { MessageTypesToSent as Out, MessageTypesToReceive as In } from "./enums";
 
 type Crypto = {
-  HqcWrapper: typeof import("../../lib/hqc").HqcWrapper;
-  hqcEncapsulate: typeof import("../../bot/crypto").hqcEncapsulate;
-  hqcDecapsulate: typeof import("../../bot/crypto").hqcDecapsulate;
-  aesEncrypt: typeof import("../../bot/crypto").aesEncrypt;
-  aesDecrypt: typeof import("../../bot/crypto").aesDecrypt;
-  deriveSharedKey: typeof import("../../bot/crypto").deriveSharedKey;
-  freshSeed: typeof import("../../bot/crypto").freshSeed;
-  deriveSessionKeys: typeof import("../../lib/secure-transport").deriveSessionKeys;
-  authProof: typeof import("../../lib/secure-transport").authProof;
-  unwrap: typeof import("../../lib/secure-transport").unwrap;
-  deriveEpoch: typeof import("../../lib/ratchet").deriveEpoch;
-  messageKey: typeof import("../../lib/ratchet").messageKey;
-  chainNext: typeof import("../../lib/ratchet").chainNext;
-  ratchetTo: typeof import("../../lib/ratchet").ratchetTo;
+  HqcWrapper: typeof import("../lib/hqc").HqcWrapper;
+  hqcEncapsulate: typeof import("../bot/crypto").hqcEncapsulate;
+  hqcDecapsulate: typeof import("../bot/crypto").hqcDecapsulate;
+  aesEncrypt: typeof import("../bot/crypto").aesEncrypt;
+  aesDecrypt: typeof import("../bot/crypto").aesDecrypt;
+  deriveSharedKey: typeof import("../bot/crypto").deriveSharedKey;
+  freshSeed: typeof import("../bot/crypto").freshSeed;
+  deriveSessionKeys: typeof import("./secure-transport").deriveSessionKeys;
+  authProof: typeof import("./secure-transport").authProof;
+  unwrap: typeof import("./secure-transport").unwrap;
+  deriveEpoch: typeof import("../lib/ratchet").deriveEpoch;
+  messageKey: typeof import("../lib/ratchet").messageKey;
+  chainNext: typeof import("../lib/ratchet").chainNext;
+  ratchetTo: typeof import("../lib/ratchet").ratchetTo;
 };
 
 /** Load the crypto modules; throws where the native HQC lib is unavailable. */
 export async function loadCrypto(): Promise<Crypto> {
-  const hqc = await import("../../lib/hqc");
-  const botCrypto = await import("../../bot/crypto");
-  const transport = await import("../../lib/secure-transport");
-  const ratchet = await import("../../lib/ratchet");
+  const hqc = await import("../lib/hqc");
+  const botCrypto = await import("../bot/crypto");
+  const transport = await import("./secure-transport");
+  const ratchet = await import("../lib/ratchet");
   return {
     HqcWrapper: hqc.HqcWrapper,
     hqcEncapsulate: botCrypto.hqcEncapsulate,
@@ -137,6 +137,14 @@ export class TestClient {
 
   addFriend(username: string) { this.send({ type: Out.ADD_FRIEND, payload: username }); }
   acceptInvite(username: string) { this.send({ type: Out.ACCEPT_INVITE, payload: username }); }
+  cancelInvite(username: string) { this.send({ type: Out.CANCEL_INVITE, payload: username }); }
+  removeFriend(username: string) { this.send({ type: Out.REMOVE_FRIEND, payload: username }); }
+
+  /** Irreversibly delete this account server-side and wait for confirmation. */
+  async deleteAccount(timeoutMs = 10000): Promise<void> {
+    this.send({ type: Out.DELETE_ACCOUNT });
+    await this.once((m) => m.type === In.ACCOUNT_DELETED, timeoutMs, "ACCOUNT_DELETED");
+  }
 
   /** Resolve once the AES secure channel with `username` is established. */
   async waitForSecureChannel(username: string, timeoutMs = 15000): Promise<void> {
@@ -171,6 +179,13 @@ export class TestClient {
     this.send({ type: Out.MESSAGE, targetPk: username, payload: aesB64, messageId, epoch, idx });
     return messageId;
   }
+
+  /** Tell the server this client is backgrounded (socket stays open). From here
+   *  on the server must queue + push rather than relay to us. */
+  background() { this.send({ type: Out.APP_BACKGROUND }); }
+
+  /** Back in the foreground — the server flushes anything queued meanwhile. */
+  foreground() { this.send({ type: Out.APP_FOREGROUND }); }
 
   /** Current key-rotation epoch with `username` (0 = legacy static key). */
   currentEpoch(username: string) { return this.friends[username]?.cur?.epoch ?? 0; }

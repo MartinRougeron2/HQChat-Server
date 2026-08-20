@@ -1,5 +1,6 @@
 import { logger } from '../../lib/logger';
 import Redis from 'ioredis';
+import * as crypto from 'crypto';
 import { friendshipHash, blindedPk } from '../../lib/crypto-utils';
 import { queryMetrics } from '../../lib/metrics';
 import { performance } from 'perf_hooks';
@@ -13,6 +14,22 @@ require('dotenv').config();
 // Redis — which avoids ioredis' "Unhandled error event" reconnect spam and an
 // open handle that keeps the test process alive. The server/bot issue commands,
 // which connect on demand.
+// Module-level so it can be referenced from default parameter positions (where
+// `this` is not typed).
+// MQTT connect token lifetime. Expiration-based rotation: EMQX is told the
+// token's `expire_at` and DISCONNECTS the client when it lapses; the client then
+// refreshes (/auth/refresh, using its longer REST session — no re-handshake) and
+// reconnects. Short (5m) to keep the replay window tight; reusable across
+// reconnects within that window.
+const MQTT_TOKEN_TTL_SECONDS = 5 * 60;
+
+// REST bearer session (app-api + /auth/refresh). Longer-lived than the one-time
+// MQTT connect token, refreshable, revoked on logout/delete.
+const REST_SESSION_TTL_SECONDS = 60 * 60;
+
+// How long an auth challenge (the KEM proof the client must return) stays open.
+const AUTH_CHALLENGE_TTL_SECONDS = 60;
+
 const redisOptions = { lazyConnect: true } as const;
 const redis = process.env.REDIS_URL
   ? new Redis(process.env.REDIS_URL, redisOptions)
@@ -157,10 +174,16 @@ const DBImpl = {
       pipeline.srem('usernames:taken', username);
     }
 
-    // Tear down each friendship from BOTH sides (set link + blind hash).
+    // Tear down each friendship from BOTH sides (set link + blind hash), and
+    // with it the MQTT authorization both sides held for the shared topic.
+    // Without the ACL cleanup the deleted account's grants survived in Redis,
+    // and every friend kept a dangling entry for a pk that no longer exists.
     for (const friendPk of friendPks) {
+      const hash = friendshipHash(pk, friendPk);
       pipeline.srem(`friends:${friendPk}`, pk);
-      pipeline.del(`friendship:${friendshipHash(pk, friendPk)}`);
+      pipeline.del(`friendship:${hash}`);
+      pipeline.hdel(`mqtt_acl:${friendPk}`, `c/${hash}`, this.presenceTopic(pk));
+      pipeline.del(`hashmembers:${hash}`);
     }
 
     // Drop everything keyed by this pk.
@@ -169,11 +192,32 @@ const DBImpl = {
     pipeline.del(`pending:${pk}`);
     pipeline.del(`push:${pk}`);
     pipeline.del(`user:${pk}`);
+    // MQTT authorization + any outstanding connect token.
+    pipeline.del(`mqtt_acl:${pk}`);
+    pipeline.del(`mqtt_auth:${pk}`);
     // Subscription/tier is stored under the blinded pk.
     pipeline.del(`user:${blindedPk(pk)}`);
     pipeline.del(`storekit:${blindedPk(pk)}`);
 
     await pipeline.exec();
+
+    // Invites this user SENT live in other people's inboxes, keyed by our pk.
+    // They are not reachable from `friends:*`, so they need their own sweep —
+    // otherwise a deleted account keeps showing up as a pending invite.
+    // SCAN rather than KEYS: KEYS blocks the whole Redis instance, and this
+    // runs on a user-facing request.
+    await new Promise<void>((resolve, reject) => {
+      const stream = redis.scanStream({ match: 'invites:*', count: 200 });
+      const pending: Promise<unknown>[] = [];
+      stream.on('data', (keys: string[]) => {
+        if (keys.length === 0) return;
+        const sweep = redis.pipeline();
+        for (const key of keys) sweep.hdel(key, pk);
+        pending.push(sweep.exec());
+      });
+      stream.on('end', () => { Promise.all(pending).then(() => resolve(), reject); });
+      stream.on('error', reject);
+    });
   },
 
   // ============================================================
@@ -249,6 +293,28 @@ const DBImpl = {
 
     // We store the invite in the recipient's "inbox"
     await redis.hset(`invites:${toPk}`, fromPk, Date.now());
+  },
+
+  /**
+   * Withdraw an invite this user sent, or decline one they received.
+   * `removeFriend` cannot do this: it requires an established friendship, so a
+   * pending invite had no way to be taken back at all.
+   * Returns true when an invite was actually removed.
+   */
+  async cancelInvite(fromPk: string, toIdentifier: string): Promise<boolean> {
+    const toPk = await this.resolveToPk(toIdentifier);
+    if (!toPk) return false;
+    // The invite lives in the *recipient's* inbox, keyed by the sender.
+    const removed = await redis.hdel(`invites:${toPk}`, fromPk);
+    return removed > 0;
+  },
+
+  /** Decline an invite addressed to this user. */
+  async declineInvite(myPk: string, fromIdentifier: string): Promise<boolean> {
+    const fromPk = await this.resolveToPk(fromIdentifier);
+    if (!fromPk) return false;
+    const removed = await redis.hdel(`invites:${myPk}`, fromPk);
+    return removed > 0;
   },
 
   async getMyInvites(myPk: string) {
@@ -409,6 +475,175 @@ const DBImpl = {
     const data = await redis.hgetall(`push:${pk}`);
     if (!data || !data.token) return null;
     return { platform: data.platform || "ios", token: data.token };
+  },
+
+  // ============================================================
+  // 6. MQTT AUTHORIZATION (RLS) — friend-hash topic ACL
+  // ============================================================
+  //
+  // The MQTT migration (see deploy/EXTRACTION_PLAN.md) makes each conversation a
+  // topic `c/{friendshipHash}`. EMQX's Redis authorizer reads `mqtt_acl:{pk}` —
+  // a hash of `topic -> action` — on every SUBSCRIBE/PUBLISH. We grant the topic
+  // to BOTH members when a friendship forms and revoke it when it ends, so
+  // authorization is live: unfriending blocks the next pub/sub immediately
+  // (already-open subscriptions must additionally be kicked via the EMQX API).
+  //
+  // The topic name is derivable by anyone who knows both public keys, so security
+  // rests ENTIRELY on this ACL — never on topic-name secrecy.
+
+  /** Conversation topic between two public keys. */
+  mqttTopicFor(pk1: string, pk2: string): string {
+    return `c/${friendshipHash(pk1, pk2)}`;
+  },
+
+  /** A user's own presence + inbox topics. Presence: owner publishes (retained +
+   *  LWT), friends subscribe. Inbox: owner subscribes (offline wake target). */
+  presenceTopic(pk: string): string { return `u/${pk}/presence`; },
+  inboxTopic(pk: string): string { return `u/${pk}/inbox`; },
+
+  /** Grant a pk the topics it owns: publish on its presence, all on its inbox.
+   *  Idempotent; call on user creation and (harmlessly) on each token mint. */
+  async grantSelfTopics(pk: string): Promise<void> {
+    await redis.hset(`mqtt_acl:${pk}`, this.presenceTopic(pk), 'publish', this.inboxTopic(pk), 'all');
+  },
+
+  /** Grant both members everything they need for a friendship: pub/sub on the
+   *  shared conversation topic and subscribe on each other's presence. Also
+   *  records the topic's members so push-bridge can resolve recipients.
+   *  Idempotent. */
+  async grantFriendTopic(pkA: string, pkB: string): Promise<void> {
+    const hash = friendshipHash(pkA, pkB);
+    const convo = `c/${hash}`;
+    const pipeline = redis.pipeline();
+    pipeline.hset(`mqtt_acl:${pkA}`, convo, 'all', this.presenceTopic(pkB), 'subscribe');
+    pipeline.hset(`mqtt_acl:${pkB}`, convo, 'all', this.presenceTopic(pkA), 'subscribe');
+    pipeline.sadd(`hashmembers:${hash}`, pkA, pkB);
+    await pipeline.exec();
+  },
+
+  /** Revoke both members' friendship topics (conversation + each other's
+   *  presence) and forget the membership. Idempotent. Callers should ALSO kick
+   *  any live subscription via the EMQX API — the Redis edit only affects the
+   *  NEXT authorization check, not an already-open subscription. */
+  async revokeFriendTopic(pkA: string, pkB: string): Promise<void> {
+    const hash = friendshipHash(pkA, pkB);
+    const convo = `c/${hash}`;
+    const pipeline = redis.pipeline();
+    pipeline.hdel(`mqtt_acl:${pkA}`, convo, this.presenceTopic(pkB));
+    pipeline.hdel(`mqtt_acl:${pkB}`, convo, this.presenceTopic(pkA));
+    pipeline.del(`hashmembers:${hash}`);
+    await pipeline.exec();
+  },
+
+  /** The two public keys that share a conversation hash (for push-bridge). */
+  async getHashMembers(hash: string): Promise<string[]> {
+    return await redis.smembers(`hashmembers:${hash}`);
+  },
+
+  /** All topics a pk may access (for backfill/debugging). */
+  async getAclTopics(pk: string): Promise<string[]> {
+    return await redis.hkeys(`mqtt_acl:${pk}`);
+  },
+
+  // ============================================================
+  // 7. MQTT AUTHENTICATION — opaque connect token (password)
+  // ============================================================
+  //
+  // No JWT. The auth server, after the HQC-KEM handshake proves pk ownership,
+  // mints a random 32-byte token, stores only its SHA-256 in `mqtt_auth:{pk}`
+  // with a ~5m TTL, and returns the raw token to the client. The client presents
+  // it as the MQTT CONNECT password; EMQX's authn hook verifies it (below) and
+  // is handed the token's `expire_at` so EMQX disconnects the client at expiry —
+  // expiration-based rotation. Grant = mintMqttToken; revoke = revokeMqttAuth.
+
+  /** Seconds a freshly-minted MQTT token stays valid before refresh is required. */
+  MQTT_TOKEN_TTL_SECONDS,
+
+  /** Mint (and store the hash of) a fresh opaque MQTT connect token for `pk`.
+   *  Returns the RAW token — the only time it is ever available. */
+  async mintMqttToken(pk: string, ttlSeconds = MQTT_TOKEN_TTL_SECONDS): Promise<string> {
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const key = `mqtt_auth:${pk}`;
+    const pipeline = redis.pipeline();
+    pipeline.hset(key, { token_hash: tokenHash, exp: Date.now() + ttlSeconds * 1000 });
+    pipeline.expire(key, ttlSeconds);
+    await pipeline.exec();
+    return token;
+  },
+
+  /** Verify a presented token against the stored hash (constant-time) WITHOUT
+   *  consuming it — the token is reusable across reconnects until it expires.
+   *  Returns whether it is valid and, if so, its absolute `expireAt` (unix
+   *  seconds) so the auth hook can tell EMQX when to force a re-auth. Revocation
+   *  is immediate via revokeMqttAuth (DEL), and TTL bounds a stale token. */
+  async verifyMqttToken(pk: string, token: string): Promise<{ ok: boolean; expireAt: number }> {
+    const key = `mqtt_auth:${pk}`;
+    const stored = await redis.hget(key, 'token_hash');
+    if (!stored) return { ok: false, expireAt: 0 };
+    const a = Buffer.from(crypto.createHash('sha256').update(token).digest('hex'));
+    const b = Buffer.from(stored);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false, expireAt: 0 };
+    const ttl = await redis.ttl(key);
+    const expireAt = ttl > 0 ? Math.floor(Date.now() / 1000) + ttl : 0;
+    return { ok: true, expireAt };
+  },
+
+  /** Revoke a pk's current MQTT token immediately (account deletion / forced
+   *  logout). The next reconnect fails until a new token is minted; to drop an
+   *  already-open connection before its token expires, ALSO kick it via the EMQX
+   *  API (the "server can revoke" half of grant/revoke). */
+  async revokeMqttAuth(pk: string): Promise<void> {
+    await redis.del(`mqtt_auth:${pk}`);
+  },
+
+  /** Single-use nonce guard for a CONNECT. Returns true the FIRST time a nonce is
+   *  seen (and reserves it for `ttlSeconds`), false on any replay. */
+  async useNonce(nonce: string, ttlSeconds = MQTT_TOKEN_TTL_SECONDS): Promise<boolean> {
+    const ok = await redis.set(`mqttnonce:${nonce}`, '1', 'EX', ttlSeconds, 'NX');
+    return ok === 'OK';
+  },
+
+  // ============================================================
+  // 8. AUTH HANDSHAKE + REST SESSION (used by the auth server)
+  // ============================================================
+  //
+  // The HQC-KEM handshake proves a client owns its public key: the auth server
+  // encapsulates to the pk and stores the expected proof under `chal:{pk}`; the
+  // client decapsulates, returns the proof, and the server compares + consumes
+  // it. On success it issues a multi-use REST session bearer (app-api auth +
+  // token refresh) alongside the one-time MQTT connect token.
+
+  /** Store the expected KEM proof for an open challenge (hex). */
+  async startAuthChallenge(pk: string, proofHex: string, ttlSeconds = AUTH_CHALLENGE_TTL_SECONDS): Promise<void> {
+    await redis.set(`chal:${pk}`, proofHex, 'EX', ttlSeconds);
+  },
+
+  /** Atomically read AND delete the open challenge proof for `pk` (so it can't be
+   *  replayed). Returns the stored proof hex, or null if none. The caller does a
+   *  constant-time compare against the client's solution. */
+  async takeAuthChallenge(pk: string): Promise<string | null> {
+    const script =
+      "local v = redis.call('GET', KEYS[1]) if v then redis.call('DEL', KEYS[1]) end return v";
+    return (await redis.eval(script, 1, `chal:${pk}`)) as string | null;
+  },
+
+  /** Mint a multi-use REST session bearer for `pk`. Returns the raw token. */
+  async mintSessionToken(pk: string, ttlSeconds = REST_SESSION_TTL_SECONDS): Promise<string> {
+    const token = crypto.randomBytes(32).toString('hex');
+    await redis.set(`session:${token}`, pk, 'EX', ttlSeconds);
+    return token;
+  },
+
+  /** Resolve a REST session bearer to its pk (or null if unknown/expired). */
+  async resolveSessionToken(token: string): Promise<string | null> {
+    if (!token) return null;
+    return await redis.get(`session:${token}`);
+  },
+
+  /** Revoke a REST session bearer (logout / account deletion). */
+  async revokeSessionToken(token: string): Promise<void> {
+    await redis.del(`session:${token}`);
   },
 
   disconnect() { redis.disconnect(); }

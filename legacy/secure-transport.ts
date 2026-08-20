@@ -74,7 +74,7 @@ export function authProof(ss: Buffer): Buffer {
  *  secret `ss` to derive the session keys from. Lazy-loads the native HQC lib so
  *  this module is importable where the lib is absent (AES/HKDF tests). */
 export function encapsulateSession(pk: Buffer): { ct: Buffer; ss: Buffer } {
-  const { HqcWrapper } = require("./hqc") as typeof import("./hqc");
+  const { HqcWrapper } = require("../lib/hqc") as typeof import("../lib/hqc");
   return HqcWrapper.encapsulate(pk);
 }
 

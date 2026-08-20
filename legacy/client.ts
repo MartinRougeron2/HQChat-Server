@@ -5,8 +5,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { exec } from "child_process";
 import { MessageTypesToSent, MessageTypesToReceive } from "./enums";
-import { HqcWrapper, HQC_CONSTANTS } from "./lib/hqc";
-import { authProof } from "./lib/secure-transport";
+import { HqcWrapper, HQC_CONSTANTS } from "../lib/hqc";
+import { authProof } from "./secure-transport";
 
 const PORT = 8080;
 
@@ -42,7 +42,7 @@ function HqcDecrypt(_privateKey: string, aesPayloadBase64: string): string {
 }
 
 export function createClient(hexSeed: string) {
-  const SERVER_URL = `wss://chat.martinrougeron.me/ws`;
+  const SERVER_URL = process.env.SERVER_WS_URL || `ws://localhost:8080/ws`;
   const seed = Buffer.from(hexSeed, "hex");
   const keys = HqcWrapper.keypairFromSeed(seed);
   const MY_PK = keys.pk.toString("hex");

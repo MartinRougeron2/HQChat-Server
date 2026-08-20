@@ -1,8 +1,8 @@
 import { WebSocket } from 'ws';
 import * as crypto from 'crypto';
 import { MessageTypesToSent, MessageTypesToReceive } from './enums';
-import { HqcWrapper } from './lib/hqc';
-import { authProof } from './lib/secure-transport';
+import { HqcWrapper } from '../lib/hqc';
+import { authProof } from '../lib/auth-proof';
 
 const PORT = 8080;
 
