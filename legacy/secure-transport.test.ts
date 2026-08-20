@@ -7,7 +7,7 @@ import {
   deriveSessionKeys,
   wrapString,
   unwrap,
-} from "../lib/secure-transport";
+} from "./secure-transport";
 
 // These cover the transport-encryption layer that does NOT need the native HQC
 // lib (AES envelope + HKDF session key). The HQC seed exchange is exercised by

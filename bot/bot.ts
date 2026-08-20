@@ -1,21 +1,39 @@
 /**
  * DissQus helper bot — an always-on protocol client.
  *
- * It authenticates like a normal user (HQC challenge/response), sets a
- * username, auto-accepts friend requests, completes the AES secure-channel
- * handshake, and replies to messages. Its identity (seed) and per-friend keys
- * are persisted so it survives restarts.
+ * It authenticates like a normal user (HQC-KEM handshake over REST), claims a
+ * username, accepts friend invites, completes the KEM secure-channel handshake
+ * and replies to messages. Its identity (seed) and per-friend keys are persisted
+ * so it survives restarts.
+ *
+ * TRANSPORT (Phase 4 — see deploy/EXTRACTION_PLAN.md). The bot used to be the
+ * heaviest user of the `/ws` monolith: one socket carrying auth, the friend
+ * graph, presence and messages. It now speaks exactly what the apps speak —
+ * REST for control (auth + friends + username) and MQTT for conversations — so
+ * retiring `/ws` leaves it untouched, and there is no protocol only the bot
+ * knows how to talk.
+ *
+ * One behavioural consequence, shared with the apps: nothing pushes graph
+ * changes any more, so invites are picked up by POLLING (`FRIEND_POLL_MS`)
+ * rather than arriving as an event.
+ *
+ * The bot is a NORMAL MQTT user, not a service: it connects with its own public
+ * key as client id and username and a short-lived token as password, and EMQX
+ * holds it to the same per-topic ACL as everyone else. It never touches the
+ * `svc-internal` superuser credential — a bot that could read every
+ * conversation would undo the point of the ACL.
  *
  * Run on the VPS (it needs the Linux HQC lib). Env:
- *   SERVER_WS_URL   default wss://chat.martinrougeron.me/ws
+ *   AUTH_BASE_URL   default http://auth:8080
+ *   API_BASE_URL    default http://app-api:8080
+ *   EMQX_URL        default ws://emqx:8083/mqtt
  *   BOT_USERNAME    default "helper"
  *   BOT_SEED        32-byte hex seed (optional; generated + saved if absent)
  *
  * The bot self-admits: on startup it writes its own public key into the Redis
- * `admission:exempt` set (shared with the server), so it's admitted under any
- * ADMISSION_POLICY without an operator hand-copying its key into
- * EXEMPT_PUBLIC_KEYS. That survives the bot's seed/identity changing. It still
- * needs the server's Redis credentials (already provided in docker-compose).
+ * `admission:exempt` set (shared with the auth server), so it's admitted under
+ * any ADMISSION_POLICY without an operator hand-copying its key into
+ * EXEMPT_PUBLIC_KEYS. That survives the bot's seed/identity changing.
  */
 
 // First import: loads .env and resolves *_FILE Docker secrets (e.g. BOT_SEED_FILE).
@@ -25,13 +43,13 @@ import "../lib/config";
 // server hiccups and reconnects without silently dying.
 import { initObservability } from "../lib/observability";
 initObservability("bot");
+import { healthMonitor } from "../lib/health-monitor";
 import { logger } from "../lib/logger";
-import WebSocket from "ws";
+import mqtt, { type MqttClient } from "mqtt";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { HqcWrapper, HQC_CONSTANTS } from "../lib/hqc";
-import { MessageTypesToSent as Out, MessageTypesToReceive as In } from "../enums";
 import {
   hqcEncapsulate,
   hqcDecapsulate,
@@ -47,10 +65,22 @@ import {
   ROTATE_AFTER_MESSAGES,
   MAX_SKIPPED,
 } from "../lib/ratchet";
-import { unwrap, deriveSessionKeys, authProof } from "../lib/secure-transport";
+import { authProof } from "../lib/auth-proof";
+import { friendshipHash } from "../lib/crypto-utils";
 import { DB } from "../services/db/api";
-const WS_URL = process.env.SERVER_WS_URL || "wss://chat.martinrougeron.me/ws";
+
+const AUTH_BASE = (process.env.AUTH_BASE_URL || "http://auth:8080").replace(/\/$/, "");
+const API_BASE = (process.env.API_BASE_URL || "http://app-api:8080").replace(/\/$/, "");
+const EMQX_URL = process.env.EMQX_URL || "ws://emqx:8083/mqtt";
 const USERNAME = process.env.BOT_USERNAME || "helper";
+// Shown by the bot's /support reply. Deployment config, not a code constant.
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "support@example.com";
+/// How often to re-read the friend graph. There is no server push for it any
+/// more, and an invite that waits a few seconds is not worth a second protocol.
+const FRIEND_POLL_MS = Number(process.env.FRIEND_POLL_MS || 15_000);
+/// Don't re-offer our KEM ciphertext to an unresponsive peer on every single
+/// poll — once a minute is enough to heal a handshake that was lost in flight.
+const HANDSHAKE_RETRY_MS = 60_000;
 // Persist state (seed + per-friend keys) in a directory SEPARATE from the code.
 // In Docker the bot-state volume mounts at BOT_STATE_DIR — never over /app/bot
 // (the code dir), which would shadow bot.ts and pin the container to stale code
@@ -73,6 +103,11 @@ const seed = loadSeed();
 const { pk, sk } = HqcWrapper.keypairFromSeed(seed);
 const pkHex = pk.toString("hex");
 
+/** Public keys are 2KB of hex; logs get the ends only. */
+function short(hex: string): string {
+  return hex.length <= 20 ? hex : `${hex.slice(0, 8)}…${hex.slice(-8)}`;
+}
+
 // ── Per-friend state ─────────────────────────────────────────────────────────
 // Epoch ≥ 1 ratchet state (Tier 1 + Tier 2). All keys hex. `skipped` holds
 // message keys for out-of-order/offline receives, keyed by chain index.
@@ -87,6 +122,7 @@ interface EpochState {
 }
 interface FriendState {
   pk: string; // hex public key
+  username?: string; // display only — logs and the greeting text
   // Epoch 0 static channel key from the KEM handshake (§KM-1). `mySeed` is the
   // shared secret WE contributed (our encapsulation's ss); `myCt` is the KEM
   // ciphertext we sent for it (base64) — kept so a re-handshake re-sends the SAME
@@ -101,13 +137,45 @@ interface FriendState {
   prev?: EpochState; // one previous epoch, recv-only grace window
   rot?: { epoch: number; mySeed?: string; myCt?: string; peerSeed?: string }; // in-flight rotation
   sentInEpoch?: number; // messages sent since the last epoch install (count trigger)
+  // Whether this user has had the welcome message. Persisted with the rest of
+  // the friend state so a bot restart never re-greets someone.
+  greeted?: boolean;
 }
+/// Keyed by the peer's PUBLIC KEY hex — the same identity the conversation
+/// topic, the EMQX ACL and the envelope's `sender` are keyed on. It used to be
+/// keyed by username, because the `/ws` server resolved names for us; MQTT has
+/// no such mediator, and a mutable display name must never be what decides
+/// which key decrypts a message.
 type State = { friends: Record<string, FriendState> };
 
 let state: State = { friends: {} };
+
 function loadState() {
-  if (fs.existsSync(STATE_FILE)) {
-    try { state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { /* ignore */ }
+  if (!fs.existsSync(STATE_FILE)) return;
+  let raw: any;
+  try { raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return; }
+
+  // Migrate username-keyed state (every entry already carries its `pk`) to
+  // pk-keyed, keeping the old key as the display name. Entries with no usable
+  // pk are dropped: without one there is no topic to reach that peer on, so
+  // their keys are unusable regardless.
+  const friends: Record<string, FriendState> = {};
+  let migrated = 0;
+  let dropped = 0;
+  for (const [key, entry] of Object.entries((raw?.friends ?? {}) as Record<string, FriendState>)) {
+    const peerPk = String(entry?.pk || "").toLowerCase();
+    if (!/^[0-9a-f]{16,}$/.test(peerPk)) { dropped++; continue; }
+    if (peerPk !== key) {
+      if (!entry.username) entry.username = key;
+      migrated++;
+    }
+    entry.pk = peerPk;
+    friends[peerPk] = entry;
+  }
+  state = { friends };
+  if (migrated || dropped) {
+    logger.startup(`🤖 [bot] state re-keyed by public key: ${migrated} migrated, ${dropped} unusable`);
+    saveState();
   }
 }
 function saveState() {
@@ -115,99 +183,298 @@ function saveState() {
 }
 loadState();
 
-// ── Connection ───────────────────────────────────────────────────────────────
-let ws: WebSocket;
-// Per-connection transport keys (see lib/secure-transport). The bot is a client,
-// so it encrypts with c2s (txKey) and decrypts with s2c (rxKey). Null until the
-// server's SESSION_KEY arrives; reset on every (re)connect.
-let txKey: Buffer | null = null;
-let rxKey: Buffer | null = null;
-
-function send(obj: object) {
-  if (!(ws && ws.readyState === WebSocket.OPEN)) return;
-  const json = JSON.stringify(obj);
-  ws.send(txKey ? JSON.stringify({ enc: aesEncrypt(json, txKey) }) : json);
+/** Log/greeting label for a peer — its username if we know one, else its key. */
+function label(peerPk: string): string {
+  return state.friends[peerPk]?.username || short(peerPk);
 }
 
-function connect() {
-  logger.debug(`🤖 [bot] connecting to ${WS_URL} as "${USERNAME}"`);
-  logger.debug(`🤖 [bot] public key: ${pkHex.substring(0, 8)}…${pkHex.substring(pkHex.length - 8)}`);
-  txKey = null;
-  rxKey = null;
-  ws = new WebSocket(WS_URL);
+// ── REST control plane (auth + directory + friend graph) ─────────────────────
+// The `/ws` protocol carried all of this inline; it is now plain HTTP against
+// the auth server and app-api, exactly as the apps do it.
 
-  ws.on("open", () => send({ type: Out.AUTH_INIT, payload: pkHex }));
-  ws.on("message", (data) => handle(data.toString()));
-  ws.on("close", () => {
-    logger.debug("🤖 [bot] disconnected — reconnecting in 3s");
-    setTimeout(connect, 3000);
+/** REST session bearer (app-api + token refresh) and the current MQTT password. */
+let sessionToken = "";
+let mqttToken = "";
+
+/** A 401: the REST session itself is gone, so the KEM handshake must be redone. */
+class Unauthenticated extends Error {}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function httpJson(
+  url: string,
+  opts: { method: string; body?: unknown; bearer?: string }
+): Promise<{ status: number; body: any }> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (opts.bearer) headers.authorization = `Bearer ${opts.bearer}`;
+  const init: RequestInit = { method: opts.method, headers };
+  if (opts.body !== undefined) init.body = JSON.stringify(opts.body);
+  const res = await fetch(url, init);
+  const text = await res.text();
+  let body: any = null;
+  try { body = text ? JSON.parse(text) : null; } catch { /* non-JSON error page */ }
+  return { status: res.status, body };
+}
+
+/** Call app-api with our session bearer. Throws Unauthenticated on 401. */
+async function api(method: string, path: string, body?: unknown): Promise<any> {
+  const opts: { method: string; body?: unknown; bearer?: string } = { method, bearer: sessionToken };
+  if (body !== undefined) opts.body = body;
+  const r = await httpJson(`${API_BASE}${path}`, opts);
+  if (r.status === 401) throw new Unauthenticated(`${method} ${path} → 401`);
+  if (r.status < 200 || r.status >= 300) {
+    throw new Error(`${method} ${path} → ${r.status} ${JSON.stringify(r.body)}`);
+  }
+  return r.body ?? {};
+}
+
+/**
+ * The HQC-KEM handshake, over REST (auth/main.ts): the server encapsulates to
+ * our public key, we decapsulate and return HKDF(ss,"auth") to prove we hold the
+ * secret key. We never send ss or any decrypted plaintext. Yields a REST session
+ * bearer plus the first (~5m) MQTT connect token.
+ */
+async function handshake(): Promise<void> {
+  const init = await httpJson(`${AUTH_BASE}/auth/init`, { method: "POST", body: { pk: pkHex } });
+  if (init.status !== 200 || typeof init.body?.ct !== "string") {
+    throw new Error(`/auth/init → ${init.status}`);
+  }
+  const ss = hqcDecapsulate(sk, Buffer.from(init.body.ct, "base64"));
+  const verify = await httpJson(`${AUTH_BASE}/auth/verify`, {
+    method: "POST",
+    body: { pk: pkHex, solution: authProof(ss).toString("base64") },
   });
-  ws.on("error", (e) => logger.error("🤖 [bot] ws error:", e.message));
+  if (verify.status === 402 || verify.status === 403) {
+    // Self-admission (registerExempt) should make this impossible; if it does
+    // happen the Redis exempt write failed, so say so rather than spin silently.
+    throw new Error(`not admitted (${verify.status}) — the admission exemption did not stick`);
+  }
+  if (verify.status !== 200 || typeof verify.body?.sessionToken !== "string") {
+    throw new Error(`/auth/verify → ${verify.status}`);
+  }
+  sessionToken = verify.body.sessionToken;
+  mqttToken = String(verify.body.mqttToken || "");
+  logger.startup(`🤖 [bot] authenticated as ${short(pkHex)}`);
 }
 
-// ── Message handling ─────────────────────────────────────────────────────────
-async function handle(raw: string) {
-  let msg: any;
-  try { msg = unwrap(raw, rxKey ?? undefined); } catch { return; }
+/**
+ * Rotate the MQTT token on the existing REST session — the ordinary path after
+ * EMQX force-disconnects us at token expiry. Returns false when the session
+ * itself has lapsed (401), which is the caller's cue to redo the handshake.
+ */
+async function refreshMqttToken(): Promise<boolean> {
+  if (!sessionToken) return false;
+  const r = await httpJson(`${AUTH_BASE}/auth/refresh`, { method: "POST", bearer: sessionToken });
+  if (r.status === 401) return false;
+  if (r.status !== 200 || typeof r.body?.mqttToken !== "string") {
+    throw new Error(`/auth/refresh → ${r.status}`);
+  }
+  mqttToken = r.body.mqttToken;
+  return true;
+}
 
-  switch (msg.type) {
-    case In.AUTH_CHALLENGE: {
-      // KEM challenge (§KM-1): decapsulate the ciphertext → the shared secret ss,
-      // then return HKDF(ss,"auth") to prove we hold the secret key. We never send
-      // ss or any decrypted plaintext.
-      const ss = hqcDecapsulate(sk, Buffer.from(msg.payload, "base64"));
-      send({ type: Out.AUTH_VERIFY, payload: authProof(ss).toString("base64") });
-      break;
+/** Claim the reserved handle. app-api lets an admission-exempt pk reclaim it. */
+async function claimUsername(): Promise<void> {
+  await api("POST", "/username", { username: USERNAME });
+  logger.startup(`🤖 [bot] username @${USERNAME}`);
+}
+
+/**
+ * Re-read the friend graph: auto-accept anything pending, then make sure every
+ * friend has state, a subscription and a secure channel. This is the whole
+ * replacement for FRIEND_REQUEST / FRIEND_ADDED — there is nothing to push it
+ * to us any more.
+ */
+async function syncGraph(): Promise<void> {
+  const invites = await api("GET", "/friends/invites");
+  for (const invite of (invites?.invites ?? []) as Array<{ pk?: string; username?: string }>) {
+    const from = String(invite?.pk || "").toLowerCase();
+    if (!from) continue;
+    logger.debug(`🤖 [bot] invite from @${invite?.username ?? short(from)} — accepting`);
+    // Accepting is also what grants BOTH of us the conversation topic in the
+    // EMQX ACL, so it must land before we try to subscribe.
+    await api("POST", "/friends/accept", { from });
+  }
+
+  const list = await api("GET", "/friends");
+  for (const friend of (list?.friends ?? []) as Array<{ pk?: string; username?: string }>) {
+    const peerPk = String(friend?.pk || "").toLowerCase();
+    if (!/^[0-9a-f]{16,}$/.test(peerPk) || peerPk === pkHex) continue;
+    trackFriend(peerPk, String(friend?.username || ""));
+  }
+}
+
+/** Ensure state + subscription + key agreement for one peer. Idempotent. */
+function trackFriend(peerPk: string, username: string) {
+  const known = state.friends[peerPk];
+  const f: FriendState = known ?? { pk: peerPk };
+  const renamed = !!username && username !== f.username;
+  if (renamed) f.username = username;
+  state.friends[peerPk] = f;
+  // The poll runs every few seconds; only touch the state file when it changed.
+  if (!known || renamed) saveState();
+  if (!known) logger.debug(`🤖 [bot] friend: @${username || short(peerPk)}`);
+  subscribeConversation(peerPk);
+  // No channel yet (fresh friend, or a handshake lost while one side was down).
+  // Re-offering our ciphertext is safe — sendAesSeed reuses the stored one.
+  if (!f.sharedKey && !f.cur) maybeOfferSeed(peerPk);
+}
+
+const lastSeedOffer = new Map<string, number>();
+/** Offer our KEM ciphertext, at most once per HANDSHAKE_RETRY_MS per peer. */
+function maybeOfferSeed(peerPk: string) {
+  if (!client?.connected) return; // nothing to publish onto yet; CONNACK retries
+  const now = Date.now();
+  if (now - (lastSeedOffer.get(peerPk) ?? 0) < HANDSHAKE_RETRY_MS) return;
+  lastSeedOffer.set(peerPk, now);
+  sendAesSeed(peerPk);
+}
+
+// ── MQTT conversations ───────────────────────────────────────────────────────
+// One topic per friendship, `c/{friendshipHash}`, which only the two members may
+// publish to (EMQX enforces it from the Redis ACL app-api maintains). The broker
+// sees ciphertext and our own public key, never plaintext.
+
+let client: MqttClient | null = null;
+/** True while a relink is already scheduled/in flight, so one drop = one retry. */
+let relinking = false;
+let relinkDelay = 2_000;
+const MAX_RELINK_MS = 30_000;
+/** Bumped per connection. A discarded client's late `close` carries the old
+ *  generation, so it can be ignored instead of tearing down its replacement.
+ *  (We can't just drop its listeners — mqtt.js keeps its own on the client.) */
+let linkGeneration = 0;
+
+function convoTopic(peerPk: string): string {
+  return `c/${friendshipHash(pkHex, peerPk)}`;
+}
+const PRESENCE_TOPIC = `u/${pkHex}/presence`;
+const PRESENCE_ONLINE = JSON.stringify({ s: "online" });
+const PRESENCE_OFFLINE = JSON.stringify({ s: "offline" });
+
+/**
+ * What one conversation payload carries. This is the wire contract with the
+ * apps' `ConversationEnvelope` (ConversationRouter.swift) and must stay
+ * byte-compatible with it. `sender` is the PUBLIC KEY hex, not a username.
+ */
+interface Envelope {
+  type: "message" | "aes" | "key_rotate";
+  sender: string;
+  payload: string;
+  messageId?: string;
+  epoch?: number;
+  idx?: number;
+}
+
+function publish(peerPk: string, envelope: Envelope) {
+  if (!client) return;
+  // QoS 1 into the client's own outgoing store: a publish issued while the link
+  // is down is delivered on the next connect rather than lost.
+  client.publish(convoTopic(peerPk), JSON.stringify(envelope), { qos: 1 });
+}
+
+function subscribeConversation(peerPk: string) {
+  if (!client?.connected) return; // (re)subscribed wholesale on CONNACK
+  client.subscribe(convoTopic(peerPk), { qos: 1 }, (err) => {
+    if (err) logger.error(`🤖 [bot] subscribe ${label(peerPk)}: ${err.message}`);
+  });
+}
+
+function connectMqtt() {
+  const gen = ++linkGeneration;
+  logger.debug(`🤖 [bot] connecting to ${EMQX_URL} as ${short(pkHex)}`);
+  const c = mqtt.connect(EMQX_URL, {
+    // The client id IS the public key: EMQX keys the topic ACL on it, and a
+    // duplicate id kicks the previous session (single-session enforcement).
+    clientId: pkHex,
+    username: pkHex,
+    password: mqttToken,
+    // Persistent session — this IS the offline queue. Messages published to our
+    // conversations while the bot is restarting are held by the broker and
+    // delivered on reconnect, which is what the `/ws` pending-queue used to do.
+    clean: false,
+    // We reconnect by hand, because a reconnect needs a FRESH token: the library
+    // would happily retry forever with the expired password that just got us
+    // disconnected.
+    reconnectPeriod: 0,
+    keepalive: 30,
+    will: {
+      topic: PRESENCE_TOPIC,
+      payload: Buffer.from(PRESENCE_OFFLINE),
+      qos: 1,
+      retain: true,
+    },
+  });
+  client = c;
+
+  c.on("connect", () => {
+    relinkDelay = 2_000;
+    logger.startup(`🤖 [bot] connected to EMQX at ${EMQX_URL}`);
+    c.publish(PRESENCE_TOPIC, PRESENCE_ONLINE, { qos: 1, retain: true });
+    for (const [peerPk, f] of Object.entries(state.friends)) {
+      subscribeConversation(peerPk);
+      // Anything that was still mid-handshake when the link died: the offers
+      // made while we were down went nowhere, so make them again now.
+      if (!f.sharedKey && !f.cur) maybeOfferSeed(peerPk);
     }
+  });
+  c.on("message", (topic, payload) => { void onEnvelope(topic, payload); });
+  c.on("error", (e) => logger.error(`🤖 [bot] mqtt: ${e.message}`));
+  c.on("close", () => { if (gen === linkGeneration) relink("connection closed"); });
+}
 
-    case In.SESSION_KEY: {
-      // Transport key exchange (§KM-1): decapsulate the ciphertext → the 32-byte
-      // shared secret, then derive the per-direction transport keys. From here,
-      // send() encrypts and unwrap() decrypts.
-      const ss = hqcDecapsulate(sk, Buffer.from(msg.payload, "base64"));
-      const keys = deriveSessionKeys(ss);
-      txKey = keys.c2s; // bot (client) encrypts with c2s
-      rxKey = keys.s2c; // bot (client) decrypts with s2c
-      logger.debug("🤖 [bot] transport session keys established");
-      break;
-    }
-    case In.AUTH_SUCCESS:
-      logger.debug("🤖 [bot] authenticated");
-      send({ type: Out.SET_USERNAME, payload: USERNAME });
-      break;
+/**
+ * Come back after a drop. EMQX disconnects us at token expiry (~5m), so the
+ * first thing a reconnect needs is a new password: rotate it on the REST
+ * session, and if that session has lapsed too, redo the whole KEM handshake.
+ */
+function relink(why: string) {
+  if (relinking) return;
+  relinking = true;
+  const stale = client;
+  client = null;
+  stale?.end(true); // force — the link is already gone; don't wait on DISCONNECT
+  const delay = relinkDelay;
+  relinkDelay = Math.min(MAX_RELINK_MS, relinkDelay * 2);
+  logger.warn(`🤖 [bot] link down (${why}) — reconnecting in ${delay}ms`);
+  setTimeout(() => {
+    void (async () => {
+      try {
+        if (!(await refreshMqttToken())) await handshake();
+        relinking = false;
+        connectMqtt();
+      } catch (e: any) {
+        logger.error(`🤖 [bot] reconnect failed: ${e.message}`);
+        relinking = false;
+        relink("reconnect failed");
+      }
+    })();
+  }, delay);
+}
 
-    case In.USERNAME_UPDATED:
-      logger.debug(`🤖 [bot] username set to @${msg.payload}`);
-      break;
+/** Inbound conversation payload. */
+async function onEnvelope(topic: string, raw: Buffer) {
+  let env: any;
+  try { env = JSON.parse(raw.toString("utf8")); } catch { return; }
 
-    case In.FRIEND_REQUEST: {
-      const sender = msg.sender as string;
-      if (msg.pk) state.friends[sender] = { ...(state.friends[sender] || {}), pk: msg.pk };
-      saveState();
-      logger.debug(`🤖 [bot] friend request from @${sender} — accepting`);
-      send({ type: Out.ACCEPT_INVITE, payload: sender });
-      break;
-    }
+  const sender = typeof env?.sender === "string" ? env.sender.toLowerCase() : "";
+  // MQTT delivers our own publishes back to us (we subscribe to the topic we
+  // publish on). Nothing to do with them.
+  if (!sender || sender === pkHex) return;
 
-    case In.FRIEND_ADDED: {
-      const username = (msg.username || msg.sender) as string;
-      const f = state.friends[username] || ({} as FriendState);
-      if (msg.pk) f.pk = msg.pk;
-      state.friends[username] = f;
-      saveState();
-      // Kick off the AES handshake unless we're already secure with them.
-      if (!f.sharedKey) sendAesSeed(username);
-      logger.debug(`🤖 [bot] friend added: @${username}`);
-      break;
-    }
+  const f = state.friends[sender];
+  if (!f) return;
+  // The topic is derived from the two public keys, so a payload naming a
+  // `sender` who is not a member of THIS conversation is not addressable state.
+  if (topic !== convoTopic(sender)) return;
 
-    case In.AES: {
-      const sender = msg.sender as string;
-      const f = state.friends[sender];
-      if (!f) break;
+  switch (env.type) {
+    case "aes": {
       try {
         // Decapsulate the peer's KEM ciphertext → the shared secret they contributed.
-        const peerSs = hqcDecapsulate(sk, Buffer.from(msg.payload, "base64"));
+        const peerSs = hqcDecapsulate(sk, Buffer.from(String(env.payload), "base64"));
         f.peerSeed = peerSs.toString("hex");
         // (Re)send OUR encapsulation so the peer can derive too. sendAesSeed reuses
         // our stored ciphertext (f.myCt) if present, so on a re-handshake we resend
@@ -217,30 +484,28 @@ async function handle(raw: string) {
         if (f.mySeed && f.peerSeed) {
           const key = deriveSharedKey(Buffer.from(f.mySeed, "hex"), Buffer.from(f.peerSeed, "hex"));
           f.sharedKey = key.toString("hex");
-          logger.debug(`🔒 [bot] secure channel established with @${sender}`);
+          logger.debug(`🔒 [bot] secure channel established with @${label(sender)}`);
+          greet(sender);
         }
         saveState();
       } catch (e: any) {
-        logger.error(`🤖 [bot] AES handshake error with @${sender}:`, e.message);
+        logger.error(`🤖 [bot] AES handshake error with @${label(sender)}:`, e.message);
       }
       break;
     }
 
-    case In.DIRECT_MESSAGE: {
-      const sender = msg.sender as string;
-      const f = state.friends[sender];
-      if (!f || sender === "SYSTEM") break;
-      const epoch = Number.isInteger(msg.epoch) ? Number(msg.epoch) : 0;
+    case "message": {
+      const epoch = Number.isInteger(env.epoch) ? Number(env.epoch) : 0;
       try {
         // §KM-1 step 5: the per-message outer HQC layer is gone. The payload is
         // the AES-GCM base64 directly, sealed under the ratchet key (epoch ≥ 1) or
         // the epoch-0 static channel key.
-        const aesB64 = msg.payload as string;
+        const aesB64 = String(env.payload);
         let text: string;
         if (epoch >= 1) {
-          const mk = obtainRecvKey(f, epoch, Number(msg.idx));
+          const mk = obtainRecvKey(f, epoch, Number(env.idx));
           if (!mk) {
-            logger.error(`🤖 [bot] no ratchet key for @${sender} (epoch ${epoch}, idx ${msg.idx})`);
+            logger.error(`🤖 [bot] no ratchet key for @${label(sender)} (epoch ${epoch}, idx ${env.idx})`);
             break;
           }
           text = aesDecrypt(aesB64, mk);
@@ -250,23 +515,21 @@ async function handle(raw: string) {
           text = aesDecrypt(aesB64, Buffer.from(f.sharedKey, "hex"));
         }
         const answer = reply(text);
-        logger.debug(`💬 [bot] @${sender}: ${text}  →  ${answer.split("\n")[0]}`);
+        logger.debug(`💬 [bot] @${label(sender)}: ${text}  →  ${answer.split("\n")[0]}`);
         sendMessage(sender, answer);
       } catch (e: any) {
-        logger.error(`🤖 [bot] message decrypt error from @${sender}:`, e.message);
+        logger.error(`🤖 [bot] message decrypt error from @${label(sender)}:`, e.message);
       }
       break;
     }
 
-    case In.KEY_ROTATE: {
+    case "key_rotate": {
       // Tier-1 epoch re-handshake — a near-clone of the AES case, epoch-scoped.
-      const sender = msg.sender as string;
-      const f = state.friends[sender];
-      if (!f?.pk) break;
-      const epoch = Number(msg.epoch);
+      if (!f.pk) break;
+      const epoch = Number(env.epoch);
       if (!Number.isInteger(epoch) || epoch <= currentEpoch(f)) break; // stale/duplicate
       try {
-        const peerSs = hqcDecapsulate(sk, Buffer.from(msg.payload, "base64"));
+        const peerSs = hqcDecapsulate(sk, Buffer.from(String(env.payload), "base64"));
         if (!f.rot || f.rot.epoch !== epoch) f.rot = { epoch }; // peer-initiated
         f.rot.peerSeed = peerSs.toString("hex");
         // Contribute our own encapsulation for this epoch if we haven't yet
@@ -276,29 +539,17 @@ async function handle(raw: string) {
           const { ct, ss } = hqcEncapsulate(Buffer.from(f.pk, "hex"));
           f.rot.mySeed = ss.toString("hex");
           f.rot.myCt = ct.toString("base64");
-          send({ type: Out.KEY_ROTATE, targetPk: sender, payload: f.rot.myCt, epoch });
+          publish(sender, { type: "key_rotate", sender: pkHex, payload: f.rot.myCt, epoch });
         }
         if (f.rot.mySeed && f.rot.peerSeed) {
           installEpoch(sender, f, epoch, Buffer.from(f.rot.mySeed, "hex"), Buffer.from(f.rot.peerSeed, "hex"));
         }
         saveState();
       } catch (e: any) {
-        logger.error(`🤖 [bot] KEY_ROTATE error with @${sender}:`, e.message);
+        logger.error(`🤖 [bot] key_rotate error with @${label(sender)}:`, e.message);
       }
       break;
     }
-
-    case In.HEARTBEAT_PING:
-      send({ type: Out.HEARTBEAT_PONG });
-      break;
-
-    case In.PAYMENT_REQUIRED:
-      logger.error("🤖 [bot] PAYMENT_REQUIRED — add the bot's public key to EXEMPT_PUBLIC_KEYS on the server.");
-      break;
-
-    case In.ERROR:
-      logger.error("🤖 [bot] server error:", msg.payload);
-      break;
   }
 }
 
@@ -314,7 +565,7 @@ function epochStateFor(f: FriendState, epoch: number): EpochState | undefined {
 }
 
 /** Install a freshly negotiated epoch; demote the current one to recv-only grace. */
-function installEpoch(username: string, f: FriendState, epoch: number, mySeed: Buffer, peerSeed: Buffer) {
+function installEpoch(peerPk: string, f: FriendState, epoch: number, mySeed: Buffer, peerSeed: Buffer) {
   const ek = deriveEpoch(mySeed, peerSeed);
   if (f.cur) f.prev = f.cur; // keep exactly one previous epoch (drops any older)
   f.cur = {
@@ -328,20 +579,20 @@ function installEpoch(username: string, f: FriendState, epoch: number, mySeed: B
   };
   delete f.rot;
   f.sentInEpoch = 0;
-  logger.debug(`🔄 [bot] installed epoch ${epoch} with @${username}`);
+  logger.debug(`🔄 [bot] installed epoch ${epoch} with @${label(peerPk)}`);
 }
 
 /** Start a Tier-1 rotation to the next epoch by sending our fresh seed. */
-function initiateRotation(username: string) {
-  const f = state.friends[username];
+function initiateRotation(peerPk: string) {
+  const f = state.friends[peerPk];
   if (!f?.pk) return;
   const nextEpoch = currentEpoch(f) + 1;
   if (f.rot && f.rot.epoch >= nextEpoch) return; // one already in flight
   const { ct, ss } = hqcEncapsulate(Buffer.from(f.pk, "hex"));
   f.rot = { epoch: nextEpoch, mySeed: ss.toString("hex"), myCt: ct.toString("base64") };
-  send({ type: Out.KEY_ROTATE, targetPk: username, payload: f.rot.myCt!, epoch: nextEpoch });
+  publish(peerPk, { type: "key_rotate", sender: pkHex, payload: f.rot.myCt!, epoch: nextEpoch });
   saveState();
-  logger.debug(`🔄 [bot] initiating rotation to epoch ${nextEpoch} with @${username}`);
+  logger.debug(`🔄 [bot] initiating rotation to epoch ${nextEpoch} with @${label(peerPk)}`);
 }
 
 /** Cap the skipped-key cache, evicting the lowest (oldest) indices first. */
@@ -370,14 +621,14 @@ function obtainRecvKey(f: FriendState, epoch: number, idx: number): Buffer | und
   return step.messageKey;
 }
 
-function bumpAndMaybeRotate(username: string, f: FriendState) {
+function bumpAndMaybeRotate(peerPk: string, f: FriendState) {
   f.sentInEpoch = (f.sentInEpoch ?? 0) + 1;
-  if (f.sentInEpoch >= ROTATE_AFTER_MESSAGES) initiateRotation(username);
+  if (f.sentInEpoch >= ROTATE_AFTER_MESSAGES) initiateRotation(peerPk);
 }
 
 // ── Crypto-aware senders ─────────────────────────────────────────────────────
-function sendAesSeed(username: string) {
-  const f = state.friends[username];
+function sendAesSeed(peerPk: string) {
+  const f = state.friends[peerPk];
   if (!f?.pk) return;
   // Encapsulate ONCE and remember (ss, ct). Re-sends reuse the stored ciphertext
   // so a re-handshake keeps both peers on the same shared secret.
@@ -385,20 +636,52 @@ function sendAesSeed(username: string) {
     const { ct, ss } = hqcEncapsulate(Buffer.from(f.pk, "hex"));
     f.mySeed = ss.toString("hex");
     f.myCt = ct.toString("base64");
+    saveState();
   }
-  send({ type: Out.AES, payload: f.myCt, targetPk: username });
+  publish(peerPk, { type: "aes", sender: pkHex, payload: f.myCt });
 }
 
-function sendMessage(username: string, text: string) {
-  const f = state.friends[username];
+/** The first thing a new user ever receives. The server auto-friends the bot to
+ *  every account, so this lands moments after the first login — which used to
+ *  leave the new user staring at an empty conversation with an account they
+ *  hadn't chosen and no idea what it was for.
+ *
+ *  Sent exactly once per user (`greeted`, persisted), and only after the secure
+ *  channel exists — there is no unencrypted path to send it on. */
+function greet(peerPk: string) {
+  const f = state.friends[peerPk];
+  if (!f || f.greeted) return;
+  f.greeted = true;
+  saveState();
+  const name = f.username || "there";
+  // A beat, so the peer has certainly installed its side of the channel before
+  // the first ciphertext arrives (the AES frame precedes this one on the wire,
+  // but the client's handshake work is asynchronous).
+  setTimeout(() => {
+    sendMessage(
+      peerPk,
+      [
+        `welcome to dissqus, @${name}.`,
+        "",
+        "i'm helper — the account you start with, so your first conversation isn't an empty screen. this chat is end-to-end encrypted like every other one: the server relays it and can't read it.",
+        "",
+        "try /help for what i can do, or just say hello.",
+      ].join("\n")
+    );
+    logger.debug(`👋 [bot] greeted @${label(peerPk)}`);
+  }, 1500);
+}
+
+function sendMessage(peerPk: string, text: string) {
+  const f = state.friends[peerPk];
   if (!f?.pk) return;
   if (f.cur) {
     // Epoch ≥ 1: seal with the per-message ratchet key, then advance the chain.
     // §KM-1 step 5: no outer per-message HQC — the payload is the AES-GCM base64.
     const mk = messageKey(Buffer.from(f.cur.sendCK, "hex"));
-    send({
-      type: Out.MESSAGE,
-      targetPk: username,
+    publish(peerPk, {
+      type: "message",
+      sender: pkHex,
       payload: aesEncrypt(text, mk),
       messageId: crypto.randomUUID(),
       epoch: f.cur.epoch,
@@ -406,19 +689,19 @@ function sendMessage(username: string, text: string) {
     });
     f.cur.sendCK = chainNext(Buffer.from(f.cur.sendCK, "hex")).toString("hex");
     f.cur.sendIdx++;
-    bumpAndMaybeRotate(username, f);
+    bumpAndMaybeRotate(peerPk, f);
     saveState();
     return;
   }
   // Epoch 0: static channel key (also counts toward the first rotation).
   if (!f.sharedKey) return;
-  send({
-    type: Out.MESSAGE,
-    targetPk: username,
+  publish(peerPk, {
+    type: "message",
+    sender: pkHex,
     payload: aesEncrypt(text, Buffer.from(f.sharedKey, "hex")),
     messageId: crypto.randomUUID(),
   });
-  bumpAndMaybeRotate(username, f);
+  bumpAndMaybeRotate(peerPk, f);
   saveState();
 }
 
@@ -448,8 +731,7 @@ function gameReply(text: string): string {
 // Testing build: always replies "hello" to any message.
 function reply(_text: string): string {
   if (_text.toLowerCase().includes("hello")) return "Hello! I'm a bot. How can I help you?";
-  if (_text.toLowerCase().startsWith("martin")) return "go to the url https://martinrougeron.me";
-  if (_text.toLowerCase().startsWith("/support")) return "For support, please email contact@martinrougeron.me";
+  if (_text.toLowerCase().startsWith("/support")) return `For support, please email ${SUPPORT_EMAIL}`;
   if (_text.toLowerCase().startsWith("/game")) return gameReply(_text);
   if (_text.toLowerCase().startsWith("/help")) return "I can play simple games or answer basic questions. Try '/game prc' for rock-paper-scissors or '/game guess <number>' to guess a number between 1 and 10.";
   // Default: echo back the message.
@@ -457,11 +739,11 @@ function reply(_text: string): string {
 }
 
 // ── Self-admission ────────────────────────────────────────────────────────────
-// Register our pk in the shared Redis exempt set BEFORE connecting, so it's in
-// place by the time the server runs checkAdmission after our AUTH_VERIFY. SADD
-// is idempotent; retry a few times so a Redis still coming up at boot doesn't
-// leave us un-exempt. Non-fatal: connect regardless (harmless under the default
-// open policy, and a later reconnect re-runs this).
+// Register our pk in the shared Redis exempt set BEFORE authenticating, so it's
+// in place by the time the auth server runs checkAdmission on our /auth/verify.
+// SADD is idempotent; retry a few times so a Redis still coming up at boot
+// doesn't leave us un-exempt. Non-fatal: connect regardless (harmless under the
+// default open policy, and a later reconnect re-runs the handshake).
 async function registerExempt(attempts = 5): Promise<void> {
   for (let i = 1; i <= attempts; i++) {
     try {
@@ -476,4 +758,49 @@ async function registerExempt(attempts = 5): Promise<void> {
   logger.error("🤖 [bot] could not register admission exemption — connecting anyway");
 }
 
-registerExempt().finally(connect);
+// ── Boot ─────────────────────────────────────────────────────────────────────
+
+/** One poll of the friend graph, re-authenticating if the session has lapsed. */
+async function pollGraph(): Promise<void> {
+  try {
+    await syncGraph();
+  } catch (e: any) {
+    if (!(e instanceof Unauthenticated)) {
+      logger.error(`🤖 [bot] friend poll: ${e.message}`);
+      return;
+    }
+    logger.warn("🤖 [bot] REST session lapsed — redoing the handshake");
+    try {
+      await handshake();
+      await claimUsername();
+      await syncGraph();
+    } catch (e2: any) {
+      logger.error(`🤖 [bot] re-authentication failed: ${e2.message}`);
+    }
+  }
+}
+
+/** Authenticate, claim the handle, learn the graph, then open the broker link.
+ *  Retries with backoff so a bot that boots before auth/app-api are up recovers
+ *  on its own instead of exiting into a restart loop. */
+async function start(): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await handshake();
+      await claimUsername();
+      await syncGraph(); // populate state BEFORE connecting, so CONNACK subscribes everything
+      connectMqtt();
+      setInterval(() => { void pollGraph(); }, FRIEND_POLL_MS);
+      return;
+    } catch (e: any) {
+      const wait = Math.min(30_000, 2_000 * attempt);
+      logger.error(`🤖 [bot] startup attempt ${attempt} failed (${e.message}) — retrying in ${wait}ms`);
+      await sleep(wait);
+    }
+  }
+}
+
+// Event-loop / memory / Redis-latency early warning → Sentry.
+healthMonitor.start();
+
+registerExempt().finally(() => { void start(); });

@@ -1,29 +1,41 @@
+// DEPRECATED — NOT DEPLOYED. This is the original single-`/ws` monolith. As of
+// Phase 4 (deploy/EXTRACTION_PLAN.md) nothing runs it: it is absent from
+// deploy/docker-compose.yml, there is no `/ws` location in nginx, and both the
+// apps and the helper bot speak REST (auth/main.ts + api/main.ts) and MQTT
+// instead. Do not add features here, and do not point a client at it.
+//
+// It stays in the tree on purpose: test/e2e.test.ts and
+// test/account-delete.e2e.test.ts drive it end-to-end and are the only coverage
+// we have of the HQC handshake and the double ratchet running against a real
+// server. Deleting the file would delete that.
+//
 // Must be first: loads .env, resolves *_FILE Docker secrets, and prepares
 // process.env before any service module reads it (assertConfig is called below).
-import { assertConfig } from "./lib/config";
+import { assertConfig } from "../lib/config";
 // Second: init Sentry + global crash handlers before anything else can throw.
-import { initObservability } from "./lib/observability";
+import { initObservability } from "../lib/observability";
 initObservability("server");
-import { logger } from "./lib/logger";
-import { healthMonitor } from "./lib/health-monitor";
+import { logger } from "../lib/logger";
+import { healthMonitor } from "../lib/health-monitor";
 import { WebSocketServer, WebSocket } from "ws";
 import * as http from "http";
 import * as crypto from "crypto";
-import { HqcWrapper, HQC_CONSTANTS } from "./lib/hqc";
-import { DB } from "./services/db/api"; // See DB changes below
-import { StripeService } from "./services/stripe/api";
-import { StoreKitService } from "./services/storekit/api";
-import { ApnsService } from "./services/apns/api";
-import { handleSubscribe } from "./services/web/subscribe";
-import { blindedPk } from "./lib/crypto-utils";
+import { HqcWrapper, HQC_CONSTANTS } from "../lib/hqc";
+import { DB } from "../services/db/api"; // See DB changes below
+import { StripeService } from "../services/stripe/api";
+import { StoreKitService } from "../services/storekit/api";
+import { ApnsService } from "../services/apns/api";
+import { handleSubscribe } from "../services/web/subscribe";
+import { blindedPk } from "../lib/crypto-utils";
 import { MessageTypesToSent, MessageTypesToReceive } from "./enums";
+import { checkAdmission, ADMISSION_POLICY } from "../lib/admission";
 import {
   aesEncrypt,
   unwrap,
   deriveSessionKeys,
   encapsulateSession,
   authProof,
-} from "./lib/secure-transport";
+} from "./secure-transport";
 
 // --- TYPES ---
 interface AuthState {
@@ -39,6 +51,11 @@ interface AuthState {
   // incoming frames decrypted with rxKey (c2s). See deriveSessionKeys.
   txKey?: Buffer; // server→client
   rxKey?: Buffer; // client→server
+  // The client told us it went into the background. iOS keeps the socket open
+  // while it suspends the app, so "the socket is open" is not the same as "the
+  // user can receive anything" — a suspended client is treated exactly like an
+  // offline one: queue the message and push, don't relay into a frozen socket.
+  suspended?: boolean;
 }
 
 interface ChatSocket extends WebSocket {
@@ -61,52 +78,9 @@ const PORT = Number(process.env.PORT) || 8080;
 const PROTOCOL_VERSION = 1;
 const SERVER_NAME = process.env.SERVER_NAME || "DissQus";
 const SERVER_VERSION = "0.1.0";
-// Admission policy controls who may use this server once authenticated:
-//   open      — anyone who passes HQC auth (default; self-host friendly)
-//   allowlist — only public keys in ADMISSION_ALLOWLIST (private/family servers)
-//   stripe    — requires an active Stripe subscription (the official server)
-const ADMISSION_POLICY = (process.env.ADMISSION_POLICY || "open").toLowerCase();
-const ADMISSION_ALLOWLIST = (process.env.ADMISSION_ALLOWLIST || "")
-  .split(",").map((s) => s.trim()).filter(Boolean);
-
-type Admission =
-  | { ok: true }
-  | { ok: false; reason: "payment"; checkoutUrl: string | undefined }
-  | { ok: false; reason: "denied" };
-
-/** Decide whether an authenticated public key may use this server. Exempt keys
- *  (e.g. the helper bot) always pass, regardless of policy. */
-async function checkAdmission(pkHex: string): Promise<Admission> {
-  const exempt = (process.env.EXEMPT_PUBLIC_KEYS || "")
-    .split(",").map((s) => s.trim()).filter(Boolean);
-  if (exempt.includes(pkHex)) return { ok: true };
-
-  // Self-registered exemptions (the helper bot writes its own pk on startup; see
-  // messages/bot/bot.ts). Survives the bot's identity/seed changing without any
-  // operator editing EXEMPT_PUBLIC_KEYS. Best-effort: a Redis blip here must not
-  // hard-fail admission for paying users, so fall through to the policy check.
-  try {
-    if (await DB.isAdmissionExempt(pkHex)) return { ok: true };
-  } catch (e: any) {
-    logger.error(`[admission] exempt-set lookup failed: ${e.message}`);
-  }
-
-  switch (ADMISSION_POLICY) {
-    case "stripe": {
-      // A StoreKit (iOS in-app purchase) OR a Stripe (web/macOS) subscription
-      // both count as paid. Check the cheap StoreKit flag first so a verified
-      // App Store subscriber isn't gated by the Stripe lookup.
-      if (await DB.isStoreKitPremium(blindedPk(pkHex))) return { ok: true };
-      const sub = await StripeService.syncAndGetStatus(pkHex);
-      return sub.active ? { ok: true } : { ok: false, reason: "payment", checkoutUrl: sub.checkoutUrl };
-    }
-    case "allowlist":
-      return ADMISSION_ALLOWLIST.includes(pkHex) ? { ok: true } : { ok: false, reason: "denied" };
-    case "open":
-    default:
-      return { ok: true };
-  }
-}
+// Admission policy (open | allowlist | stripe) + checkAdmission now live in
+// lib/admission.ts, shared with the extracted auth server (auth/main.ts) so both
+// enforce identical rules. ADMISSION_POLICY + checkAdmission are imported above.
 
 // HTTP server hosts the Stripe webhook + a health check, and the WebSocket
 // server is attached to it (so nginx can proxy both /ws and /stripe/webhook).
@@ -388,6 +362,52 @@ function allowConnection(ip: string): boolean {
 // --- PRESENCE ---
 
 /** Tell a user's online friends that they came online / went offline. */
+/**
+ * The socket to deliver to, or undefined when this user cannot receive right
+ * now. "Open" was the only test before, which quietly included clients iOS had
+ * suspended: their messages were written into a socket nobody was reading,
+ * neither queued nor pushed, until the 30s heartbeat finally reaped it.
+ */
+function deliverySocket(username: string): ChatSocket | undefined {
+  const sock = onlineUsers.get(username);
+  if (!sock || sock.readyState !== WebSocket.OPEN) return undefined;
+  if (sock.auth.suspended) return undefined;
+  return sock;
+}
+
+/** Deliver everything queued for this user while they were away. */
+async function flushPendingTo(ws: ChatSocket, label: string) {
+  const pending = await DB.flushPending(ws.auth.publicKey!);
+  if (pending.length === 0) return;
+  logger.debug(`📬 [${label}] Delivering ${pending.length} queued message(s)`);
+  for (const envelope of pending) {
+    ws.send(JSON.stringify(envelope));
+
+    // Now that it's delivered, flip the sender's status queued → delivered
+    // (if they're online to receive the receipt).
+    const env = envelope as any;
+    if (
+      env.type === MessageTypesToReceive.DIRECT_MESSAGE &&
+      env.messageId &&
+      env.sender
+    ) {
+      const receipt = {
+        type: MessageTypesToReceive.MESSAGE_DELIVERED,
+        messageId: env.messageId,
+      };
+      const senderSock = deliverySocket(env.sender);
+      if (senderSock) {
+        senderSock.send(JSON.stringify(receipt));
+        logger.debug(`✅ [${env.sender}] queued→delivered (${env.messageId})`);
+      } else {
+        // Sender away too — queue the receipt for their next sign-in.
+        const senderPk = await DB.getPkByUsername(env.sender);
+        if (senderPk) await DB.enqueuePending(senderPk, receipt);
+      }
+    }
+  }
+}
+
 async function broadcastPresence(pk: string, username: string, online: boolean) {
   const type = online
     ? MessageTypesToReceive.USER_ONLINE
@@ -580,36 +600,7 @@ const Handlers = {
       }
 
       // Flush any messages queued while this user was offline.
-      const pending = await DB.flushPending(ws.auth.publicKey!);
-      if (pending.length > 0) {
-        logger.debug(`📬 [${username || senderId}] Delivering ${pending.length} queued message(s)`);
-        for (const envelope of pending) {
-          ws.send(JSON.stringify(envelope));
-
-          // Now that it's delivered, flip the sender's status queued → delivered
-          // (if they're online to receive the receipt).
-          const env = envelope as any;
-          if (
-            env.type === MessageTypesToReceive.DIRECT_MESSAGE &&
-            env.messageId &&
-            env.sender
-          ) {
-            const receipt = {
-              type: MessageTypesToReceive.MESSAGE_DELIVERED,
-              messageId: env.messageId,
-            };
-            const senderSock = onlineUsers.get(env.sender);
-            if (senderSock && senderSock.readyState === WebSocket.OPEN) {
-              senderSock.send(JSON.stringify(receipt));
-              logger.debug(`✅ [${env.sender}] queued→delivered (${env.messageId})`);
-            } else {
-              // Sender offline too — queue the receipt for their next sign-in.
-              const senderPk = await DB.getPkByUsername(env.sender);
-              if (senderPk) await DB.enqueuePending(senderPk, receipt);
-            }
-          }
-        }
-      }
+      await flushPendingTo(ws, username || senderId);
     } else {
       ws.send(
         JSON.stringify({
@@ -620,6 +611,39 @@ const Handlers = {
       logger.debug(`📥 [${senderId}] Receiving: ERROR (AUTH_FAILED)`);
       ws.close();
     }
+  },
+
+  /**
+   * The client is going into the background. iOS does not close the socket when
+   * it suspends an app, so without this frame the server keeps the user in
+   * `onlineUsers` and relays into a socket nobody is reading: the message is
+   * neither queued nor pushed, and it stays that way until the 30s heartbeat
+   * reaps the connection. That window is exactly when a user backgrounds the
+   * app and expects a notification.
+   *
+   * The socket stays open — this is a presence change, not a disconnect, so
+   * coming back costs no reconnect and no re-authentication (and so no second
+   * biometric prompt).
+   */
+  async onAppBackground(ws: ChatSocket) {
+    if (ws.auth.step !== "AUTHENTICATED" || ws.auth.suspended) return;
+    ws.auth.suspended = true;
+    logger.debug(`🌙 [${ws.auth.username}] backgrounded — delivering via push`);
+    if (ws.auth.username && ws.auth.publicKey) {
+      await broadcastPresence(ws.auth.publicKey, ws.auth.username, false);
+    }
+  },
+
+  /** Back in the foreground: deliver what arrived while we were away. */
+  async onAppForeground(ws: ChatSocket) {
+    if (ws.auth.step !== "AUTHENTICATED" || !ws.auth.suspended) return;
+    ws.auth.suspended = false;
+    logger.debug(`☀️ [${ws.auth.username}] foregrounded — flushing queue`);
+    if (ws.auth.username && ws.auth.publicKey) {
+      await broadcastPresence(ws.auth.publicKey, ws.auth.username, true);
+      await sendOnlineFriendsTo(ws, ws.auth.publicKey);
+    }
+    await flushPendingTo(ws, ws.auth.username || "unknown");
   },
 
   async onSetUsername(ws: ChatSocket, newUsername: string) {
@@ -686,7 +710,7 @@ const Handlers = {
       pk: ws.auth.publicKey,
       payload: "Wants to add you as a friend",
     };
-    const peer = onlineUsers.get(targetUsername);
+    const peer = deliverySocket(targetUsername);
     if (peer) {
       peer.send(JSON.stringify(requestEnvelope));
       logger.debug(
@@ -695,6 +719,9 @@ const Handlers = {
     } else {
       await DB.enqueuePending(targetPk, requestEnvelope);
       logger.debug(`📦 [${targetUsername}] Queued: FRIEND_REQUEST (from: ${sender})`);
+      // Wake the recipient — an invite sat silently in the queue until they
+      // happened to reopen the app, which is how invites went unanswered.
+      ApnsService.send(targetPk, "Friend request", `${sender} wants to connect`);
     }
 
     ws.send(
@@ -747,7 +774,7 @@ const Handlers = {
       username: ws.auth.username,
       pk: ws.auth.publicKey!,
     };
-    const peer = onlineUsers.get(targetUsername);
+    const peer = deliverySocket(targetUsername);
     if (peer) {
       peer.send(JSON.stringify(addedEnvelope));
       logger.debug(
@@ -773,6 +800,63 @@ const Handlers = {
         JSON.stringify({
           type: MessageTypesToReceive.USER_ONLINE,
           sender: ws.auth.username,
+        })
+      );
+    }
+  },
+
+  /**
+   * Withdraw an invite you sent, or decline one you received. Both directions
+   * are the same operation on a different inbox, so one handler covers them.
+   */
+  async onCancelInvite(ws: ChatSocket, targetUsername: string) {
+    const sender =
+      ws.auth.username || ws.auth.publicKey?.substring(0, 8) || "Unknown";
+    logger.debug(
+      `📤 [${sender}] Sending: CANCEL_INVITE (target: ${targetUsername})`
+    );
+
+    const targetPk = await DB.getPkByUsername(targetUsername);
+    if (!targetPk) {
+      ws.send(
+        JSON.stringify({
+          type: MessageTypesToReceive.ERROR,
+          payload: "USER_NOT_FOUND",
+        })
+      );
+      return;
+    }
+
+    const myPk = ws.auth.publicKey!;
+    // Try both directions: an outbound invite sits in *their* inbox, an inbound
+    // one in ours. Exactly one can match.
+    const withdrew = await DB.cancelInvite(myPk, targetUsername);
+    const declined = withdrew ? false : await DB.declineInvite(myPk, targetUsername);
+
+    if (!withdrew && !declined) {
+      ws.send(
+        JSON.stringify({
+          type: MessageTypesToReceive.ERROR,
+          payload: "NO_PENDING_INVITE",
+        })
+      );
+      return;
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: MessageTypesToReceive.INVITE_CANCELLED,
+        username: targetUsername,
+      })
+    );
+
+    // Tell the other side so their pending row disappears too.
+    const peer = onlineUsers.get(targetUsername);
+    if (peer) {
+      peer.send(
+        JSON.stringify({
+          type: MessageTypesToReceive.INVITE_CANCELLED,
+          username: ws.auth.username,
         })
       );
     }
@@ -873,8 +957,8 @@ const Handlers = {
       epoch,
       idx,
     };
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(JSON.stringify(envelope));
       logger.debug(
         `📥 [${targetUsername}] Receiving: DIRECT_MESSAGE (from: ${sender})`
@@ -922,8 +1006,8 @@ const Handlers = {
       messageId,
       epoch, // per-epoch media key selector; undefined on the legacy path
     };
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(JSON.stringify(envelope));
       logger.debug(`📥 [${targetUsername}] Receiving: IMAGE_MESSAGE (from: ${sender})`);
       if (messageId) {
@@ -968,8 +1052,8 @@ const Handlers = {
       payload,
       epoch, // per-epoch media key selector; undefined on the legacy path
     };
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(JSON.stringify(envelope));
       logger.debug(
         `📥 [${targetUsername}] Receiving: AUDIO_MESSAGE (from: ${sender})`
@@ -1006,8 +1090,8 @@ const Handlers = {
       return;
     }
 
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(
         JSON.stringify({
           type: MessageTypesToReceive.AUDIO_STREAM_START,
@@ -1032,8 +1116,8 @@ const Handlers = {
     const areFriends = await DB.checkFriendship(ws.auth.publicKey!, targetPk);
     if (!areFriends) return;
 
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(
         JSON.stringify({
           type: MessageTypesToReceive.AUDIO_STREAM_CHUNK,
@@ -1057,8 +1141,8 @@ const Handlers = {
     const areFriends = await DB.checkFriendship(ws.auth.publicKey!, targetPk);
     if (!areFriends) return;
 
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(
         JSON.stringify({
           type: MessageTypesToReceive.AUDIO_STREAM_END,
@@ -1106,8 +1190,8 @@ const Handlers = {
       sender: ws.auth.username,
       payload,
     };
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(JSON.stringify(envelope));
       logger.debug(`📥 [${targetUsername}] Receiving: AES (from: ${sender})`);
     } else {
@@ -1139,8 +1223,8 @@ const Handlers = {
       payload,
       epoch,
     };
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(JSON.stringify(envelope));
       logger.debug(`📥 [${targetUsername}] Receiving: KEY_ROTATE (from: ${sender})`);
     } else {
@@ -1171,8 +1255,8 @@ const Handlers = {
       return;
     }
 
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(
         JSON.stringify({
           type: MessageTypesToReceive.CALL_INCOMING,
@@ -1203,8 +1287,8 @@ const Handlers = {
     );
 
     if (!(await isVerifiedFriend(ws, targetUsername))) return;
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(
         JSON.stringify({
           type: MessageTypesToReceive.CALL_ACCEPTED,
@@ -1225,8 +1309,8 @@ const Handlers = {
     );
 
     if (!(await isVerifiedFriend(ws, targetUsername))) return;
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(
         JSON.stringify({
           type: MessageTypesToReceive.CALL_REJECTED,
@@ -1245,8 +1329,8 @@ const Handlers = {
     logger.debug(`📤 [${sender}] Sending: CALL_END (target: ${targetUsername})`);
 
     if (!(await isVerifiedFriend(ws, targetUsername))) return;
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(
         JSON.stringify({
           type: MessageTypesToReceive.CALL_ENDED,
@@ -1269,8 +1353,8 @@ const Handlers = {
 
     // Drop media to non-friends (cached, so this is cheap per chunk).
     if (!(await isVerifiedFriend(ws, targetUsername))) return;
-    const peer = onlineUsers.get(targetUsername);
-    if (peer && peer.readyState === WebSocket.OPEN) {
+    const peer = deliverySocket(targetUsername);
+    if (peer) {
       peer.send(
         JSON.stringify({
           type: MessageTypesToReceive.CALL_MEDIA_CHUNK,
@@ -1326,6 +1410,10 @@ const Handlers = {
     if (username) onlineUsers.delete(username);
     onlinePks.delete(pk);
     await DB.deleteUser(pk);
+    // Parity with the REST `/account/delete` route, which already did this. The
+    // WS path — the one the apps actually use — left the MQTT connect token
+    // valid until its TTL expired.
+    await DB.revokeMqttAuth(pk);
 
     ws.send(JSON.stringify({ type: MessageTypesToReceive.ACCOUNT_DELETED }));
     ws.close();
@@ -1401,6 +1489,24 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
         "Unknown";
       logger.debug(`📨 [${sender}] Received message type: ${msg.type}`);
 
+      // A suspended app runs no code, so it cannot send us anything: any frame
+      // other than the one announcing the background is proof this client is
+      // awake. Clearing the flag here makes presence self-healing — a lost or
+      // never-sent APP_FOREGROUND used to leave the user marked away with a
+      // perfectly good socket, so every message queued and arrived as a push
+      // while their conversation stayed empty.
+      // HEARTBEAT_PONG is excluded deliberately: it is a reflex, and it is the
+      // one frame that can still go out in the short window between the app
+      // entering the background and iOS actually suspending it — which would
+      // clear the flag just in time to lose the next message.
+      if (
+        socket.auth.suspended &&
+        msg.type !== MessageTypesToSent.APP_BACKGROUND &&
+        msg.type !== MessageTypesToSent.HEARTBEAT_PONG
+      ) {
+        await Handlers.onAppForeground(socket);
+      }
+
       switch (msg.type) {
         case MessageTypesToSent.AUTH_INIT:
           await Handlers.onAuthInit(socket, msg.payload);
@@ -1419,6 +1525,9 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
           break;
         case MessageTypesToSent.REMOVE_FRIEND:
           await Handlers.onRemoveFriend(socket, msg.payload);
+          break;
+        case MessageTypesToSent.CANCEL_INVITE:
+          await Handlers.onCancelInvite(socket, msg.payload);
           break;
         case MessageTypesToSent.MESSAGE:
           await Handlers.onMessage(socket, msg.targetPk, msg.payload, msg.messageId, msg.epoch, msg.idx); // msg.targetPk here acts as username field container
@@ -1464,6 +1573,12 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
           break;
         case MessageTypesToSent.HEARTBEAT_PONG:
           socket.isAlive = true;
+          break;
+        case MessageTypesToSent.APP_BACKGROUND:
+          await Handlers.onAppBackground(socket);
+          break;
+        case MessageTypesToSent.APP_FOREGROUND:
+          await Handlers.onAppForeground(socket);
           break;
         case MessageTypesToSent.REGISTER_PUSH_TOKEN:
           await Handlers.onRegisterPushToken(socket, msg.payload);

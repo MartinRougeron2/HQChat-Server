@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { MessageTypesToReceive as In } from "../enums";
-import { TestClient, loadCrypto } from "./helpers/test-client";
+import { MessageTypesToReceive as In } from "./enums";
+import { TestClient, loadCrypto } from "./test-client";
 
 // End-to-end tests of the full user journey, driving TWO real protocol clients
 // (the same crypto/handshake the Swift apps use) against a running server:
@@ -88,6 +88,50 @@ test("e2e: two clients, full journey over a live server", async (t) => {
       const m = await bob.nextMessage();
       assert.equal(m.imageContent, content);
       assert.ok(m.imageContent!.startsWith("IMAGE_ONCE:"));
+    });
+
+    await t.test("a backgrounded recipient is queued, not relayed into a frozen socket", async () => {
+      // iOS suspends the app without closing the socket, so "the socket is
+      // open" used to be taken as "the user can receive". Messages were written
+      // into a socket nobody was reading — never queued, so never pushed, and
+      // no notification until the heartbeat reaped the connection ~30s later.
+      const queued = alice.waitFor(In.MESSAGE_QUEUED);
+      bob.background();
+      // Give the server a moment to record the presence change before sending.
+      await new Promise((r) => setTimeout(r, 300));
+      alice.sendMessage(bobName, "sent while backgrounded 🌙");
+      const receipt = await queued;
+      assert.ok(receipt, "sender should be told the message was queued, not delivered");
+
+      // Coming back must deliver it — without a reconnect, so the client pays
+      // no second handshake (and the user no second biometric prompt).
+      bob.foreground();
+      const m = await bob.nextMessage();
+      assert.equal(m.from, aliceName);
+      assert.equal(m.text, "sent while backgrounded 🌙");
+    });
+
+    await t.test("a client that speaks again is live again, even if app_foreground is lost", async () => {
+      // The foreground frame can go missing: the socket may have died while the
+      // app was suspended, or the frame simply never made it out. When that
+      // happened the server kept the user marked away on a perfectly good
+      // socket — so every message queued and arrived as a push while their
+      // conversation stayed empty. Any frame from a client proves it is awake,
+      // because a suspended app runs no code.
+      bob.background();
+      await new Promise((r) => setTimeout(r, 300));
+
+      // Bob speaks without ever sending app_foreground.
+      bob.sendMessage(aliceName, "i'm awake 👋");
+      const heard = await alice.nextMessage();
+      assert.equal(heard.text, "i'm awake 👋");
+
+      // …and is therefore delivered to live, not queued.
+      const delivered = alice.waitFor(In.MESSAGE_DELIVERED);
+      alice.sendMessage(bobName, "and so are you");
+      await delivered;
+      const back = await bob.nextMessage();
+      assert.equal(back.text, "and so are you");
     });
 
     await t.test("key rotation to epoch 1 relays end-to-end; messages decrypt under the ratchet", async () => {

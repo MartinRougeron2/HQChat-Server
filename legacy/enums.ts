@@ -15,11 +15,18 @@ enum MessageTypesToSent {
     ACCEPT_INVITE = 'accept_invite',
     REMOVE_FRIEND = 'remove_friend',
     GET_INVITES = 'get_invites',
+    CANCEL_INVITE = 'cancel_invite',   // withdraw one you sent, or decline one you got
     ROOM_MESSAGE = 'room_message',
     SET_USERNAME = 'set_username',
     GET_USERNAME = 'get_username',
     GET_ALL_USERS = 'get_users',
     HEARTBEAT_PONG = 'heartbeat_pong', // Used to keep connection alive
+    // The client is going into / coming back from the background. iOS suspends
+    // the app without closing the socket, so without these the server keeps
+    // thinking the user is live and relays messages into a frozen socket —
+    // never queueing them, never sending the push that would surface them.
+    APP_BACKGROUND = 'app_background',
+    APP_FOREGROUND = 'app_foreground',
     REGISTER_PUSH_TOKEN = 'register_push_token',
     CALL_INITIATE = 'call_initiate',
     CALL_ACCEPT = 'call_accept',
@@ -45,6 +52,7 @@ enum MessageTypesToReceive {
     FRIEND_ADDED = 'friend_added',
     FRIEND_REQUEST = 'friend_request',
     FRIEND_REMOVED = 'friend_removed',
+    INVITE_CANCELLED = 'invite_cancelled',
     USER_LIST_RESPONSE = 'users',
 
     // Messaging

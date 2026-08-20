@@ -25,7 +25,7 @@ import { blindedPk } from "../../lib/crypto-utils";
  */
 
 const BUNDLE_ID = process.env.STOREKIT_BUNDLE_ID || "";
-const PRODUCT_ID = process.env.STOREKIT_PRODUCT_ID || "me.martinrougeron.dissqus.premium.monthly";
+const PRODUCT_ID = process.env.STOREKIT_PRODUCT_ID || "com.example.app.premium.monthly";
 const APP_APPLE_ID = process.env.STOREKIT_APP_APPLE_ID ? Number(process.env.STOREKIT_APP_APPLE_ID) : undefined;
 const ROOT_CERTS_DIR = process.env.STOREKIT_ROOT_CERTS_DIR || "";
 

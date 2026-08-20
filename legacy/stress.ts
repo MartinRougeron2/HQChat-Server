@@ -49,13 +49,13 @@
  * mid-run, that's reported as a crash with the last healthy sample.
  */
 
-import "./lib/config";
+import "../lib/config";
 import WebSocket from "ws";
 import * as crypto from "crypto";
-import { HqcWrapper, HQC_CONSTANTS } from "./lib/hqc";
+import { HqcWrapper, HQC_CONSTANTS } from "../lib/hqc";
 import { MessageTypesToSent as Out, MessageTypesToReceive as In } from "./enums";
-import { hqcEncapsulate, hqcDecapsulate, aesEncrypt, deriveSharedKey } from "./bot/crypto";
-import { unwrap, wrapString, deriveSessionKeys, authProof } from "./lib/secure-transport";
+import { hqcEncapsulate, hqcDecapsulate, aesEncrypt, deriveSharedKey } from "../bot/crypto";
+import { unwrap, wrapString, deriveSessionKeys, authProof } from "./secure-transport";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const WS_URL = process.env.SERVER_WS_URL || "ws://localhost:8080/ws";

@@ -21,10 +21,11 @@ import * as Sentry from "@sentry/node";
 import { logger, registerSentrySink } from "./logger";
 import { scrubEvent, scrubBreadcrumb, redact } from "./scrub";
 
-// Send-only client DSN. Sentry DSNs are meant to ship in clients; this is not a
-// secret. Override with SENTRY_DSN (set it to "" to hard-disable).
-const DEFAULT_DSN =
-  "https://96c230b3ec97c3e5f802d333c549b083@o4505907327926272.ingest.us.sentry.io/4511834379649024";
+// Sentry DSNs can only SEND, so one is not a secret — but shipping ours in a
+// public repo means every fork and every local run reports into our project.
+// There is no default: set SENTRY_DSN (deployment config, see deploy/server.env)
+// or run without it, which logs "Sentry disabled" instead of failing quietly.
+const DEFAULT_DSN = "";
 
 let started = false;
 let sentryOn = false;
@@ -37,7 +38,11 @@ export function sentryEnabled(): boolean {
  * Initialise Sentry + global crash capture. Idempotent. `component` tags every
  * event ("server" | "bot") so the two processes are distinguishable in Sentry.
  */
-export function initObservability(component: "server" | "bot"): void {
+/** Which process is reporting — tags every Sentry event so processes are
+ *  distinguishable. Extended for the MQTT extraction services. */
+export type Component = "server" | "bot" | "auth" | "api" | "push-bridge" | "broker-watch";
+
+export function initObservability(component: Component): void {
   if (started) return;
   started = true;
 
@@ -134,7 +139,7 @@ async function flushThen(after: () => void): Promise<void> {
   }
 }
 
-function installGlobalHandlers(component: "server" | "bot"): void {
+function installGlobalHandlers(component: Component): void {
   // The bug that took the server down. An uncaught exception leaves the process
   // in an undefined state — capture it, flush, and exit so the orchestrator
   // restarts us clean (restart:unless-stopped). Do NOT try to keep running.
