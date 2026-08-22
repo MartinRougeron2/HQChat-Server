@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# hqcat-apply-nginx <prod|preprod> — root-owned nginx applier, called by the
+# deploy agent (infra/deploy/agent/hqcat-agent) after a rollout.
+#
+# It renders from the deploy bundle the agent extracted out of the released
+# image — i.e. from an immutable, content-addressed digest that was reviewed and
+# built by CI, not from anything writable on this host. That is the same
+# integrity property this script previously got from reading a committed git ref
+# (`git show origin/<branch>:...`), preserved now that the VM holds no checkout.
+#
+#   - root-owned, so the config it renders cannot be swapped underneath it,
+#   - one constrained arg (stack), selecting per-stack config from root-owned
+#     /etc/hqcat/nginx.env,
+#   - REFUSES load_module/user directives regardless of source.
+#
+# For interactive/first-time use, use apply-nginx.sh instead.
+set -euo pipefail
+
+STACK="${1:?usage: hqcat-apply-nginx <prod|preprod>}"
+case "$STACK" in
+  prod|preprod) ;;
+  *) echo "bad stack '$STACK' (prod|preprod)"; exit 1 ;;
+esac
+
+# Both stacks now use the SAME upstream ports. Pre-prod used to run alongside
+# prod on one VM and had to be remapped (mqtt 8183 / auth 8190 / api 8191) to
+# avoid colliding with it; it has its own host now, so the base nginx.conf ports
+# apply verbatim on both. The stack arg still selects the per-stack DOMAIN /
+# REPO_DIR / BRANCH below, and is still what sudoers pins.
+MQTT=8083; AUTH=8090; API=8091
+
+CONF=/etc/hqcat/nginx.env
+[[ -r "$CONF" ]] || { echo "missing $CONF (run install-agent.sh)"; exit 1; }
+# shellcheck disable=SC1090
+. "$CONF"
+# Per-stack values: DOMAIN_PROD / BUNDLE_DIR_PROD (and the _PREPROD twins).
+u="${STACK^^}"
+# bash indirect expansion (no eval): pick DOMAIN_PROD / BUNDLE_DIR_PROD.
+dvar="DOMAIN_${u}"; bdvar="BUNDLE_DIR_${u}"
+DOMAIN="${!dvar:-}"; BUNDLE_DIR="${!bdvar:-/opt/hqcat/$STACK}"
+: "${DOMAIN:?DOMAIN_${u} unset in $CONF}"
+
+# From the extracted release bundle (root-owned, written by the agent straight
+# out of the image digest it just deployed). This replaced a `git show` against
+# an origin ref, which had been silently failing since the repo was reorganised:
+# it still asked for deploy/nginx.conf after the file moved to
+# infra/deploy/nginx.conf, `set -e` aborted the wrapper, and the caller's
+# `|| echo "⚠️ …"` swallowed it — so nginx was never actually reapplied.
+NGINX_SRC="$BUNDLE_DIR/nginx.conf"
+[[ -f "$NGINX_SRC" ]] || { echo "missing $NGINX_SRC (has the agent run yet?)"; exit 1; }
+src="$(cat "$NGINX_SRC")"
+
+# Defense-in-depth: nginx runs as root; forbid directives that execute code or
+# change the host run-user. These never appear in our nginx.conf.
+if grep -Eiq '^[[:space:]]*(load_module|user)[[:space:]]' <<<"$src"; then
+  echo "refusing nginx.conf containing a load_module/user directive"; exit 1
+fi
+
+site="hqcat-${DOMAIN}"; dst="/etc/nginx/sites-available/$site"; link="/etc/nginx/sites-enabled/$site"
+rendered="$(mktemp)"
+printf '%s\n' "$src" | sed \
+  -e "s/chat\.example\.com/${DOMAIN}/g" \
+  -e "s#127\\.0\\.0\\.1:8083#127.0.0.1:${MQTT}#g" \
+  -e "s#127\\.0\\.0\\.1:8090#127.0.0.1:${AUTH}#g" \
+  -e "s#127\\.0\\.0\\.1:8091#127.0.0.1:${API}#g" > "$rendered"
+
+# Install + enable, but VALIDATE before committing to it: back up any current
+# site, and if `nginx -t` fails, roll back so the live/rebootable config is never
+# left broken (a failed reload must not brick the next nginx (re)start).
+backup=""
+[[ -f "$dst" ]] && { backup="$(mktemp)"; cp -a "$dst" "$backup"; }
+install -m 0644 -o root -g root "$rendered" "$dst"; rm -f "$rendered"
+newlink=0; [[ -L "$link" ]] || { ln -sf "$dst" "$link"; newlink=1; }
+if ! nginx -t; then
+  if [[ -n "$backup" ]]; then cp -a "$backup" "$dst"; else [[ $newlink -eq 1 ]] && rm -f "$link"; fi
+  rm -f "$backup"
+  echo "❌ nginx -t failed — rolled back, not reloading"; exit 1
+fi
+rm -f "$backup"
+systemctl reload nginx
+logger -t hqcat-apply-nginx "applied $site stack=$STACK by=${SUDO_USER:-?}"
+echo "✅ applied https://$DOMAIN (stack=$STACK → mqtt:$MQTT auth:$AUTH api:$API)"

@@ -1,0 +1,30 @@
+# Copy to terraform.tfvars and fill in. The API TOKEN is NOT set here — export it:
+#   export CLOUDFLARE_API_TOKEN=...   (or set it as a CI secret)
+#
+# example.com is a SHARED zone (Vercel apex + backend/bbia/yt + email), so
+# the zone-wide toggles default OFF and Terraform manages only the DissQus bits.
+
+account_id  = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"   # 3af5c2d5… (from your zone export)
+zone_name   = "example.com"
+origin_ipv4 = "REPLACE_WITH_VM_PUBLIC_IP"            # the chat origin (kept out of git)
+# origin_ipv6 = "2001:db8::1"                         # optional
+
+app_host     = "chat"                  # → chat.example.com (import the existing record)
+preprod_host = "preprod.chat"          # → preprod.chat.example.com (TF creates it; or null)
+# Pre-prod runs on its OWN VM, not alongside prod. Leave unset to skip the record.
+# preprod_origin_ipv4 = "REPLACE_WITH_PREPROD_VM_PUBLIC_IP"
+
+# --- Worker (legal pages overlaying the shared apex) ---
+manage_worker      = true
+worker_name        = "dissqus-home"
+worker_route_host  = "example.com"
+worker_legal_paths = ["/privacy", "/terms", "/support"]
+
+# --- ZONE-WIDE toggles — keep false on the shared zone (would affect Vercel/backend) ---
+manage_zone_settings  = false          # SSL strict / HSTS / TLS — zone-wide
+manage_security_rules = false          # WAF custom-rules entrypoint — zone-wide replace
+
+# --- PRO-plan features — false on Free; flip to true after upgrading ---
+enable_rate_limiting = false           # [PRO] WAF rate-limiting rules
+enable_health_check  = false           # [PRO] standalone Health Check + alert
+alert_email          = "you@example.com"

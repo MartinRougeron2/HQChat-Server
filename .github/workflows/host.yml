@@ -1,0 +1,140 @@
+name: Host
+
+# Builds the NixOS host closures, signs them, and publishes them to the R2
+# binary cache. The VMs pull from there on their own timer — nothing here
+# connects to a server, exactly like the app pipeline.
+#
+#   push main (infra/nixos/**)  → build → sign → push closure → move pointer
+#   pull_request                → build only (proves it evaluates and compiles)
+#
+# The published pointer is what a host follows:
+#   <cache>/channels/prod     → /nix/store/<hash>-nixos-system-dissqus-prod-…
+#
+# Rolling back a host is putting an older store path back in that object; the
+# closure is still in the cache and still signed.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/nixos/**"
+      - "infra/deploy/agent/hqcat-agent"
+      - ".github/workflows/host.yml"
+  pull_request:
+    paths:
+      - "infra/nixos/**"
+      - "infra/deploy/agent/hqcat-agent"
+      - ".github/workflows/host.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [prod, preprod]
+    # Only the publish path needs credentials; a PR build gets none, so a fork
+    # PR can never reach the signing key or the bucket.
+    environment: ${{ github.event_name == 'push' && 'production' || '' }}
+    defaults:
+      run:
+        working-directory: infra/nixos
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+
+      # Cache /nix/store between runs so an unchanged nixpkgs is not re-fetched.
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/nix-cache
+          key: nix-store-${{ matrix.host }}-${{ hashFiles('infra/nixos/flake.lock') }}
+          restore-keys: nix-store-${{ matrix.host }}-
+
+      - name: Check formatting
+        run: nix fmt -- --check . || echo "::warning::nix fmt would reformat these files"
+
+      - name: Evaluate the flake
+        run: nix flake check --no-build
+
+      - name: Build ${{ matrix.host }} closure
+        id: build
+        run: |
+          nix build ".#toplevel-${{ matrix.host }}" --print-build-logs --out-link result
+          echo "path=$(readlink -f result)" >> "$GITHUB_OUTPUT"
+          echo "Built $(readlink -f result)"
+
+      - name: Closure size
+        run: nix path-info -Sh "${{ steps.build.outputs.path }}"
+
+      # ---- everything below only on a push to main ----------------------------
+
+      - name: Sign the closure
+        if: github.event_name == 'push'
+        env:
+          SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: |
+          [ -n "$SIGNING_KEY" ] || { echo "::error::NIX_CACHE_SIGNING_KEY is not set"; exit 1; }
+          umask 077
+          printf '%s' "$SIGNING_KEY" > /tmp/cache-key.sec
+          nix store sign --key-file /tmp/cache-key.sec --recursive "${{ steps.build.outputs.path }}"
+          rm -f /tmp/cache-key.sec
+
+      - name: Push the closure to R2
+        if: github.event_name == 'push'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ vars.R2_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          CACHE_BUCKET: ${{ vars.NIX_CACHE_BUCKET }}
+        run: |
+          set -euo pipefail
+          # `nix copy` speaks S3 directly, so there is no separate upload step
+          # and no chance of publishing a pointer to a closure that is not there.
+          nix copy \
+            --to "s3://${CACHE_BUCKET}?endpoint=${R2_ENDPOINT}&region=auto" \
+            "${{ steps.build.outputs.path }}"
+
+      # The pointer moves LAST and only after the closure is fully uploaded, so
+      # a host can never resolve a channel to a path the cache does not have.
+      - name: Move the ${{ matrix.host }} channel pointer
+        if: github.event_name == 'push'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ vars.R2_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          CACHE_BUCKET: ${{ vars.NIX_CACHE_BUCKET }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ steps.build.outputs.path }}" > /tmp/pointer
+          nix run nixpkgs#awscli2 -- s3 cp /tmp/pointer \
+            "s3://${CACHE_BUCKET}/channels/${{ matrix.host }}" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type text/plain \
+            --cache-control "no-cache, max-age=0"
+
+      - name: Summary
+        if: github.event_name == 'push'
+        run: |
+          {
+            echo "### \`${{ matrix.host }}\` host closure published"
+            echo
+            echo '```'
+            echo "${{ steps.build.outputs.path }}"
+            echo '```'
+            echo
+            echo "The ${{ matrix.host }} host checks every 30 minutes and will switch on its next tick."
+            echo "Force it now: \`systemctl start hqcat-host-agent.service\`"
+          } >> "$GITHUB_STEP_SUMMARY"

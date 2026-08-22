@@ -1,79 +1,109 @@
 # hqchat server
 
-The server half of [hqchat](https://github.com/MartinRougeron2/HQCAT), an
-end-to-end encrypted messenger with a post-quantum handshake.
+The server half of **hqchat**, an end-to-end encrypted messenger with a
+post-quantum handshake — and, since it is no use reading a server you cannot
+run, everything needed to deploy it: compose files, Terraform, NixOS hosts and
+the runbooks that put them in order.
 
-It is not a relay in the usual sense: **it never sees a message.** It proves that
-a client holds a private key, decides who may publish to which topic, and lets
-EMQX fan out ciphertext it has no key for. The interesting code is all in the
-first two of those.
+It is not a relay in the usual sense: **it never sees a message.** It proves a
+client holds a private key, decides who may publish to which topic, and lets
+EMQX fan out ciphertext it has no key for.
 
-Licensed **AGPL-3.0** ([LICENSE](./LICENSE)).
+Licensed **AGPL-3.0** ([LICENSE](LICENSE)).
 
-## Services
+## What is here
 
-One image, several entrypoints. All of them run on one VM today.
+| Path | What lives there |
+|---|---|
+| [`services/server/`](services/server/) | the services themselves — auth · app-api · push-bridge · broker-watch · helper bot |
+| [`infra/deploy/`](infra/deploy/) | compose, nginx, EMQX config, the pull agent, operational scripts |
+| [`infra/nixos/`](infra/nixos/) | the hosts — a flake, one file per machine, nothing configured by hand |
+| [`infra/cloudflare/`](infra/cloudflare/), [`infra/database/`](infra/database/), [`infra/multiregion/`](infra/multiregion/) | Terraform: the edge, the managed Postgres, the regional PoPs |
+| [`.github/workflows/`](.github/workflows/) | CI, release, promote — and `from-scratch`, which builds an environment from nothing |
+| [`docs/architecture/`](docs/architecture/) | how it fits together, and what each hop can see |
+| [`docs/runbooks/`](docs/runbooks/) | standing one up, deploying to it, debugging it |
 
-| Service | Entrypoint | Owns |
-|---|---|---|
-| **auth** | `auth/main.ts` | the HQC-KEM handshake, session + MQTT tokens, admission, and the EMQX authn hook |
-| **app-api** | `api/main.ts` | directory, friend graph (which writes the broker's topic ACL), push tokens, account deletion, payments |
-| **push-bridge** | `push/main.ts` | subscribes to every conversation, sends a content-free APNs wake to offline members |
-| **broker-watch** | `ops/broker-watch.ts` | polls EMQX and Redis health, escalates transitions to Sentry |
-| **helper bot** | `bot/bot.ts` | the account every new user starts with — an ordinary MQTT client, no special privileges |
+The paths are the ones the monorepo uses, so a link inside any file here means
+the same thing there.
 
-Plus **EMQX** (messaging, per-topic ACL, offline sessions) and **Redis** (tokens,
-ACL, friend graph, directory), neither of which is in this repo.
+**Not here:** the macOS and iOS clients, and the security audits. The clients are
+closed for now; the audits track findings that are still open, and publishing a
+list of unfixed weaknesses alongside the code that has them is a favour to the
+wrong reader. What the audits conclude is summarised in
+[SECURITY.md](SECURITY.md).
 
-`legacy/` is the retired single-WebSocket monolith. It does not run; it is kept
-for its end-to-end tests. See [legacy/README.md](legacy/README.md).
+## Running it locally
 
-## Running it
+Needs Node 22 and Docker.
 
 ```bash
-npm ci
+cd services/server && npm ci
 npm run typecheck && npm test
-
-# the whole stack, including EMQX and Redis
-docker compose -f ../../infra/deploy/docker-compose.yml up -d
 ```
 
-Individual services: `npm run auth`, `npm run api`, `npm run push`,
-`npm run bot`, `npm run broker-watch`. Each needs Redis; `auth` and the bot also
-need the native HQC library (see below).
+The unit suite skips its database-backed tests when there is nothing to connect
+to, so that passes on a bare checkout.
 
-Configuration is environment variables — see `infra/deploy/.env.example`. There
-are no defaults pointing at anyone's deployment: unset means unset, and the
-services say so at startup.
+The whole stack, against a throwaway Postgres container:
 
-## The native HQC library
+```bash
+sh infra/deploy/local-secrets/generate.sh    # once — writes local credentials
+docker compose -f infra/deploy/docker-compose.yml \
+               -f infra/deploy/docker-compose.local.yml up -d
+```
 
-`lib/hqc.ts` dlopens a native shared library built from the HQC reference
-implementation (`lib/libhqc_x86.so`, linux/x86_64, glibc — which is why the
-Docker image is Debian-based and not Alpine). The wrapper's source lives in the
-monorepo under `native/hqc/`.
+## Deploying it for real
+
+Read [`docs/runbooks/from-scratch.md`](docs/runbooks/from-scratch.md) first —
+it is the whole path, DigitalOcean through Cloudflare to a serving host, in the
+order the dependencies actually run. Most of it is automated by the
+[From scratch workflow](.github/workflows/from-scratch.yml): everything a cloud
+API can do it does, idempotently, and it hands back a rendered script for the
+steps that need SSH.
+
+What you supply is a domain on Cloudflare, a DigitalOcean account, and an APNs
+key if you want push. The workflows are here because you need them — `release`
+builds and publishes the image, `promote` moves the production channel, `host`
+builds the NixOS closures — but they are configured for a deployment that is not
+yours, and Actions is switched off on this repository for that reason. Fork it,
+set your secrets (`infra/deploy/scripts/set-ci-secrets.sh` writes the whole set),
+then turn Actions on in your copy. What the design assumes, and what you should not quietly
+undo:
+
+- **Hosts pull, CI never connects.** Nothing in GitHub can reach a server. The
+  host agent notices a new image digest and applies it; a leaked CI token buys
+  an attacker a registry push, not a shell.
+- **The origin is not reachable except through Cloudflare.** The firewall names
+  Cloudflare's ranges, and the origin address is worth as much as a password.
+- **Postgres holds tokens, the topic ACL and the friend graph — never
+  plaintext.** The per-topic ACL is the only barrier between a stranger and a
+  conversation, and topic names are derivable from two public keys.
+
+Every value that names a deployment is a placeholder here: `example.com`,
+`YOUR-GITHUB-ACCOUNT`, `<your-origin-ipv4>`. Grep for them — the list of things
+you must set is exactly the list of placeholders you find.
 
 ## How it fits together
 
-- [Authentication](https://github.com/MartinRougeron2/HQCAT/blob/main/docs/architecture/auth-flow.md) — the handshake, and why there are two tokens
-- [Messaging](https://github.com/MartinRougeron2/HQCAT/blob/main/docs/architecture/message-flow.md) — one message end to end, and what each hop can see
-- [The topic ACL](https://github.com/MartinRougeron2/HQCAT/blob/main/docs/architecture/emqx-acl.md) — the only thing between a stranger and a conversation
-- [Audits](https://github.com/MartinRougeron2/HQCAT/tree/main/docs/audits) — including the open findings
+- [Authentication](docs/architecture/auth-flow.md) — the handshake, and why there are two tokens
+- [Messaging](docs/architecture/message-flow.md) — one message end to end, and what each hop can see
+- [The topic ACL](docs/architecture/emqx-acl.md) — the only thing between a stranger and a conversation
+- [Deployment architecture](docs/architecture/overview.md) — how code and secrets reach a host
+- [Components and regions](docs/architecture/components-regions.md) — what can be moved closer to users
 
 ## Where this code lives
 
-This repository is a mirror. The server is developed in the
-[HQCAT monorepo](https://github.com/MartinRougeron2/HQCAT) alongside the Apple
-clients and the infrastructure, and published here as a `git subtree` from
-`services/server/`.
+This repository is generated. The server and the infrastructure are developed in
+a private monorepo alongside the Apple clients, and published here by
+`infra/mirror/publish.sh`, which copies the paths above and rewrites every value
+that names the reference deployment.
 
-Issues and pull requests are welcome here. A PR against this repo is pulled back
-into the monorepo with `git subtree pull`, so nothing is lost — but if you are
-changing something that touches the clients too, the monorepo is the easier place
-to do it.
+Issues and pull requests are welcome — a PR here is applied to the monorepo by
+hand and comes back on the next sync, so nothing is lost, but the commit you see
+land will not be the one you wrote.
 
 ## Security
 
-Please report vulnerabilities privately — see
-[SECURITY.md](https://github.com/MartinRougeron2/HQCAT/blob/main/SECURITY.md).
-Known open findings are listed in the audits linked above; check there first.
+Report vulnerabilities privately: open a
+[security advisory](https://github.com/MartinRougeron2/HQChat-Server/security/advisories/new)
+on this repository rather than a public issue. See [SECURITY.md](SECURITY.md).

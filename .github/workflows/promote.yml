@@ -1,0 +1,91 @@
+name: Promote
+
+# Ship to production by moving the `:prod` channel tag onto an already-built,
+# already-tested digest. The production VM's agent follows that tag and rolls
+# itself over within a couple of minutes.
+#
+# This is the entire release action. There is no SSH, no rebuild, and no
+# re-running of CI: the digest being promoted is one CI already built and
+# smoke-tested on the Release run for that commit. Promoting cannot produce a
+# binary that was never tested, because it cannot produce a binary at all.
+#
+# Roll back the same way — promote an older sha. The agent also reverts on its
+# own if the new release fails its health gate.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA to promote (default: current tip of main)"
+        type: string
+        required: false
+      channel:
+        description: Channel tag to move
+        type: choice
+        options: [prod, preprod]
+        default: prod
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: promote-${{ inputs.channel }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/YOUR-GITHUB-ACCOUNT/dissqus-server
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Attach an Environment here (and add Required reviewers to it) if you want
+    # promotion to need a second pair of eyes. Left off deliberately: running
+    # this workflow IS the human gate, and the point was to make releasing less
+    # ceremonial, not to move the ceremony.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || 'main' }}
+
+      - name: Resolve the release to promote
+        id: rel
+        run: |
+          SHA="${{ inputs.sha }}"
+          [ -n "$SHA" ] || SHA="$(git rev-parse HEAD)"
+          SHORT="${SHA:0:12}"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "Promoting sha-$SHORT to :${{ inputs.channel }}"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # `buildx imagetools create` retags by manifest reference, server-side —
+      # it does not pull or push layers, so the promoted digest is byte-identical
+      # to the one CI tested. A plain pull+tag+push could re-resolve to something
+      # else on a multi-arch or re-pushed tag.
+      - name: Move the channel tag
+        run: |
+          set -euo pipefail
+          SHORT="${{ steps.rel.outputs.short }}"
+          CH="${{ inputs.channel }}"
+          for repo in "$IMAGE" "$IMAGE-bot"; do
+            src="$repo:sha-$SHORT"
+            if ! docker buildx imagetools inspect "$src" >/dev/null 2>&1; then
+              echo "::error::$src does not exist in GHCR. Has the Release workflow run for this commit?"
+              exit 1
+            fi
+            docker buildx imagetools create --tag "$repo:$CH" "$src"
+            echo "  $repo:$CH → sha-$SHORT"
+          done
+
+      - name: Summary
+        run: |
+          {
+            echo "### Promoted \`sha-${{ steps.rel.outputs.short }}\` → \`:${{ inputs.channel }}\`"
+            echo
+            echo "The ${{ inputs.channel }} agent polls every 2 minutes and will roll over on its next tick."
+            echo "Watch it on the VM: \`journalctl -u hqcat-agent.service -f\`"
+            echo
+            echo "Roll back by re-running this workflow with an earlier SHA."
+          } >> "$GITHUB_STEP_SUMMARY"

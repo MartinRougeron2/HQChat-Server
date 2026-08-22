@@ -1,0 +1,356 @@
+// Auth server entrypoint (Phase 1 — see deploy/EXTRACTION_PLAN.md).
+//
+// Owns the HQC-KEM handshake that proves a client owns its public key, the
+// admission gate, and token issuance. It replaces the WS AUTH_INIT/AUTH_CHALLENGE
+// /AUTH_VERIFY flow from server.ts with stateless REST:
+//
+//   POST /auth/free/init    { pk }                -> { ct }         (KEM challenge)
+//   POST /auth/free/verify  { pk, solution }      -> free session
+//   POST /auth/paid/init    { pk }                -> { ct } or 402   (claim gate)
+//   POST /auth/paid/verify  { pk, solution }      -> premium session
+//   POST /claim/start       { email }             -> { ok }          (mails a code)
+//   POST /claim/verify      { email, code, pk }   -> { ok }          (binds device)
+//   POST /auth/refresh (Bearer sessionToken)      -> { mqttToken, ttl } (rotation)
+//   POST /mqtt/authn  (EMQX hook)                 -> { result }      (one-time token)
+//
+// TWO DOORS, not one endpoint with a flag. The free door sells nothing and asks
+// nothing; the paid door refuses an unclaimed key BEFORE spending a KEM
+// encapsulation on it. What separates them is what they mint: the session
+// carries its scope, so no later request re-derives an entitlement.
+//
+// Transport confidentiality is TLS (WSS via nginx) — there is NO per-connection
+// AES session key here anymore (the SESSION_KEY step is deleted; TLS replaces it).
+// Runs the SAME image as the monolith via `command:` in the compose overlay.
+
+// Must be first: loads .env + resolves *_FILE secrets before anything reads env.
+import { assertConfig } from "../lib/config";
+import { initObservability } from "../lib/observability";
+initObservability("auth");
+import { healthMonitor } from "../lib/health-monitor";
+import { logger } from "../lib/logger";
+import * as http from "http";
+import { readJson, send, bearer, clientIp, requireString, requireHex, HttpError } from "../lib/http";
+import * as crypto from "crypto";
+// hqc is lazy-required inside /auth/init (it dlopen's the native x86 .so; keeping
+// it out of the import graph lets the auth server boot — and serve the token/
+// refresh/authn paths — anywhere the lib is absent, matching secure-transport.ts).
+import { authProof } from "../lib/auth-proof";
+import { checkAdmission, type Door } from "../lib/admission";
+import { DB, type SessionScope } from "../services/db/api";
+import { SubscriptionService } from "../services/subscription/api";
+
+const PORT = Number(process.env.PORT || 8080);
+
+// --- Anti-automation (ASVS-3, ASVS-4) --------------------------------------
+// `/auth/init` cannot require authentication — proving who you are is what it is
+// for — and every call runs an HQC encapsulation (CPU) plus a database write. Left
+// open it is a cheap way to make the auth service the bottleneck for everyone.
+// nginx rate-limits the REST zone, but that is one bucket shared with every
+// other route; these are per-IP and per-key.
+const INIT_PER_IP_PER_MIN = Number(process.env.AUTH_INIT_IP_LIMIT || 30);
+const INIT_PER_PK_PER_MIN = Number(process.env.AUTH_INIT_PK_LIMIT || 10);
+// Repeated FAILED proofs against one public key are the signature of someone
+// trying to authenticate as a key they do not hold. Nothing counted them before,
+// so the attempt was invisible however long it went on.
+const VERIFY_FAILURE_ALERT = Number(process.env.AUTH_VERIFY_FAILURE_ALERT || 5);
+// A claim code is six digits. The per-code counter caps guesses at one address;
+// this caps a caller working through many addresses at once.
+const CLAIM_VERIFY_PER_IP = Number(process.env.CLAIM_VERIFY_IP_LIMIT || 20);
+
+// Internal service credential (push-bridge etc.): a privileged MQTT identity that
+// authn grants superuser so it can subscribe across conversations. The secret is
+// a compose secret resolved via INTERNAL_MQTT_SECRET_FILE.
+const INTERNAL_MQTT_USER = process.env.INTERNAL_MQTT_USER || "svc-internal";
+const INTERNAL_MQTT_SECRET = process.env.INTERNAL_MQTT_SECRET || "";
+
+const BOT_USERNAME = process.env.BOT_USERNAME || "helper";
+
+/**
+ * Friend the helper bot to a user, so a brand-new account opens on a
+ * conversation instead of an empty screen (the bot's welcome message rides that
+ * friendship). The `/ws` monolith did this on every login and was the ONLY
+ * place it happened, so retiring it at Phase 4 would have silently removed the
+ * first thing a new user ever sees. It lives here now, on the one path every
+ * client — apps and bot alike — goes through.
+ *
+ * Idempotent and best-effort: on a cold stack the bot may not have claimed its
+ * handle yet, and a login must never fail because of that. The next login
+ * retries.
+ */
+async function ensureBotFriendship(pk: string): Promise<void> {
+  try {
+    const botPk = await DB.getPkByUsername(BOT_USERNAME);
+    if (!botPk || botPk === pk) return; // bot not registered yet, or this IS the bot
+    if (!(await DB.areFriends(pk, botPk))) await DB.createFriendship(pk, botPk);
+    // The friend sets alone are invisible to MQTT — the ACL entry is what lets
+    // either side use the shared topic, and it records the members push-bridge
+    // resolves. Idempotent, so re-running it per login is harmless.
+    await DB.grantFriendTopic(pk, botPk);
+  } catch (e) {
+    logger.warn(`[auth] helper-bot auto-friend failed for ${pk.slice(0, 12)}…: ${(e as Error).message}`);
+  }
+}
+
+/** Constant-time equality for two utf8/hex strings of possibly differing length. */
+function safeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+/**
+ * Refuse a door, in the shape the client can act on. 402 means "this key has no
+ * live subscription" and the app falls back to the free door; 403 means the
+ * server does not want this key at all and falling back would be pointless.
+ */
+function refuse(res: http.ServerResponse, admission: { reason: "denied" | "not_claimed" }): void {
+  if (admission.reason === "not_claimed") return send(res, 402, { error: "NOT_CLAIMED" });
+  return send(res, 403, { error: "NOT_ADMITTED" });
+}
+
+/**
+ * Open a KEM challenge for a door.
+ *
+ * The order of the checks is the point. Cheap shape check, then the rate-limit
+ * counters, then admission — and only then the native HQC library and the
+ * encapsulation. An unclaimed key knocking on the paid door costs one
+ * primary-key lookup and never reaches `dlopen`, let alone a keygen-sized CPU burn.
+ */
+async function handleInit(req: http.IncomingMessage, res: http.ServerResponse, door: Door): Promise<void> {
+  const { pk } = await readJson(req);
+  const pkHex = String(pk || "");
+  if (!/^[0-9a-fA-F]+$/.test(pkHex)) return send(res, 400, { error: "bad public key" });
+
+  const ip = clientIp(req);
+  const [ipHits, pkHits] = await Promise.all([
+    DB.bumpCounter(`init:ip:${ip}`, 60),
+    DB.bumpCounter(`init:pk:${pkHex}`, 60),
+  ]);
+  if (ipHits > INIT_PER_IP_PER_MIN || pkHits > INIT_PER_PK_PER_MIN) {
+    logger.warn(`[auth] ${door} init rate-limited (ip=${ipHits}/${INIT_PER_IP_PER_MIN}, pk=${pkHits}/${INIT_PER_PK_PER_MIN})`);
+    return send(res, 429, { error: "RATE_LIMITED" });
+  }
+
+  const admission = await checkAdmission(pkHex, door);
+  if (!admission.ok) return refuse(res, admission);
+
+  const { HqcWrapper, HQC_CONSTANTS } = require("../lib/hqc") as typeof import("../lib/hqc");
+  if (pkHex.length !== HQC_CONSTANTS.PUBLIC_KEY_BYTES * 2) {
+    return send(res, 400, { error: "bad public key" });
+  }
+
+  const { ct, ss } = HqcWrapper.encapsulate(Buffer.from(pkHex, "hex"));
+  await DB.startAuthChallenge(pkHex, authProof(ss).toString("hex"));
+  return send(res, 200, { ct: ct.toString("base64") });
+}
+
+/**
+ * Consume the challenge, re-check admission, and mint a session at the door's
+ * scope.
+ *
+ * Admission is checked AGAIN here, not because the client could have changed
+ * doors — it can, freely — but because the subscription can lapse inside the
+ * challenge's 60-second window, and the scope minted here outlives the request.
+ *
+ * The free door deliberately does NOT revoke friend topics. Cancellation
+ * revokes, on the webhook, where an actual event says so; a client that lands
+ * on the free door because a database read blipped would otherwise tear down every
+ * conversation it has and rebuild them on the next successful paid login.
+ */
+async function handleVerify(req: http.IncomingMessage, res: http.ServerResponse, door: Door): Promise<void> {
+  const { pk, solution } = await readJson(req);
+  const pkHex = String(pk || "");
+  const solutionHex = Buffer.from(String(solution || ""), "base64").toString("hex");
+
+  // Atomically consume the open challenge (single-use — no replay).
+  const expectedHex = await DB.takeAuthChallenge(pkHex);
+  if (!expectedHex || !safeEqualStr(solutionHex, expectedHex)) {
+    // A wrong proof is either a client bug or someone trying to sign in as a key
+    // they do not hold. Either way it should be visible: logger.error reaches
+    // Sentry, so a run of them raises an alert instead of vanishing.
+    const failures = await DB.bumpCounter(`verify:fail:${pkHex}`, 15 * 60);
+    if (failures === VERIFY_FAILURE_ALERT) {
+      logger.error(`🚨 [auth] ${failures} failed key-possession proofs in 15m for one public key (ip=${clientIp(req)})`);
+    }
+    return send(res, 401, { error: "auth failed" });
+  }
+  // A success clears the run, so an alert means a genuine sustained burst.
+  await DB.clearCounter(`verify:fail:${pkHex}`);
+
+  const admission = await checkAdmission(pkHex, door);
+  if (!admission.ok) return refuse(res, admission);
+
+  const scope: SessionScope = door === "paid" ? "premium" : "free";
+
+  // Self topics (presence publish + inbox) and the helper bot are what the FREE
+  // tier is: a new account already lands here, so the free door needs no ACL
+  // work of its own — only the absence of friend grants.
+  await DB.grantSelfTopics(pkHex);
+  await ensureBotFriendship(pkHex);
+  if (scope === "premium") {
+    // Restore whatever a lapse revoked. Idempotent, so paying users pay no
+    // attention to it; a resubscriber gets their conversations back on login.
+    await DB.regrantAllFriendTopics(pkHex);
+  }
+
+  const username = await DB.getUsername(pkHex);
+  const sessionToken = await DB.mintSessionToken(pkHex, scope);
+  const mqttToken = await DB.mintMqttToken(pkHex);
+  return send(res, 200, {
+    pk: pkHex,
+    username: username || null,
+    scope,
+    sessionToken,
+    mqttToken,
+    mqttTtl: DB.MQTT_TOKEN_TTL_SECONDS,
+    // Absolute expiry (unix seconds) so the client can refresh proactively,
+    // before EMQX force-disconnects at expire_at.
+    mqttExpiresAt: Math.floor(Date.now() / 1000) + DB.MQTT_TOKEN_TTL_SECONDS,
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = req.url || "";
+  const method = req.method || "GET";
+  try {
+    if (method === "GET" && url === "/health") {
+      return send(res, 200, { ok: true, service: "auth" });
+    }
+
+    // --- 1. HQC-KEM challenge, per door -------------------------------------
+    if (method === "POST" && (url === "/auth/free/init" || url === "/auth/paid/init")) {
+      return await handleInit(req, res, url === "/auth/paid/init" ? "paid" : "free");
+    }
+
+    // --- 2. Verify the proof, admit, issue a scoped session ------------------
+    if (method === "POST" && (url === "/auth/free/verify" || url === "/auth/paid/verify")) {
+      return await handleVerify(req, res, url === "/auth/paid/verify" ? "paid" : "free");
+    }
+
+    // --- 3. Claim a web subscription with an emailed code -------------------
+    // Unauthenticated on purpose: the caller has no session yet, and obtaining
+    // one is what this is for. The device is identified by the public key it
+    // sends, which the code is what entitles it to bind.
+    if (method === "POST" && url === "/claim/start") {
+      const body = await readJson(req);
+      const email = requireString(body, "email", { max: 254 });
+      const result = await SubscriptionService.startClaim(email, clientIp(req));
+      if (!result.ok) {
+        return result.reason === "rate_limited"
+          ? send(res, 429, { error: "RATE_LIMITED" })
+          : send(res, 400, { error: "INVALID_EMAIL" });
+      }
+      // Deliberately identical whether or not a code was actually sent.
+      // Answering "no subscription for that address" would turn this into a
+      // lookup service for anyone holding a list of email addresses.
+      return send(res, 200, { ok: true });
+    }
+
+    if (method === "POST" && url === "/claim/verify") {
+      const ip = clientIp(req);
+      // The per-code attempt counter bounds guessing against ONE address; this
+      // bounds a caller spraying guesses across many.
+      const hits = await DB.bumpCounter(`claim:verify:ip:${ip}`, 15 * 60);
+      if (hits > CLAIM_VERIFY_PER_IP) {
+        logger.warn(`[auth] /claim/verify rate-limited (ip hits=${hits})`);
+        return send(res, 429, { error: "RATE_LIMITED" });
+      }
+
+      const body = await readJson(req);
+      const email = requireString(body, "email", { max: 254 });
+      const code = requireString(body, "code", { min: 6, max: 6 });
+      const pkHex = requireString(body, "pk", { min: 64, max: 40_000 });
+      if (!/^[0-9a-fA-F]+$/.test(pkHex) || pkHex.length % 2 !== 0) {
+        return send(res, 400, { error: "INVALID_FIELD", message: "pk must be hex" });
+      }
+
+      const result = await SubscriptionService.verifyClaim(email, code, pkHex);
+      if (!result.ok) {
+        // `bad_code` and `no_code` are distinguished because the user needs to
+        // know whether to retype the code or ask for a new one. Neither says
+        // anything about whether that address has a subscription.
+        const status = result.reason === "cap_reached" ? 409 : 400;
+        return send(res, status, { error: result.reason.toUpperCase() });
+      }
+      return send(res, 200, { ok: true });
+    }
+
+    // --- 4. Rotate the MQTT token (proactive refresh / after expiry) ---------
+    // Authenticated by the REST session bearer, so a client refreshes without
+    // redoing the KEM handshake. The scope rides along untouched: a refresh
+    // rotates a credential, it does not re-decide an entitlement.
+    if (method === "POST" && url === "/auth/refresh") {
+      const session = await DB.resolveSessionToken(bearer(req));
+      if (!session) return send(res, 401, { error: "unauthenticated" });
+      const mqttToken = await DB.mintMqttToken(session.pk);
+      return send(res, 200, {
+        mqttToken,
+        scope: session.scope,
+        mqttTtl: DB.MQTT_TOKEN_TTL_SECONDS,
+        mqttExpiresAt: Math.floor(Date.now() / 1000) + DB.MQTT_TOKEN_TTL_SECONDS,
+      });
+    }
+
+    // --- 5. EMQX HTTP authentication hook ------------------------------------
+    // EMQX posts { username, password, clientid, nonce? } on every CONNECT.
+    // Internal services present the privileged credential → superuser. Everyone
+    // else: username=pk, password=token; we verify it and hand EMQX the token's
+    // `expire_at` so EMQX DISCONNECTS the client at expiry → the client refreshes
+    // and reconnects (expiration-based rotation, ~5m). Optional per-CONNECT nonce
+    // blocks exact-packet replay.
+    // EMQX expects HTTP 200 with { result: "allow"|"deny", is_superuser?, expire_at? }.
+    if (method === "POST" && url === "/mqtt/authn") {
+      const body = await readJson(req);
+      const username = String(body.username || "");
+      const password = String(body.password || "");
+      const nonce = body.nonce ? String(body.nonce) : "";
+
+      // Privileged internal identity (push-bridge, ops tools). No expiry.
+      if (
+        INTERNAL_MQTT_SECRET &&
+        username === INTERNAL_MQTT_USER &&
+        safeEqualStr(password, INTERNAL_MQTT_SECRET)
+      ) {
+        return send(res, 200, { result: "allow", is_superuser: true });
+      }
+
+      const pk = username;
+      if (!pk || !password) return send(res, 200, { result: "deny" });
+
+      // Replay guard: a captured CONNECT can't be resent with the same nonce.
+      if (nonce && !(await DB.useNonce(nonce))) {
+        logger.warn(`[auth] CONNECT nonce replay for pk=${pk.slice(0, 12)}…`);
+        return send(res, 200, { result: "deny" });
+      }
+
+      const { ok, expireAt } = await DB.verifyMqttToken(pk, password);
+      if (!ok) return send(res, 200, { result: "deny" });
+      // expire_at (unix seconds) → EMQX force-disconnects at this time.
+      return send(res, 200, { result: "allow", expire_at: expireAt });
+    }
+
+    return send(res, 404, { error: "not found" });
+  } catch (e) {
+    if (e instanceof HttpError) {
+      return send(res, e.status, { error: e.code, message: e.message });
+    }
+    logger.error(`[auth] ${method} ${url} — ${(e as Error).message}`, e as Error);
+    return send(res, 500, { error: "INTERNAL" });
+  }
+});
+
+// Fail fast, before the port opens. This process owns /claim/*, so a missing
+// mail credential means nobody can finish linking a subscription — better
+// refused at boot than at the moment a paying customer tries. (The call sits
+// here rather than beside the import because imports are hoisted above it.)
+assertConfig(["mail"]);
+
+server.listen(PORT, () => {
+  logger.startup(`🔐 auth server on :${PORT} — /auth/{free,paid}/*, /claim/*, EMQX hook /mqtt/authn`);
+});
+
+// Event-loop / memory / query-latency early warning → Sentry. This process gates
+// every CONNECT (EMQX calls /mqtt/authn synchronously), so a stall here stalls
+// the whole broker — worth watching in its own right.
+healthMonitor.start();

@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+#
+# bootstrap-hosts.sh — the half of docs/runbooks/from-scratch.md that CI cannot
+# do, with your values already in it.
+#
+# RENDERED by the "From scratch" workflow (run ${BS_RUN_ID}). The template is
+# infra/deploy/scripts/bootstrap-hosts.sh.tmpl; edit that, not this.
+#
+# Everything here needs SSH, and nothing in GitHub is allowed to reach a host —
+# the hosts pull, CI never connects (from-scratch.md §0). So this runs from your
+# laptop, from a checkout of the repo, with your admin key loaded.
+#
+#   ./bootstrap-hosts.sh                # walk every step in order
+#   ./bootstrap-hosts.sh --only 3       # just one
+#   ./bootstrap-hosts.sh --list
+#
+# Steps are ordered because the order matters. In particular §6's TOTP enrolment
+# comes last and enrols BEFORE anything is enabled: turning it on first locks you
+# out, recoverable only through the DigitalOcean web console.
+set -euo pipefail
+
+PROD_IP='${BS_PROD_IP}'
+PREPROD_IP='${BS_PREPROD_IP}'
+ZONE='${BS_ZONE}'
+APP_FQDN='${BS_APP_FQDN}'
+CACHE_FQDN='${BS_CACHE_FQDN}'
+CACHE_PUBKEY='${BS_CACHE_PUBKEY}'
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+confirm() {
+  local prompt="$1"
+  read -r -p "$prompt [y/N] " a
+  [[ "$a" == [yY] ]] || { info "skipped"; return 1; }
+}
+
+step_header() { printf '\n'; bold "── $1"; }
+
+# --- 0. preconditions -------------------------------------------------------
+
+preconditions() {
+  for c in ssh nix terraform; do
+    command -v "$c" >/dev/null || die "$c is not installed. See from-scratch.md §0."
+  done
+  [[ -d "$REPO_ROOT/infra/nixos" ]] || die "run this from a checkout of the repo (looked in $REPO_ROOT)"
+
+  if grep -q REPLACE_ME_WITH_CACHE_PUBLIC_KEY "$REPO_ROOT/infra/nixos/modules/options.nix"; then
+    die "cachePublicKey is still the placeholder — merge the bootstrap config PR first.
+   Expected: $CACHE_PUBKEY
+   Nothing below can work without it: a host built from this checkout would refuse
+   every path in the cache, so nixos-anywhere has nothing to install."
+  fi
+  if ! grep -qE '^\s+"ssh-' "$REPO_ROOT/infra/nixos/admin.nix"; then
+    die "admin.nix has no SSH key — merge the bootstrap config PR first.
+   A host built with no key and no password has no way in at all, which is why
+   evaluation fails rather than producing one."
+  fi
+
+  # The Host workflow must have published a closure, or there is nothing to pull.
+  if ! curl -fsS "https://$CACHE_FQDN/channels/prod" >/dev/null 2>&1; then
+    printf '\033[33m! %s\033[0m\n' "https://$CACHE_FQDN/channels/prod is not answering yet."
+    info "The Host workflow publishes it on a push to main. Merge the config PR, let"
+    info "Host run, then come back — nixos-anywhere builds locally so step 1 will still"
+    info "work, but the hosts cannot follow their channel until this exists."
+  fi
+}
+
+# --- 1. NixOS (§6) ----------------------------------------------------------
+
+step_1() {
+  step_header "1/6  Install NixOS  (§6)"
+  info "Replaces Ubuntu on the droplet. DESTRUCTIVE — take a DigitalOcean snapshot first:"
+  info "droplet page → Snapshots → Take Snapshot."
+  info ""
+  info "Pre-prod first. It is the same procedure and a much cheaper place to be wrong."
+
+  cd "$REPO_ROOT/infra/nixos"
+  if confirm "Install NixOS on PRE-PROD ($PREPROD_IP)?"; then
+    nix run github:nix-community/nixos-anywhere -- --flake ".#preprod" "root@$PREPROD_IP"
+    info "waiting for the reboot…"
+    until ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "root@$PREPROD_IP" true 2>/dev/null; do sleep 5; done
+    ssh "root@$PREPROD_IP" 'nixos-version && systemctl is-active hqcat-agent.timer hqcat-host-agent.timer'
+  fi
+
+  info ""
+  info "Confirm pre-prod actually works before touching production."
+  if confirm "Install NixOS on PRODUCTION ($PROD_IP)?"; then
+    nix run github:nix-community/nixos-anywhere -- --flake ".#prod" "root@$PROD_IP"
+    info "waiting for the reboot…"
+    until ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "root@$PROD_IP" true 2>/dev/null; do sleep 5; done
+    ssh "root@$PROD_IP" 'nixos-version && systemctl is-active hqcat-agent.timer hqcat-host-agent.timer'
+  fi
+}
+
+# --- 2. Origin certificate (§7) ---------------------------------------------
+
+step_2() {
+  step_header "2/6  Origin certificate  (§7)"
+  info "Cloudflare dashboard → zone $ZONE → SSL/TLS → Origin Server → Create Certificate."
+  info "Accept the defaults (RSA, 15 years, *.$ZONE and $ZONE)."
+  info "The private key is shown EXACTLY ONCE — save both halves before closing the page."
+  info ""
+  info "Until this runs the site answers Cloudflare 526. That is the expected state,"
+  info "not a fault: the host boots with a self-signed placeholder so nginx starts."
+
+  local pem key
+  read -r -p "  path to the certificate (.pem, blank to skip): " pem
+  [[ -n "$pem" ]] || { info "skipped"; return 0; }
+  read -r -p "  path to the private key (.key): " key
+
+  # install-origin-cert.sh validates the pair locally — wrong file type, empty
+  # file, or a cert and key that do not match are all rejected before anything
+  # touches the host.
+  for ip in "$PREPROD_IP" "$PROD_IP"; do
+    if confirm "Install on $ip?"; then
+      "$REPO_ROOT/infra/nixos/install-origin-cert.sh" "root@$ip" "$pem" "$key"
+    fi
+  done
+}
+
+# --- 3. Database credentials (§8) -------------------------------------------
+
+step_3() {
+  step_header "3/6  Database credentials onto production  (§8)"
+  info "Straight from terraform output to the host — never through GitHub."
+  info "Pre-prod is not on the managed cluster; it runs its own postgres container"
+  info "and step 4 generates its credentials."
+
+  cd "$REPO_ROOT/infra/database"
+  if [[ ! -d .terraform ]]; then
+    info "initialising the database module (needs AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+    info "for the R2 state backend — the state token id, and sha256 of its value)"
+    terraform init -backend-config=backend.hcl
+  fi
+
+  terraform output -raw private_host >/dev/null 2>&1 \
+    || die "no database outputs — has the From scratch workflow run with apply:true and include_database:true?"
+
+  confirm "Write the four credential files to $PROD_IP?" || return 0
+  for o in database_url database_url_direct pg_ca_cert emqx_pg; do
+    terraform output -raw "$o" | ssh "root@$PROD_IP" "umask 077; cat > /etc/hqcat/prod/secrets/$o"
+    info "wrote $o"
+  done
+
+  info ""
+  info "These two go in server.env in the next step:"
+  terraform output -json app_roles | jq -r '"  APP_ROLE=\(.app)\n  EMQX_ROLE=\(.emqx)"'
+  info ""
+  info "Prove the door is shut — from here, which is not a trusted source, this must"
+  info "hang and time out. If it prompts for a password, the firewall is not what you"
+  info "think it is:"
+  info "  psql \"postgresql://doadmin@\$(terraform output -raw public_host):25060/defaultdb\""
+}
+
+# --- 4. Host secrets (§9) ---------------------------------------------------
+
+step_4() {
+  step_header "4/6  Host secrets  (§9)"
+  info "These never enter GitHub. Skipping any of them is fine — every compose secret"
+  info "already exists as an empty file, so an unused Stripe or APNs key will not stop"
+  info "the stack. The OTP pepper generates itself."
+  info ""
+  info "set-host-secrets.sh runs ON the host and prompts, so nothing lands in your"
+  info "shell history."
+
+  for pair in "prod:$PROD_IP" "preprod:$PREPROD_IP"; do
+    local stack="${pair%%:*}" ip="${pair##*:}"
+    confirm "Set $stack secrets on $ip?" || continue
+    scp "$REPO_ROOT/infra/deploy/agent/set-host-secrets.sh" "root@$ip:/tmp/set-host-secrets.sh"
+    ssh -t "root@$ip" "chmod +x /tmp/set-host-secrets.sh && /tmp/set-host-secrets.sh $stack; rm -f /tmp/set-host-secrets.sh"
+  done
+
+  info ""
+  info "Non-secret config still to write on prod — see infra/deploy/.env.example for every key:"
+  cat <<EOF
+  ssh root@$PROD_IP 'umask 077; cat > /etc/hqcat/prod/server.env' <<'ENV'
+  SERVER_NAME=DissQus
+  PUBLIC_BASE_URL=https://$APP_FQDN
+  ADMISSION_POLICY=stripe
+  APP_ROLE=<from step 3>
+  EMQX_ROLE=<from step 3>
+  ENV
+EOF
+  info ""
+  info "And GHCR pull credentials, unless you made the package public:"
+  info "  github.com/settings/tokens → classic → read:packages ONLY"
+  info "  printf 'GHCR_USER=<you>\\nGHCR_TOKEN=<token>\\n' | ssh root@$PROD_IP 'umask 077; cat > /etc/hqcat/agent-auth.env'"
+}
+
+# --- 5. TOTP (§6) -----------------------------------------------------------
+
+step_5() {
+  step_header "5/6  Second factor on SSH  (§6)"
+  info "ORDER MATTERS. Enrol first, prove it, and only then flip the flag. Enabling"
+  info "TOTP before enrolling locks you out of SSH entirely, recoverable only through"
+  info "the DigitalOcean web console."
+  info ""
+  info "Enrolment is machine state, not configuration, so each host needs its own run."
+
+  for ip in "$PREPROD_IP" "$PROD_IP"; do
+    confirm "Enrol root on $ip now?" || continue
+    info "Scan the QR with your authenticator app and SAVE the emergency scratch codes offline."
+    # -w 8 accepts codes ±3.5 minutes out, absorbing clock drift on a droplet;
+    # -r 3 -R 30 rate-limits attempts.
+    ssh "root@$ip" -t 'google-authenticator -t -d -f -r 3 -R 30 -w 8'
+
+    info ""
+    info "Now prove it from a NEW terminal, while this session is still open:"
+    info "  ssh root@$ip true"
+    read -r -p "  Did a fresh session work? [y/N] " a
+    [[ "$a" == [yY] ]] || die "Stop here. Do NOT enable totp until a fresh session works — your
+   current session is the only way back in. Re-run: ./bootstrap-hosts.sh --only 5"
+  done
+
+  info ""
+  info "Both hosts enrolled and proved? Then set totp = true in infra/nixos/admin.nix,"
+  info "merge, and let the host agent pick it up (or: systemctl start hqcat-host-agent.service)."
+  info "From then on SSH needs BOTH your key and a code."
+}
+
+# --- 6. Verify (§11) --------------------------------------------------------
+
+step_6() {
+  step_header "6/6  Verify  (§11)"
+  info "Nothing is deployed until you move the channel tag: Actions → Promote →"
+  info "Run workflow, target prod. Pre-prod needs no promote — a push to the preprod"
+  info "branch moves :preprod directly."
+  info ""
+
+  set +e
+  echo "  → https://$APP_FQDN/health"
+  curl -sS "https://$APP_FQDN/health"; echo
+  echo "  → compose"
+  ssh "root@$PROD_IP" 'cd /opt/hqcat/prod && docker compose ps'
+  echo "  → broker-watch (the one worth not skipping: EMQX keeps its own Postgres"
+  echo "    and auth links, and both can be broken while everything else is healthy)"
+  ssh "root@$PROD_IP" 'curl -sS localhost:8092/health'; echo
+  echo "  → dig $APP_FQDN (expect Cloudflare IPs, not $PROD_IP)"
+  dig +short "$APP_FQDN"
+  echo "  → deployed digest"
+  ssh "root@$PROD_IP" 'cat /var/lib/hqcat/prod/current'
+  echo "  → host channel"
+  curl -sS "https://$CACHE_FQDN/channels/prod"; echo
+  set -e
+
+  info ""
+  info "Anything red? from-scratch.md §12 has the symptom → cause table."
+}
+
+# --- driver -----------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+usage: bootstrap-hosts.sh [--only N] [--list]
+
+  1  Install NixOS on both droplets            (§6)   destructive
+  2  Origin certificate                        (§7)
+  3  Database credentials onto production      (§8)
+  4  Host secrets                              (§9)
+  5  TOTP enrolment                            (§6)
+  6  Verify                                    (§11)
+
+  prod     $PROD_IP
+  preprod  $PREPROD_IP
+  app      https://$APP_FQDN
+  cache    https://$CACHE_FQDN
+EOF
+}
+
+main() {
+  local only=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --only) only="${2:?--only needs a step number}"; shift 2 ;;
+      --list|-h|--help) usage; exit 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  preconditions
+  if [[ -n "$only" ]]; then
+    case "$only" in
+      1|2|3|4|5|6) "step_$only" ;;
+      *) die "no such step: $only" ;;
+    esac
+  else
+    for n in 1 2 3 4 5 6; do "step_$n"; done
+  fi
+
+  printf '\n'
+  bold "Done. Remaining manual bits, if you have not done them:"
+  info "· Cloudflare zone → SSL/TLS → Overview → Full (strict)   (§5, a dashboard click)"
+  info "· Actions → Promote → Run workflow, target prod          (§10)"
+  info "· Revoke the DigitalOcean token and the GitHub PAT you pasted into the workflow"
+}
+
+main "$@"

@@ -1,0 +1,263 @@
+name: Release
+
+# Builds and publishes a release. It does NOT reach into any server.
+#
+#   push preprod  → ci → image (moves the :preprod channel tag)
+#   push main     → ci → image (:latest) → cloudflare
+#   production    → run the Promote workflow to move the :prod channel tag
+#
+# The VMs deploy themselves: infra/deploy/agent watches its channel tag in GHCR
+# and rolls over when the digest moves. That is why there is no deploy job here,
+# no DEPLOY_SSH_KEY, no DEPLOY_HOST, and no git checkout on any server — the
+# things this pipeline used to need in order to push a release onto a box.
+#
+# Releasing production = moving a tag (Promote). Rolling back = moving it to an
+# older digest, or letting the agent's health gate revert it automatically.
+on:
+  push:
+    branches: [main, preprod]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize per target. cancel-in-progress is deliberately FALSE: cancelling a
+# half-finished rollout is worse than queueing behind it.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # GitHub Container Registry image (owner must be lowercase for GHCR).
+  IMAGE: ghcr.io/YOUR-GITHUB-ACCOUNT/dissqus-server
+
+jobs:
+  # Re-test the merged commit before we build or ship anything. Reusing ci.yml
+  # means the deploy gate is byte-identical to the PR gate — no drift.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # ---------------------------------------------------------------------------
+  # Image: build the server image, smoke-test the real compose stack through the
+  # *_FILE secrets path, then push it to GHCR. The VM pulls this image — it never
+  # builds — so deploys are fast, identical, and reproducible.
+  # ---------------------------------------------------------------------------
+  image:
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      ref: ${{ steps.meta.outputs.sha_ref }}
+      bot_ref: ${{ steps.meta.outputs.bot_sha_ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute tags
+        id: meta
+        run: |
+          SHA_REF="${IMAGE}:sha-${GITHUB_SHA::12}"
+          echo "sha_ref=$SHA_REF" >> "$GITHUB_OUTPUT"
+          # The bot ships its own, smaller image (see services/server/Dockerfile.bot).
+          BOT_SHA_REF="${IMAGE}-bot:sha-${GITHUB_SHA::12}"
+          echo "bot_sha_ref=$BOT_SHA_REF" >> "$GITHUB_OUTPUT"
+          # On preprod this moving tag IS the release channel the pre-prod
+          # agent follows, so pushing it deploys. `main` publishes :latest,
+          # which nothing follows — production ships by moving :prod, which is
+          # the Promote workflow's job.
+          MOVING=""
+          BOT_MOVING=""
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            MOVING="${IMAGE}:latest"; BOT_MOVING="${IMAGE}-bot:latest"
+          elif [ "$GITHUB_REF" = "refs/heads/preprod" ]; then
+            MOVING="${IMAGE}:preprod"; BOT_MOVING="${IMAGE}-bot:preprod"
+          fi
+          echo "moving=$MOVING" >> "$GITHUB_OUTPUT"
+          echo "bot_moving=$BOT_MOVING" >> "$GITHUB_OUTPUT"
+
+      # `--load` puts the result in the local daemon so the smoke test below can
+      # run it. The GHA layer cache is what stops both images rebuilding from
+      # scratch on every single run.
+      - name: Build server image (linux/amd64, the native HQC .so target)
+        uses: docker/build-push-action@v6
+        with:
+          context: services/server
+          # The image also carries /deploy-bundle (compose files, emqx.conf,
+          # nginx.conf, scripts, agent) so a VM needs no git checkout to run it.
+          build-contexts: |
+            deploy=infra/deploy
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.sha_ref }}
+          load: true
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,scope=server,mode=max
+
+      - name: Build bot image
+        uses: docker/build-push-action@v6
+        with:
+          context: services/server
+          file: services/server/Dockerfile.bot
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.bot_sha_ref }}
+          load: true
+          cache-from: type=gha,scope=bot
+          cache-to: type=gha,scope=bot,mode=max
+
+      - name: Image sizes
+        run: |
+          docker image inspect -f 'server: {{.Size}} bytes' "${{ steps.meta.outputs.sha_ref }}"
+          docker image inspect -f 'bot:    {{.Size}} bytes' "${{ steps.meta.outputs.bot_sha_ref }}"
+
+      - name: Smoke-test the compose stack
+        run: |
+          mkdir -p infra/deploy/secrets
+          # Internal secrets (internal-mqtt/dashboard) are GENERATED at launch by
+          # the secrets-init service; the DATABASE credentials come from the
+          # local overlay, which also supplies the postgres container to point
+          # them at. CI only writes the remaining external ones.
+          printf '%s' 'ci-apns-key-p8'   > infra/deploy/secrets/apns_key_p8
+          printf '%s' 'ci-resend-key'    > infra/deploy/secrets/resend_api_key
+          printf '%s' 'ci-otp-pepper'    > infra/deploy/secrets/otp_pepper
+          printf 'ADMISSION_POLICY=open\nSERVER_NAME=CI\nAPNS_KEY_ID=ci\nAPNS_TEAM_ID=ci\n' > infra/deploy/server.env
+
+          # Production reaches a managed cluster over a VPC, which a runner does
+          # not have. The local overlay adds a throwaway postgres container and
+          # generate.sh writes the four database secrets pointing at it — the SAME
+          # files a developer uses, so this stays a test of the stack that ships
+          # rather than of a CI-only variant of it.
+          sh infra/deploy/local-secrets/generate.sh
+          COMPOSE="-f infra/deploy/docker-compose.yml -f infra/deploy/docker-compose.local.yml"
+          export SERVER_IMAGE="${{ steps.meta.outputs.sha_ref }}"
+          export BOT_IMAGE="${{ steps.meta.outputs.bot_sha_ref }}"
+
+          # Since Phase 4 the stack has no `/ws` monolith: auth + app-api are the
+          # whole HTTP surface. Validate the file parses, then bring the TS
+          # services up (same image, no build/pull) and health-check each. EMQX
+          # is a separate pulled image; its config is validated by `compose config`.
+          docker compose $COMPOSE config -q
+          # db-migrate is a dependency of both, so this also proves the schema
+          # applies cleanly from empty — the step a bad migration fails at.
+          docker compose $COMPOSE up -d --no-build auth app-api
+          for svc in "8090:/health" "8091:/health"; do
+            port="${svc%%:*}"; path="${svc##*:}"
+            for i in $(seq 1 30); do
+              if curl -fsS http://localhost:$port$path >/dev/null; then echo "service :$port up"; break; fi
+              sleep 2
+            done
+            curl -fsS http://localhost:$port$path \
+              || (echo "service :$port did not become healthy"; docker compose $COMPOSE logs; exit 1)
+          done
+
+          # Broker + watchdog. This is the guard for the class of failure that is
+          # otherwise INVISIBLE in production: EMQX keeps its OWN Postgres link
+          # (the topic-ACL authorizer, with its own role and its own pool) and its
+          # own HTTP link to auth, and both can be down while every service above
+          # answers /health. broker-watch reports `unhealthy: []` only when the
+          # rendered emqx.conf actually connected — so this fails the build on a
+          # credential that did not template in (emqx/emqx#14587), on an
+          # authorizer query the schema does not satisfy, and on a dashboard
+          # credential that drifted.
+          docker compose $COMPOSE up -d --no-build emqx broker-watch
+          for i in $(seq 1 45); do
+            body=$(curl -fsS http://localhost:8092/health 2>/dev/null || true)
+            case "$body" in *'"unhealthy":[]'*) broker_ok=1; break ;; esac
+            sleep 2
+          done
+          [ "${broker_ok:-0}" = 1 ] || (
+            echo "broker-watch never went clean; last answer: $body"
+            docker compose $COMPOSE logs emqx broker-watch
+            exit 1
+          )
+
+          docker compose $COMPOSE down -v
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Push image
+        run: |
+          docker push "${{ steps.meta.outputs.sha_ref }}"
+          docker push "${{ steps.meta.outputs.bot_sha_ref }}"
+          if [ -n "${{ steps.meta.outputs.moving }}" ]; then
+            docker tag "${{ steps.meta.outputs.sha_ref }}" "${{ steps.meta.outputs.moving }}"
+            docker push "${{ steps.meta.outputs.moving }}"
+          fi
+          if [ -n "${{ steps.meta.outputs.bot_moving }}" ]; then
+            docker tag "${{ steps.meta.outputs.bot_sha_ref }}" "${{ steps.meta.outputs.bot_moving }}"
+            docker push "${{ steps.meta.outputs.bot_moving }}"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Cloudflare edge (DNS, Worker + routes, zone, security, health checks).
+  #
+  # Runs BEFORE either rollout so the record/route a new release depends on
+  # already exists when containers come up. It used to live in its own workflow
+  # on its own trigger, which meant the edge and the origin it points at could
+  # be applied hours apart, in either order.
+  # ---------------------------------------------------------------------------
+  cloudflare:
+    needs: ci
+    # main only: both a merge to main and a production dispatch, never a
+    # pre-prod rollout (the pre-prod DNS record lives in this same state and
+    # is applied from main along with everything else).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    defaults:
+      run:
+        working-directory: infra/cloudflare
+    env:
+      # Two SEPARATE Cloudflare tokens, two purposes:
+      #   CLOUDFLARE_API_TOKEN       → provider: manage DNS/Workers/zone ("management").
+      #   CLOUDFLARE_API_TOKEN_USER  → the R2 bucket token, used for state ("bucket").
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # Module inputs (origin IPs kept as secrets so they aren't echoed in logs).
+      TF_VAR_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_origin_ipv4: ${{ secrets.ORIGIN_IPV4 }}
+      TF_VAR_preprod_origin_ipv4: ${{ secrets.PREPROD_ORIGIN_IPV4 }}
+      TF_VAR_alert_email: ${{ vars.CLOUDFLARE_ALERT_EMAIL }}
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5" # >= 1.10 for native S3/R2 state locking
+      - name: Cache Terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-providers-${{ hashFiles('infra/cloudflare/.terraform.lock.hcl') }}
+      # Absolute path, so the job-level working-directory is irrelevant here.
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+      # The S3 backend speaks the S3 protocol, which needs Access Key ID + Secret
+      # — NOT a bearer token. Cloudflare derives them from an R2 API token:
+      #   Access Key ID     = the token's ID
+      #   Secret Access Key = SHA-256(token value)
+      # R2_ACCESS_KEY_ID is read from vars OR secrets: the provisioning script
+      # sets it as a variable, but the live environment has it as a secret, and
+      # reading only `vars` silently produced an empty Access Key ID.
+      - name: Derive R2 S3 credentials
+        env:
+          R2_TOKEN_VALUE: ${{ secrets.CLOUDFLARE_API_TOKEN_USER }}
+          R2_TOKEN_ID: ${{ vars.R2_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+        run: |
+          [ -n "$R2_TOKEN_ID" ] || { echo "::error::R2_ACCESS_KEY_ID is not set as a variable or secret on this environment"; exit 1; }
+          SECRET=$(printf '%s' "$R2_TOKEN_VALUE" | sha256sum | cut -d' ' -f1)
+          echo "::add-mask::$SECRET"
+          echo "AWS_ACCESS_KEY_ID=$R2_TOKEN_ID" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET"  >> "$GITHUB_ENV"
+
+      - name: Init
+        run: terraform init -input=false -backend-config=backend.hcl
+      - name: Validate
+        run: terraform validate
+      # Planned separately from apply so the diff is readable in the run log
+      # even though the apply is unattended.
+      - name: Plan
+        run: terraform plan -input=false -no-color -out=tfplan
+      - name: Apply
+        run: terraform apply -input=false -auto-approve tfplan

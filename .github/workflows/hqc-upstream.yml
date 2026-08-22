@@ -1,0 +1,61 @@
+name: HQC upstream drift-check
+
+# Alerts when the official HQC reference implementation advances past the commit
+# this repo's crypto is built from. Advisory only — it runs on its own schedule
+# and does NOT gate PR merges (it is not part of ci.yml). Bumping is a deliberate,
+# reviewed action: see native/hqc/HQC_UPSTREAM.txt.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare pinned HQC commit against upstream
+        run: |
+          set -euo pipefail
+          # Read the pin (ignores comments/blank lines).
+          eval "$(grep -E '^(REPO|REF|PINNED_COMMIT)=' native/hqc/HQC_UPSTREAM.txt)"
+          echo "Tracking $REPO ref '$REF'"
+          echo "Pinned:   $PINNED_COMMIT"
+
+          UPSTREAM="$(git ls-remote "$REPO" "$REF" | awk '{print $1}')"
+          if [ -z "$UPSTREAM" ]; then
+            echo "::error::Could not resolve $REPO ref '$REF' (renamed or removed upstream?)."
+            exit 1
+          fi
+          echo "Upstream: $UPSTREAM"
+
+          {
+            echo "### HQC upstream drift-check"
+            echo ""
+            echo "- Repo: \`$REPO\`"
+            echo "- Ref: \`$REF\`"
+            echo "- Pinned: \`$PINNED_COMMIT\`"
+            echo "- Upstream: \`$UPSTREAM\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$PINNED_COMMIT" = "UNKNOWN" ]; then
+            echo "PINNED_COMMIT is UNKNOWN — pin it to \`$UPSTREAM\` in native/hqc/HQC_UPSTREAM.txt." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::HQC pin is UNKNOWN; current upstream is $UPSTREAM."
+            exit 0
+          fi
+
+          if [ "$UPSTREAM" != "$PINNED_COMMIT" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ **Upstream HQC advanced.** Review the diff, rebuild the libs + xcframework, run the crypto tests, then bump PINNED_COMMIT." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::HQC upstream ($UPSTREAM) differs from pinned ($PINNED_COMMIT). See native/hqc/HQC_UPSTREAM.txt."
+            exit 1
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Up to date with the pinned HQC commit." >> "$GITHUB_STEP_SUMMARY"
+          echo "HQC is up to date."

@@ -1,0 +1,616 @@
+# DissQus production stack: EMQX + the extracted services + helper bot.
+#
+# There is no database container here. State lives in a DigitalOcean Managed
+# Postgres cluster (infra/database), reachable only from this droplet over the
+# VPC's private endpoint — so the stack is stateless apart from EMQX's own
+# mnesia and the bot's identity, and a lost droplet loses nothing that matters.
+#
+# As of Phase 4 (deploy/EXTRACTION_PLAN.md) there is no `/ws` monolith here any
+# more: control is REST (auth + app-api) and conversations are MQTT (emqx),
+# which is what the apps and the bot both speak. `server/messages/server.ts`
+# stays in the repo — undeployed — only so its e2e tests keep covering the HQC
+# handshake and the ratchet.
+#
+# Two classes of secret:
+#  - INTERNAL, mutually-agreed service credentials (internal MQTT identity, EMQX
+#    dashboard password, metrics token) are GENERATED at launch by the
+#    `secrets-init` service into a shared tmpfs volume (RAM only — never on the
+#    host disk or in git), and read via the *_FILE convention in config.ts.
+#    Nothing to create for these. Both ends are inside this stack, so nobody has
+#    to be told what they are.
+#  - EXTERNAL secrets that must be provided/stable (database_url, pg_ca_cert,
+#    emqx_pg, stripe_*, apns_key_p8, bot_seed) are delivered via Docker Compose
+#    `secrets:` from deploy/secrets/*. The database credentials are external for
+#    the same reason: the cluster is issued by infra/database, not invented here.
+# Non-secret config lives in ./server.env (gitignored).
+#
+# Setup (on the VM, from the repo root):
+#   cp deploy/.env.example deploy/server.env      # edit non-secret values
+#   mkdir -p deploy/secrets && chmod 700 deploy/secrets
+#   # REQUIRED — from `terraform output` in infra/database (see its README):
+#   #   deploy/secrets/{database_url,database_url_direct,pg_ca_cert,emqx_pg}
+#   # ONLY if you use them (ADMISSION_POLICY=stripe / APNs):
+#   printf '%s' 'sk_live_...'   > deploy/secrets/stripe_secret_key
+#   printf '%s' 'whsec_...'     > deploy/secrets/stripe_webhook_secret
+#   printf '%s' '<apns .p8>'    > deploy/secrets/apns_key_p8
+#   chmod 600 deploy/secrets/*
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Runtime hardening applied to every service below:
+#   security_opt no-new-privileges  — a process can't gain privileges via setuid.
+#   cap_drop ALL                    — no Linux capabilities (none are needed).
+#   read_only root filesystem       — the image is immutable at runtime; the only
+#                                     writable paths are the named volumes and a
+#                                     small tmpfs at /tmp. (The app already runs
+#                                     as the non-root `node` user.)
+#   init                            — PID 1 reaps zombies + forwards signals.
+#   pids_limit / mem_limit / cpus   — bound a runaway or abused container.
+#   logging max-size/max-file       — cap log growth so a noisy/attacked service
+#                                     can't fill the disk.
+# Tip: pin base images by digest (e.g. `emqx/emqx:5.8@sha256:…`) for
+# reproducible, tamper-evident builds — see deploy/DEPLOY.md.
+
+services:
+  # One-shot: GENERATE the internal service credentials (internal MQTT identity,
+  # EMQX dashboard password, metrics token) at launch into the shared
+  # `runtime-secrets` tmpfs volume (RAM only — never on the host disk, wiped on
+  # `down`). Everything below reads them from there via *_FILE. Only internal,
+  # mutually-agreed secrets are generated; external ones (the database
+  # credentials, apns/stripe/bot_seed) come from compose `secrets:` / the secret
+  # store. Runs the same image (has `node`) and exits.
+  secrets-init:
+    image: ${SERVER_IMAGE:-dissqus-server:local}
+    user: "0:0"                       # write + chmod the shared volume
+    # Generate once, then hold the tmpfs volume open for the stack's lifetime so
+    # its RAM-backed content survives for the consumers (a tmpfs volume is torn
+    # down on last-unmount). Idempotent: a restart keeps existing values while any
+    # other consumer still holds the volume.
+    entrypoint: ["sh", "-c", "sh /gen-runtime-secrets.sh && exec tail -f /dev/null"]
+    volumes:
+      - runtime-secrets:/runtime-secrets
+      - ./scripts/gen-runtime-secrets.sh:/gen-runtime-secrets.sh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /runtime-secrets/internal_mqtt_secret"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
+  # One-shot: bring the schema up to date, then exit. Everything else waits for
+  # it to succeed, so a service can never start against a database that is a
+  # migration behind — and a failed migration stops the rollout instead of
+  # producing a stack that half-works.
+  #
+  # It uses the DIRECT endpoint and the cluster admin, not the pooler and the
+  # application role: DDL does not belong on a transaction-mode pooler, and the
+  # application role is deliberately not allowed to create tables
+  # (services/db/migrations/000_roles.sql).
+  db-migrate:
+    image: ${SERVER_IMAGE:-dissqus-server:local}
+    command: ["node", "--import", "tsx", "services/db/migrate.ts"]
+    restart: "no"
+    env_file:
+      - server.env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL_DIRECT_FILE: /run/secrets/database_url_direct
+      PGSSLROOTCERT: /run/secrets/pg_ca_cert
+      LOG_LEVEL: info
+    secrets:
+      - database_url_direct
+      - pg_ca_cert
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    pids_limit: 128
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
+  bot:
+    # The bot has its own image (server/messages/Dockerfile.bot): same base and
+    # same native HQC lib, minus the packages and sources it never imports
+    # (stripe, the auth/api/push entrypoints). Falls back to the server image so
+    # a local `docker compose up` still works with one build.
+    image: ${BOT_IMAGE:-${SERVER_IMAGE:-dissqus-server:local}}
+    restart: unless-stopped
+    # The bot is an ordinary client of the same three services the apps use.
+    depends_on:
+      # Both one-shots: the credentials this service reads from the tmpfs volume,
+      # and the schema it is about to query. Ordering that used to arrive
+      # transitively through the database container has to be said out loud now
+      # that there isn't one.
+      secrets-init:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      auth:
+        condition: service_started
+      app-api:
+        condition: service_started
+      emqx:
+        condition: service_started
+    # Run via `node --import tsx` (not npx, not the .bin/tsx symlink) so it works
+    # under the read-only rootfs. See the Dockerfile CMD for the rationale.
+    command: ["node", "--import", "tsx", "bot/bot.ts"]
+    env_file:
+      - server.env
+    environment:
+      NODE_ENV: production
+      # REST for control, MQTT for conversations — the same protocol the apps
+      # speak, reached in-cluster instead of through nginx.
+      AUTH_BASE_URL: http://auth:8080
+      API_BASE_URL: http://app-api:8080
+      EMQX_URL: ws://emqx:8083/mqtt
+      BOT_USERNAME: helper
+      # Persist state here — a path OUTSIDE the code dir. The bot-state volume
+      # mounts at this path (NOT /app/bot), so it never shadows the bot's code.
+      BOT_STATE_DIR: /app/bot-state
+      # The bot needs the database even though messaging is MQTT: it writes its
+      # own public key into `admission_exempt` at startup (self-admission),
+      # which is what lets it authenticate and claim its reserved handle.
+      DATABASE_URL_FILE: /run/secrets/database_url
+      PGSSLROOTCERT: /run/secrets/pg_ca_cert
+      # Observability: same Sentry project, tagged component=bot in code.
+      # From deploy/server.env (gitignored) — empty here so a clone of this
+      # repo never reports into someone else's Sentry project.
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      SENTRY_ENVIRONMENT: production
+      LOG_LEVEL: info
+      # Crash early-warning (lib/health-monitor.ts): fire below this service's
+      # 512m mem_limit so the alert beats the cgroup OOM-kill.
+      HEALTH_RSS_WARN_MB: "380"
+      HEALTH_RSS_CRIT_MB: "460"
+      # BOT_SEED_FILE: /run/secrets/bot_seed             # uncomment for a stable identity
+    # Persist the bot's identity/state across restarts when no BOT_SEED is set.
+    # Mounted at BOT_STATE_DIR (/app/bot-state) — a dedicated data dir, NOT the
+    # code dir /app/bot: mounting over the code would overlay bot.ts with a stale
+    # copy from the volume and freeze the container on old code across upgrades.
+    # This named volume stays writable even with a read-only root filesystem.
+    secrets:
+      - database_url
+      - pg_ca_cert
+    volumes:
+      - bot-state:/app/bot-state
+      - runtime-secrets:/runtime-secrets:ro
+    # --- hardening ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ===========================================================================
+  # MQTT stack (EXTRACTION_PLAN.md). Since Phase 4 this IS the stack — the /ws
+  # monolith it was dual-homed with is gone. The TS services reuse
+  # ${SERVER_IMAGE} via a `command:` entrypoint — no new image; only EMQX is a
+  # pulled official image.
+  # The dashboard password and the internal MQTT identity are generated at launch
+  # by secrets-init; the broker's DATABASE credentials are not, because they
+  # belong to a cluster this stack does not own — place deploy/secrets/emqx_pg
+  # and deploy/secrets/pg_ca_cert from `terraform output` (infra/database).
+  # ===========================================================================
+
+  # --- EMQX broker: WSS (via nginx) messaging backbone ----------------------
+  emqx:
+    image: emqx/emqx:5.8
+    restart: unless-stopped
+    depends_on:
+      # Both one-shots: the credentials this service reads from the tmpfs volume,
+      # and the schema it is about to query. Ordering that used to arrive
+      # transitively through the database container has to be said out loud now
+      # that there isn't one.
+      secrets-init:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      auth:
+        condition: service_started
+    # Inject the secrets, then hand off to the image entrypoint. Keeps
+    # credentials out of emqx.conf (which is a TEMPLATE, mounted read-only).
+    #
+    # The authorizer's connection details are TEMPLATED IN, not exported as env
+    # overrides: EMQX cannot override an element of an ARRAY config (authorization
+    # .sources is one) from the environment — since 5.0.25 the attempt is either
+    # ignored or fails validation outright with `missing_type_field`
+    # (emqx/emqx#10264, emqx/emqx#14587). An ignored password leaves the source
+    # `disconnected` while everything else looks healthy, i.e. an ACL that never
+    # matches — and with deny_action = disconnect, a broker that drops every
+    # client that tries a topic. broker-watch alerts on exactly that, and the
+    # release smoke test fails the build on it.
+    #
+    # They arrive as a FILE of shell assignments rather than as environment
+    # variables for the same reason: EMQX reads the environment as configuration,
+    # so an unrecognised var is a boot failure rather than something it ignores.
+    # `set -e` so a failed render never silently boots the broker on its stock
+    # config (which authorizes everything).
+    #
+    # The dashboard password is re-synced AFTER boot because
+    # `dashboard.default_password` only seeds the admin user on the FIRST boot;
+    # the credential then lives in mnesia (emqx-data), which survives the
+    # `docker compose down` that regenerates the RAM-only runtime secret.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        set -e;
+        . /run/secrets/emqx_pg;
+        sed -e "s|__PG_SERVER__|$$AUTHZ_PG_SERVER|"
+        -e "s|__PG_HOST__|$${AUTHZ_PG_SERVER%%:*}|"
+        -e "s|__PG_DATABASE__|$$AUTHZ_PG_DATABASE|"
+        -e "s|__PG_USERNAME__|$$AUTHZ_PG_USERNAME|"
+        -e "s|__PG_PASSWORD__|$$AUTHZ_PG_PASSWORD|"
+        -e "s|__PG_SSL__|$${AUTHZ_PG_SSL:-true}|"
+        /emqx.conf.template > /opt/emqx/etc/emqx.conf;
+        export EMQX_DASHBOARD__DEFAULT_PASSWORD="$$(cat /runtime-secrets/emqx_dashboard_password)";
+        (
+          until /opt/emqx/bin/emqx ctl status >/dev/null 2>&1; do sleep 2; done;
+          PW="$$(cat /runtime-secrets/emqx_dashboard_password)";
+          /opt/emqx/bin/emqx ctl admins passwd admin "$$PW" >/dev/null 2>&1 ||
+          /opt/emqx/bin/emqx ctl admins add admin "$$PW" >/dev/null 2>&1 || true
+        ) &
+        exec /usr/bin/docker-entrypoint.sh emqx foreground
+    secrets:
+      - emqx_pg
+      - pg_ca_cert
+    volumes:
+      - ./emqx/emqx.conf:/emqx.conf.template:ro
+      - emqx-data:/opt/emqx/data
+      - runtime-secrets:/runtime-secrets:ro
+    ports:
+      - "127.0.0.1:8083:8083"
+      - "127.0.0.1:18083:18083"
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx", "ctl", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    init: true
+    mem_limit: 1g
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # --- Auth server: HQC handshake + token mint + EMQX authn hook ------------
+  auth:
+    image: ${SERVER_IMAGE:-dissqus-server:local}
+    restart: unless-stopped
+    depends_on:
+      # Both one-shots: the credentials this service reads from the tmpfs volume,
+      # and the schema it is about to query. Ordering that used to arrive
+      # transitively through the database container has to be said out loud now
+      # that there isn't one.
+      secrets-init:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    command: ["node", "--import", "tsx", "auth/main.ts"]
+    env_file:
+      - server.env
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL_FILE: /run/secrets/database_url
+      PGSSLROOTCERT: /run/secrets/pg_ca_cert
+      INTERNAL_MQTT_SECRET_FILE: /runtime-secrets/internal_mqtt_secret
+      # The paid door consults the claim state, and /claim/* mails the codes
+      # that create it — so auth needs the mail credentials and the pepper.
+      # It never talks to Stripe: money is app-api's business.
+      ADMISSION_POLICY: stripe
+      RESEND_API_KEY_FILE: /run/secrets/resend_api_key
+      OTP_PEPPER_FILE: /run/secrets/otp_pepper
+      MAIL_FROM: "${MAIL_FROM:-}"
+      # From deploy/server.env (gitignored) — empty here so a clone of this
+      # repo never reports into someone else's Sentry project.
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      SENTRY_ENVIRONMENT: production
+      LOG_LEVEL: info
+      # Crash early-warning (lib/health-monitor.ts): fire below this service's
+      # 512m mem_limit so the alert beats the cgroup OOM-kill.
+      HEALTH_RSS_WARN_MB: "380"
+      HEALTH_RSS_CRIT_MB: "460"
+    secrets:
+      - database_url
+      - pg_ca_cert
+      - resend_api_key
+      - otp_pepper
+    volumes:
+      - runtime-secrets:/runtime-secrets:ro
+    ports:
+      - "127.0.0.1:8090:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # --- App-API: REST directory / friends / push / account / payments -------
+  app-api:
+    image: ${SERVER_IMAGE:-dissqus-server:local}
+    restart: unless-stopped
+    depends_on:
+      # Both one-shots: the credentials this service reads from the tmpfs volume,
+      # and the schema it is about to query. Ordering that used to arrive
+      # transitively through the database container has to be said out loud now
+      # that there isn't one.
+      secrets-init:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      emqx:
+        condition: service_started
+    command: ["node", "--import", "tsx", "api/main.ts"]
+    env_file:
+      - server.env
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL_FILE: /run/secrets/database_url
+      PGSSLROOTCERT: /run/secrets/pg_ca_cert
+      # Revocation acts rather than waits: unfriending drops the live
+      # subscription and account deletion kicks the session (lib/emqx.ts).
+      EMQX_API_URL: http://emqx:18083
+      EMQX_DASHBOARD_PASSWORD_FILE: /runtime-secrets/emqx_dashboard_password
+      # app-api owns /stripe/webhook and /subscribe, so it is the service that
+      # needs the Stripe and mail credentials.
+      ADMISSION_POLICY: stripe
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-https://chat.example.com}"
+      STRIPE_SECRET_KEY_FILE: /run/secrets/stripe_secret_key
+      STRIPE_WEBHOOK_SECRET_FILE: /run/secrets/stripe_webhook_secret
+      RESEND_API_KEY_FILE: /run/secrets/resend_api_key
+      OTP_PEPPER_FILE: /run/secrets/otp_pepper
+      MAIL_FROM: "${MAIL_FROM:-}"
+      # From deploy/server.env (gitignored) — empty here so a clone of this
+      # repo never reports into someone else's Sentry project.
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      SENTRY_ENVIRONMENT: production
+      LOG_LEVEL: info
+      # Crash early-warning (lib/health-monitor.ts): fire below this service's
+      # 1g mem_limit so the alert beats the cgroup OOM-kill.
+      HEALTH_RSS_WARN_MB: "780"
+      HEALTH_RSS_CRIT_MB: "930"
+    secrets:
+      - database_url
+      - pg_ca_cert
+      - stripe_secret_key
+      - stripe_webhook_secret
+      - resend_api_key
+      - otp_pepper
+    volumes:
+      - runtime-secrets:/runtime-secrets:ro
+    ports:
+      - "127.0.0.1:8091:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    pids_limit: 512
+    mem_limit: 1g
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # --- Push-bridge: EMQX inbox → content-free APNs --------------------------
+  push-bridge:
+    image: ${SERVER_IMAGE:-dissqus-server:local}
+    restart: unless-stopped
+    depends_on:
+      # Both one-shots: the credentials this service reads from the tmpfs volume,
+      # and the schema it is about to query. Ordering that used to arrive
+      # transitively through the database container has to be said out loud now
+      # that there isn't one.
+      secrets-init:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      emqx:
+        condition: service_started
+    command: ["node", "--import", "tsx", "push/main.ts"]
+    env_file:
+      - server.env
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL_FILE: /run/secrets/database_url
+      PGSSLROOTCERT: /run/secrets/pg_ca_cert
+      INTERNAL_MQTT_SECRET_FILE: /runtime-secrets/internal_mqtt_secret
+      EMQX_URL: ws://emqx:8083/mqtt
+      APNS_KEY_P8_FILE: /run/secrets/apns_key_p8
+      # From deploy/server.env (gitignored) — empty here so a clone of this
+      # repo never reports into someone else's Sentry project.
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      SENTRY_ENVIRONMENT: production
+      LOG_LEVEL: info
+      # Crash early-warning (lib/health-monitor.ts): fire below this service's
+      # 512m mem_limit so the alert beats the cgroup OOM-kill.
+      HEALTH_RSS_WARN_MB: "380"
+      HEALTH_RSS_CRIT_MB: "460"
+    secrets:
+      - database_url
+      - pg_ca_cert
+      - apns_key_p8
+    volumes:
+      - runtime-secrets:/runtime-secrets:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # --- Broker watchdog: EMQX + Postgres health → Sentry ---------------------
+  # EMQX is not a Node process and reports nothing to Sentry; its Postgres (topic
+  # ACL) and auth-server links can fail silently while every app service looks
+  # healthy. This polls the broker's API and escalates transitions. It also runs
+  # the expiry sweeper — Redis expired its own keys and Postgres does not. See
+  # services/server/ops/broker-watch.ts.
+  broker-watch:
+    image: ${SERVER_IMAGE:-dissqus-server:local}
+    restart: unless-stopped
+    depends_on:
+      secrets-init:
+        condition: service_healthy
+      emqx:
+        condition: service_started
+      db-migrate:
+        condition: service_completed_successfully
+    command: ["node", "--import", "tsx", "ops/broker-watch.ts"]
+    env_file:
+      - server.env
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL_FILE: /run/secrets/database_url
+      PGSSLROOTCERT: /run/secrets/pg_ca_cert
+      EMQX_API_URL: http://emqx:18083
+      EMQX_DASHBOARD_PASSWORD_FILE: /runtime-secrets/emqx_dashboard_password
+      # From deploy/server.env (gitignored) — empty here so a clone of this
+      # repo never reports into someone else's Sentry project.
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      SENTRY_ENVIRONMENT: production
+      LOG_LEVEL: info
+      # Crash early-warning (lib/health-monitor.ts): fire below this service's
+      # 256m mem_limit so the alert beats the cgroup OOM-kill.
+      HEALTH_RSS_WARN_MB: "180"
+      HEALTH_RSS_CRIT_MB: "220"
+    secrets:
+      - database_url
+      - pg_ca_cert
+    volumes:
+      - runtime-secrets:/runtime-secrets:ro
+    # Localhost-only, like every other service port: `curl 127.0.0.1:8092/health`
+    # on the VM answers "what does the broker look like right now".
+    ports:
+      - "127.0.0.1:8092:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  # internal_mqtt_secret / emqx_dashboard_password / metrics_token are GENERATED
+  # at launch by the `secrets-init` service into the runtime-secrets tmpfs
+  # volume — they are intentionally NOT compose secrets here.
+  #
+  # The database credentials are. They belong to a managed cluster this stack
+  # does not own, so they are issued by `terraform output` in infra/database and
+  # placed on the host — see that module's README for the exact commands.
+  # `database_url` is the transaction-mode pooler (what the services use);
+  # `database_url_direct` bypasses it for migrations.
+  database_url:
+    file: ./secrets/database_url
+  database_url_direct:
+    file: ./secrets/database_url_direct
+  # The cluster CA, so every connection can be sslmode=verify-full rather than
+  # DigitalOcean's default `require` (encrypted, but the server unauthenticated).
+  pg_ca_cert:
+    file: ./secrets/pg_ca_cert
+  # EMQX's own read-only role, as shell assignments: AUTHZ_PG_{SERVER,DATABASE,
+  # USERNAME,PASSWORD}. One file because EMQX must not read these from the
+  # environment (see the emqx service above).
+  emqx_pg:
+    file: ./secrets/emqx_pg
+  # app-api holds these: it serves /stripe/webhook and /subscribe, and mails the
+  # claim codes that bind a subscription to a device key.
+  stripe_secret_key:
+    file: ./secrets/stripe_secret_key
+  stripe_webhook_secret:
+    file: ./secrets/stripe_webhook_secret
+  resend_api_key:
+    file: ./secrets/resend_api_key
+  # Pepper for stored OTP hashes — without it a database dump yields every
+  # pending claim code. `openssl rand -hex 32 > ./secrets/otp_pepper`
+  otp_pepper:
+    file: ./secrets/otp_pepper
+  apns_key_p8:
+    file: ./secrets/apns_key_p8
+  # Bearer token for /metrics (SRV-2). Only the retired /ws monolith served
+  # /metrics; nothing in this stack does, so this is currently unused.
+  # metrics_token:
+  #   file: ./secrets/metrics_token
+  # bot_seed:
+  #   file: ./secrets/bot_seed
+
+volumes:
+  bot-state:
+  emqx-data:
+  # RAM-backed, shared across services: holds the launch-generated internal
+  # secrets. Never touches the host disk; cleared when the stack is torn down.
+  runtime-secrets:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs

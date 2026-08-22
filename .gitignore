@@ -1,8 +1,42 @@
-node_modules/
-.env
-*.log
-.DS_Store
+# The same protections the monorepo has, for the paths that are published here.
+# A clone of this repo that runs generate.sh or `terraform apply` produces real
+# credentials in the working tree, and none of them should be committable.
 
-# Bot identity + per-friend key state, when running without a volume.
+.DS_Store
+node_modules/
+
+# Runtime configuration. Every service reads its secrets from these; none of
+# them belongs in git. `.env.example` is the template and is committed.
+.env
+.env.prod
+.env.local
+infra/deploy/server.env
+infra/deploy/secrets/
+infra/deploy/apple.env
+infra/deploy/preprod/server.env
+infra/deploy/preprod/secrets/
+
+# Credentials for the throwaway local postgres. Not secret — they reach a
+# container on a laptop — but a committed connection URI trips every secret
+# scanner, so they are generated:  sh infra/deploy/local-secrets/generate.sh
+infra/deploy/local-secrets/database_url
+infra/deploy/local-secrets/database_url_direct
+infra/deploy/local-secrets/pg_ca_cert
+infra/deploy/local-secrets/emqx_pg
+
+# Terraform. State holds every value the provider returned, database passwords
+# included, and tfvars holds the ones you typed — including the origin IP, which
+# behind Cloudflare is worth as much as a password.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Wrangler caches the Cloudflare account id and the owner's email.
+.wrangler/
+
+# Helper bot identity + per-friend keys.
 .bot-seed
 .bot-state.json

@@ -1,0 +1,201 @@
+name: CI
+
+# Single source of truth for "is this code good?" — server typecheck+tests, a
+# live end-to-end run, and a Terraform plan of the Cloudflare edge. Defined ONCE
+# here and reused by the release pipeline (release.yml) via `workflow_call`, so the
+# exact same jobs gate both merges and releases.
+#
+# Triggers:
+#   - pull_request  → gate every PR (path-filtered: only the areas that changed
+#                     run, so a server-only PR skips the Terraform job).
+#   - workflow_call → release.yml invokes this before building. On that
+#                     path the full suite always runs (see the `if:` below) so
+#                     nothing ships untested.
+# Deliberately NOT triggered on `push`: pushes to main/preprod are handled by
+# release.yml (which calls this), avoiding a double CI run on those branches.
+#
+# There is deliberately NO macOS job here. It ran on every push to main/preprod
+# via the workflow_call path and, at the 10x macOS billing multiplier with
+# per-job minute round-up, was 84% of the entire Actions bill. Apple builds are
+# verified locally instead — see apps/apple/verify.sh.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# One CI run per branch; a new push supersedes the old one instead of paying for
+# both. Safe to cancel: nothing here touches the outside world.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Detect which areas changed so PRs only pay for the jobs they need.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      server: ${{ steps.filter.outputs.server }}
+      edge: ${{ steps.filter.outputs.edge }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # These globs must track the real layout (services/, apps/, infra/).
+          # They previously read 'server/**' and 'apple/**' — paths that stopped
+          # existing when the repo was reorganised — so every filter evaluated
+          # false and PR CI silently ran nothing at all.
+          filters: |
+            server:
+              - 'services/server/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+            edge:
+              - 'infra/cloudflare/**'
+              - 'apps/web/src/**'
+              - '.github/workflows/ci.yml'
+
+  # ---------------------------------------------------------------------------
+  # Server: typecheck + unit tests
+  # ---------------------------------------------------------------------------
+  server:
+    needs: changes
+    # Run when server code changed on a PR, OR always when reused by release.yml
+    # (a deploy re-tests everything regardless of what the last commit touched).
+    if: needs.changes.outputs.server == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      # The unit suite skips its database-backed tests when there is nothing to
+      # connect to (test/pg-helper.ts), which is the right behaviour on a laptop
+      # and the wrong one here: without this, sessions, rate limits, admission
+      # and the whole subscription claim went UNTESTED on every run and the job
+      # still went green.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: hqcat
+          POSTGRES_PASSWORD: hqcat
+          POSTGRES_DB: hqcat
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hqcat -d hqcat" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    defaults:
+      run:
+        working-directory: services/server
+    env:
+      DATABASE_URL: postgresql://hqcat:hqcat@localhost:5432/hqcat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/server/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Migrate
+        run: npm run migrate
+      - name: Unit tests
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # End-to-end: two real protocol clients through a live server (open admission).
+  # ---------------------------------------------------------------------------
+  e2e:
+    needs: changes
+    if: needs.changes.outputs.server == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: hqcat
+          POSTGRES_PASSWORD: hqcat
+          POSTGRES_DB: hqcat
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hqcat -d hqcat" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    defaults:
+      run:
+        working-directory: services/server
+    env:
+      ADMISSION_POLICY: open
+      DATABASE_URL: postgresql://hqcat:hqcat@localhost:5432/hqcat
+      PORT: "8080"
+      TEST_WS_URL: ws://localhost:8080/ws
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/server/package-lock.json
+      - run: npm ci
+      - name: Migrate
+        run: npm run migrate
+      - name: Start server
+        # `npm run legacy:server`, not `npx tsx server.ts`: the entrypoint moved
+        # to legacy/server.ts and this step had been starting nothing at all.
+        run: |
+          npm run legacy:server > /tmp/server.log 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health >/dev/null; then echo "server up"; break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8080/info || (echo "server did not start"; cat /tmp/server.log; exit 1)
+      - name: E2E tests
+        run: npm run test:e2e
+      - name: Server logs (on failure)
+        if: failure()
+        run: cat /tmp/server.log
+
+  # ---------------------------------------------------------------------------
+  # Cloudflare edge: prove the Terraform is valid before it reaches the deploy
+  # pipeline. The matching `plan`+`apply` live in release.yml, which has the
+  # credentials, so the edge and the origin roll out together.
+  #
+  # This job is deliberately credential-free and backend-free:
+  #   - Cloudflare/R2 creds are GitHub *Environment* secrets, so reading state
+  #     would mean putting `environment: production` on a PR job. That currently
+  #     works only because production has no protection rules; the moment the
+  #     required-reviewer gate from docs/runbooks/deploy.md §7 is enabled, every
+  #     PR would block waiting for a human to approve a read-only plan.
+  #   - It also keeps fork PRs from reaching a write-scoped token.
+  # `validate` catches the class of breakage that actually bit us (a moved file
+  # making the module unloadable). For a state-aware diff, run `terraform plan`
+  # locally, or watch the plan step in the release run.
+  # ---------------------------------------------------------------------------
+  cloudflare-plan:
+    needs: changes
+    if: needs.changes.outputs.edge == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/cloudflare
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5" # >= 1.10 for native S3/R2 state locking
+      - name: Format check (advisory)
+        continue-on-error: true
+        run: terraform fmt -check -recursive
+      # No backend and no credentials: a PR from a fork must not be able to read
+      # remote state, and `validate` does not need it. The real plan against
+      # state happens in release.yml, which has the secrets.
+      - name: Init (no backend)
+        run: terraform init -input=false -backend=false
+      - name: Validate
+        run: terraform validate

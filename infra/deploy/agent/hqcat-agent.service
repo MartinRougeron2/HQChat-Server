@@ -1,0 +1,17 @@
+[Unit]
+Description=HQCAT pull-based deploy agent (watches a GHCR channel tag)
+Documentation=https://github.com/MartinRougeron2/HQChat-Server/blob/main/docs/runbooks/deploy.md
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hqcat-agent
+# A rollout can take a while on a cold pull; the agent has its own health
+# timeout and rollback, so let it finish rather than killing it mid-compose.
+TimeoutStartSec=900
+# Never leave two rollouts interleaved.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

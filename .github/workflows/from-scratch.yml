@@ -1,0 +1,812 @@
+name: From scratch
+
+# Bring a greenfield environment up from nothing: R2 buckets, droplets, the
+# GitHub environment secrets, the cache signing key, and both Terraform modules.
+# This is docs/runbooks/from-scratch.md, executed — steps 1, 3, 4, 5, 6 (key),
+# and 8, in the order that runbook establishes.
+#
+# It is idempotent. Every create is preceded by an existence check and every
+# "already exists" is a success, so a run that fails half way can simply be run
+# again. Nothing here destroys anything: this bootstraps, it does not rebuild.
+#
+# WHAT IT DELIBERATELY DOES NOT DO. Installing NixOS, the origin certificate,
+# host secrets and TOTP enrolment all need SSH, and the whole architecture rests
+# on nothing in GitHub being able to reach a host (from-scratch.md §0) — the
+# hosts pull, CI never connects. The TOTP gate in §6 would break unattended SSH
+# anyway. Those steps are emitted instead: the `handoff` job uploads a
+# `bootstrap-hosts.sh` with your real IPs and outputs already filled in.
+#
+# ON THE TOKEN INPUTS. workflow_dispatch inputs are stored in PLAINTEXT in the
+# run's event payload and are readable through the Actions API by anyone with
+# read access to this repo. The `::add-mask::` calls below keep them out of the
+# logs; they cannot keep them out of the payload. This was an accepted trade for
+# needing zero pre-setup on a repo that has no secrets yet. Mitigate it the way
+# the final summary tells you to: once bootstrap succeeds, revoke and re-mint
+# the DigitalOcean token and the GitHub PAT. The Cloudflare and R2 tokens have
+# to survive — the pipeline keeps using them — but by then they live in
+# environment secrets, and the copy in the payload is the one you rotate away.
+on:
+  workflow_dispatch:
+    inputs:
+      zone_name:
+        description: "Cloudflare zone (apex domain), e.g. example.com"
+        type: string
+        required: true
+      app_host:
+        description: "Subdomain for the production origin"
+        type: string
+        default: chat
+      preprod_host:
+        description: "Subdomain for the pre-prod origin"
+        type: string
+        default: preprod.chat
+      worker_route_host:
+        description: "Host the legal pages are served on (usually the apex)"
+        type: string
+        required: true
+      do_region:
+        description: "DigitalOcean region slug for both droplets, e.g. fra1"
+        type: string
+        required: true
+      droplet_size:
+        description: "Droplet size slug (§1 minimum is 2 GB — the stack runs EMQX and four Node services)"
+        type: string
+        default: s-1vcpu-2gb
+      admin_ssh_pubkey:
+        description: "Your SSH PUBLIC key. Uploaded to DigitalOcean and written into admin.nix by the config PR."
+        type: string
+        required: true
+      cloudflare_account_id:
+        description: "Cloudflare account id"
+        type: string
+        required: true
+      cloudflare_api_token:
+        description: "Cloudflare MANAGEMENT token (§2). Needs the §2 scopes PLUS Account → Workers R2 Storage:Edit, for bucket creation."
+        type: string
+        required: true
+      r2_state_token_id:
+        description: "R2 state token ID → R2_ACCESS_KEY_ID (not secret)"
+        type: string
+        required: true
+      r2_state_token_value:
+        description: "R2 state token VALUE → CLOUDFLARE_API_TOKEN_USER. The VALUE, not the displayed secret key: Terraform derives its S3 secret as sha256(value)."
+        type: string
+        required: true
+      r2_cache_secret_access_key:
+        description: "R2 cache token Secret Access Key (this one IS the displayed secret key)"
+        type: string
+        required: true
+      digitalocean_token:
+        description: "DigitalOcean API token (dop_v1_…)"
+        type: string
+        required: true
+      gh_admin_token:
+        description: "GitHub PAT that can write environment secrets — GITHUB_TOKEN cannot. Classic with `repo`, or fine-grained with Administration/Environments/Secrets/Variables: write."
+        type: string
+        required: true
+      apply:
+        description: "Apply Terraform. Leave false for a plan-only dry run — NOTE the buckets and droplets are created either way, because neither plan can be produced without them."
+        type: boolean
+        default: false
+      include_database:
+        description: "Also run infra/database (§8). The cluster takes ~10 minutes to provision."
+        type: boolean
+        default: true
+      open_config_pr:
+        description: "Open a PR filling in cachePublicKey and admin.nix sshKeys"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# One bootstrap at a time, and never cancel one in flight: these steps create
+# real cloud resources, and a half-created droplet is worse than a queue.
+concurrency:
+  group: from-scratch
+  cancel-in-progress: false
+
+env:
+  STATE_BUCKET: your-tfstate-bucket
+  CACHE_BUCKET: dissqus-nix-cache
+  PROD_DROPLET: dissqus-prod
+  PREPROD_DROPLET: dissqus-preprod
+  CACHE_KEY_NAME: hqcat-cache-1
+  DO_IMAGE: ubuntu-24-04-x64
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fail here or nowhere. Every credential is proved, with the scope it needs
+  # named in the failure, BEFORE anything is created — because the expensive
+  # failure mode is not a bad token, it is a bad token discovered at §5 with
+  # half an environment already standing.
+  # ---------------------------------------------------------------------------
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      zone_id: ${{ steps.zone.outputs.id }}
+      r2_endpoint: ${{ steps.endpoint.outputs.url }}
+      app_fqdn: ${{ steps.zone.outputs.app_fqdn }}
+      cache_fqdn: ${{ steps.zone.outputs.cache_fqdn }}
+    steps:
+      - name: Mask the tokens
+        run: |
+          for t in '${{ inputs.cloudflare_api_token }}' \
+                   '${{ inputs.r2_state_token_value }}' \
+                   '${{ inputs.r2_cache_secret_access_key }}' \
+                   '${{ inputs.digitalocean_token }}' \
+                   '${{ inputs.gh_admin_token }}'; do
+            echo "::add-mask::$t"
+          done
+
+      - name: Cloudflare token
+        env:
+          CF_TOKEN: ${{ inputs.cloudflare_api_token }}
+        run: |
+          set -euo pipefail
+          resp="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            https://api.cloudflare.com/client/v4/user/tokens/verify)"
+          if [ "$(echo "$resp" | jq -r .success)" != "true" ]; then
+            echo "::error::Cloudflare token rejected: $(echo "$resp" | jq -c '.errors')"
+            echo "Mint it at dash.cloudflare.com/profile/api-tokens — scopes are listed in from-scratch.md §2."
+            exit 1
+          fi
+          echo "Cloudflare token OK ($(echo "$resp" | jq -r .result.status))"
+
+      - name: Cloudflare zone
+        id: zone
+        env:
+          CF_TOKEN: ${{ inputs.cloudflare_api_token }}
+        run: |
+          set -euo pipefail
+          resp="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=${{ inputs.zone_name }}")"
+          id="$(echo "$resp" | jq -r '.result[0].id // empty')"
+          if [ -z "$id" ]; then
+            echo "::error::Zone ${{ inputs.zone_name }} not found on this token's account."
+            echo "The domain must already be on Cloudflare with its nameservers delegated (§2)."
+            echo "If the zone exists but is invisible here, the token is missing Zone → Zone:Read."
+            exit 1
+          fi
+          {
+            echo "id=$id"
+            echo "app_fqdn=${{ inputs.app_host }}.${{ inputs.zone_name }}"
+            echo "cache_fqdn=cache.${{ inputs.zone_name }}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Zone ${{ inputs.zone_name }} → $id"
+
+      - name: R2 permission on the Cloudflare token
+        env:
+          CF_TOKEN: ${{ inputs.cloudflare_api_token }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o /tmp/r2.json -w '%{http_code}' \
+            -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/${{ inputs.cloudflare_account_id }}/r2/buckets")"
+          if [ "$code" != "200" ]; then
+            echo "::error::Cannot list R2 buckets (HTTP $code). Add Account → Workers R2 Storage:Edit to the management token."
+            echo "This workflow creates the buckets §3 tells you to create by hand, so it needs that scope on top of the §2 list."
+            jq -c '.errors // .' /tmp/r2.json || true
+            exit 1
+          fi
+          echo "R2 API reachable"
+
+      - name: R2 endpoint
+        id: endpoint
+        run: echo "url=https://${{ inputs.cloudflare_account_id }}.r2.cloudflarestorage.com" >> "$GITHUB_OUTPUT"
+
+      - name: DigitalOcean token
+        env:
+          DO_TOKEN: ${{ inputs.digitalocean_token }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o /tmp/do.json -w '%{http_code}' \
+            -H "Authorization: Bearer $DO_TOKEN" https://api.digitalocean.com/v2/account)"
+          if [ "$code" != "200" ]; then
+            echo "::error::DigitalOcean token rejected (HTTP $code). It needs read+write."
+            exit 1
+          fi
+          echo "DigitalOcean account $(jq -r '.account.email' /tmp/do.json), status $(jq -r '.account.status' /tmp/do.json)"
+
+      - name: GitHub admin token
+        env:
+          GH_TOKEN: ${{ inputs.gh_admin_token }}
+        run: |
+          set -euo pipefail
+          gh api user -q .login >/dev/null || {
+            echo "::error::The GitHub PAT is not valid."; exit 1; }
+          # Reading the environments endpoint is the cheapest proxy for the
+          # admin rights the secret writes in §4 actually need.
+          if ! gh api "repos/${{ github.repository }}/environments" >/dev/null 2>&1; then
+            echo "::error::The PAT cannot read this repo's environments, so it will not be able to write environment secrets either."
+            echo "Classic PAT: needs the 'repo' scope. Fine-grained: Administration, Environments, Secrets and Variables, all write."
+            exit 1
+          fi
+          echo "GitHub PAT OK as $(gh api user -q .login)"
+
+      - name: SSH public key looks like one
+        run: |
+          set -euo pipefail
+          echo '${{ inputs.admin_ssh_pubkey }}' > /tmp/admin.pub
+          ssh-keygen -l -f /tmp/admin.pub || {
+            echo "::error::admin_ssh_pubkey is not a valid SSH public key. Paste the contents of ~/.ssh/id_ed25519.pub — the .pub half."
+            exit 1; }
+
+      - name: Plan of record
+        run: |
+          {
+            echo "### Preflight passed"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Zone | \`${{ inputs.zone_name }}\` (\`${{ steps.zone.outputs.id }}\`) |"
+            echo "| App origin | \`${{ steps.zone.outputs.app_fqdn }}\` |"
+            echo "| Cache | \`${{ steps.zone.outputs.cache_fqdn }}\` |"
+            echo "| Droplets | \`${{ env.PROD_DROPLET }}\`, \`${{ env.PREPROD_DROPLET }}\` — ${{ inputs.droplet_size }} in ${{ inputs.do_region }} |"
+            echo "| Terraform | ${{ inputs.apply && 'plan + APPLY' || 'plan only' }} |"
+            echo "| Database (§8) | ${{ inputs.include_database && 'yes' || 'skipped' }} |"
+            echo
+            if [ "${{ inputs.apply }}" != "true" ]; then
+              echo "> Dry run: Terraform will not apply. The buckets and droplets are still created —"
+              echo "> neither plan can be produced without them (the database module reads the prod"
+              echo "> droplet by name, and the DNS records need its IP)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # §3. Two buckets. The cache is public on purpose: Nix refuses any store path
+  # that is not signed by a trusted key, so a reader learns only which packages
+  # you run.
+  # ---------------------------------------------------------------------------
+  buckets:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Mask the tokens
+        run: echo "::add-mask::${{ inputs.cloudflare_api_token }}"
+
+      - name: Create the buckets
+        env:
+          CF_TOKEN: ${{ inputs.cloudflare_api_token }}
+          ACCOUNT: ${{ inputs.cloudflare_account_id }}
+        run: |
+          set -euo pipefail
+          for b in "$STATE_BUCKET" "$CACHE_BUCKET"; do
+            code="$(curl -sS -o /tmp/out.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $CF_TOKEN" -H 'Content-Type: application/json' \
+              "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/r2/buckets" \
+              --data "$(jq -nc --arg n "$b" '{name: $n}')")"
+            case "$code" in
+              200|201) echo "created  $b" ;;
+              # 10004 is "bucket already exists" — the idempotent path.
+              409)     echo "exists   $b" ;;
+              400)
+                if jq -e '.errors[]? | select(.code == 10004)' /tmp/out.json >/dev/null; then
+                  echo "exists   $b"
+                else
+                  echo "::error::Creating $b failed: $(jq -c '.errors' /tmp/out.json)"; exit 1
+                fi ;;
+              *) echo "::error::Creating $b failed (HTTP $code): $(jq -c '.errors // .' /tmp/out.json)"; exit 1 ;;
+            esac
+          done
+
+      - name: Publish the cache on its custom domain
+        env:
+          CF_TOKEN: ${{ inputs.cloudflare_api_token }}
+          ACCOUNT: ${{ inputs.cloudflare_account_id }}
+          CACHE_FQDN: ${{ needs.preflight.outputs.cache_fqdn }}
+          ZONE_ID: ${{ needs.preflight.outputs.zone_id }}
+        run: |
+          set -euo pipefail
+          # Cloudflare creates the DNS record and serves it over HTTPS. This is
+          # what the hosts' hqcat-host-agent pulls closures from.
+          code="$(curl -sS -o /tmp/dom.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $CF_TOKEN" -H 'Content-Type: application/json' \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/r2/buckets/$CACHE_BUCKET/domains/custom" \
+            --data "$(jq -nc --arg d "$CACHE_FQDN" --arg z "$ZONE_ID" \
+                       '{domain: $d, zoneId: $z, enabled: true}')")"
+          case "$code" in
+            200|201) echo "$CACHE_FQDN → $CACHE_BUCKET" ;;
+            400|409)
+              # Already attached. Confirm rather than assume.
+              if curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+                   "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/r2/buckets/$CACHE_BUCKET/domains/custom" \
+                   | jq -e --arg d "$CACHE_FQDN" '.result.domains[]? | select(.domain == $d)' >/dev/null; then
+                echo "$CACHE_FQDN already attached"
+              else
+                echo "::error::Could not attach $CACHE_FQDN: $(jq -c '.errors // .' /tmp/dom.json)"; exit 1
+              fi ;;
+            *) echo "::error::Could not attach $CACHE_FQDN (HTTP $code): $(jq -c '.errors // .' /tmp/dom.json)"; exit 1 ;;
+          esac
+
+  # ---------------------------------------------------------------------------
+  # §1. Both droplets. Ubuntu is temporary — nixos-anywhere replaces it in the
+  # handoff script. The NAMES matter: infra/database reads the prod droplet by
+  # name to learn which VPC to join and which droplet id to trust.
+  # ---------------------------------------------------------------------------
+  droplets:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      prod_ip: ${{ steps.create.outputs.prod_ip }}
+      preprod_ip: ${{ steps.create.outputs.preprod_ip }}
+    steps:
+      - name: Mask the tokens
+        run: echo "::add-mask::${{ inputs.digitalocean_token }}"
+
+      - name: Ensure the SSH key is on the account
+        id: sshkey
+        env:
+          DO_TOKEN: ${{ inputs.digitalocean_token }}
+        run: |
+          set -euo pipefail
+          echo '${{ inputs.admin_ssh_pubkey }}' > /tmp/admin.pub
+          fp="$(ssh-keygen -l -E md5 -f /tmp/admin.pub | awk '{print $2}' | sed 's/^MD5://')"
+          existing="$(curl -sS -H "Authorization: Bearer $DO_TOKEN" \
+            'https://api.digitalocean.com/v2/account/keys?per_page=200' \
+            | jq -r --arg fp "$fp" '.ssh_keys[] | select(.fingerprint == $fp) | .id' | head -1)"
+          if [ -n "$existing" ]; then
+            echo "key already on the account (id $existing)"
+          else
+            existing="$(curl -sS -X POST -H "Authorization: Bearer $DO_TOKEN" \
+              -H 'Content-Type: application/json' https://api.digitalocean.com/v2/account/keys \
+              --data "$(jq -nc --arg n 'hqcat-bootstrap' --arg k "$(cat /tmp/admin.pub)" \
+                         '{name: $n, public_key: $k}')" | jq -r '.ssh_key.id')"
+            [ -n "$existing" ] && [ "$existing" != "null" ] || { echo "::error::Could not upload the SSH key"; exit 1; }
+            echo "uploaded key (id $existing)"
+          fi
+          echo "id=$existing" >> "$GITHUB_OUTPUT"
+
+      - name: Create the droplets
+        id: create
+        env:
+          DO_TOKEN: ${{ inputs.digitalocean_token }}
+          KEY_ID: ${{ steps.sshkey.outputs.id }}
+        run: |
+          set -euo pipefail
+          ensure() {
+            local name="$1" id ip
+            id="$(curl -sS -H "Authorization: Bearer $DO_TOKEN" \
+              'https://api.digitalocean.com/v2/droplets?per_page=200' \
+              | jq -r --arg n "$name" '.droplets[] | select(.name == $n) | .id' | head -1)"
+            if [ -n "$id" ]; then
+              echo "exists   $name (id $id)" >&2
+            else
+              id="$(curl -sS -X POST -H "Authorization: Bearer $DO_TOKEN" \
+                -H 'Content-Type: application/json' https://api.digitalocean.com/v2/droplets \
+                --data "$(jq -nc \
+                    --arg n "$name" --arg r '${{ inputs.do_region }}' \
+                    --arg s '${{ inputs.droplet_size }}' --arg i "$DO_IMAGE" \
+                    --argjson k "$KEY_ID" \
+                    '{name:$n, region:$r, size:$s, image:$i, ssh_keys:[$k],
+                      ipv6:true, monitoring:true, tags:["hqcat"]}')" \
+                | jq -r '.droplet.id')"
+              [ -n "$id" ] && [ "$id" != "null" ] || { echo "::error::Creating $name failed"; exit 1; }
+              echo "created  $name (id $id)" >&2
+            fi
+            # Poll to active. A droplet without a public IPv4 yet is not usable
+            # as a Terraform origin, so wait for the address, not just the state.
+            local body status
+            for _ in $(seq 1 60); do
+              body="$(curl -sS -H "Authorization: Bearer $DO_TOKEN" \
+                "https://api.digitalocean.com/v2/droplets/$id")"
+              status="$(echo "$body" | jq -r '.droplet.status')"
+              ip="$(echo "$body" | jq -r '.droplet.networks.v4[]? | select(.type=="public") | .ip_address' | head -1)"
+              if [ "$status" = active ] && [ -n "$ip" ]; then break; fi
+              sleep 10
+            done
+            [ -n "${ip:-}" ] || { echo "::error::$name never came up with a public IPv4"; exit 1; }
+            echo "$ip"
+          }
+          prod_ip="$(ensure "$PROD_DROPLET")"
+          preprod_ip="$(ensure "$PREPROD_DROPLET")"
+          {
+            echo "prod_ip=$prod_ip"
+            echo "preprod_ip=$preprod_ip"
+          } >> "$GITHUB_OUTPUT"
+          echo "prod $prod_ip / preprod $preprod_ip"
+
+      - name: Reachability
+        run: |
+          set -euo pipefail
+          # §1 ends on `ssh root@<ip> 'echo reachable'`. We have no private key
+          # here, so prove the port answers instead — the same failure surfaces.
+          for ip in '${{ steps.create.outputs.prod_ip }}' '${{ steps.create.outputs.preprod_ip }}'; do
+            open=false
+            for _ in $(seq 1 30); do
+              if nc -z -w3 "$ip" 22; then open=true; break; fi
+              sleep 10
+            done
+            if $open; then
+              echo "$ip:22 open"
+            else
+              echo "::warning::$ip is not answering on 22 yet. The droplet exists; give it a minute and check the DigitalOcean console before running bootstrap-hosts.sh."
+            fi
+          done
+
+  # ---------------------------------------------------------------------------
+  # §4 + §6 (key half). Environments, secrets, variables, and the cache signing
+  # key. The private half of that key exists only as a GitHub secret and is
+  # never printed; the public half is committed by the config PR below.
+  # ---------------------------------------------------------------------------
+  github-config:
+    needs: [preflight, buckets, droplets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      cache_public_key: ${{ steps.signing.outputs.public }}
+    steps:
+      - name: Mask the tokens
+        run: |
+          for t in '${{ inputs.cloudflare_api_token }}' \
+                   '${{ inputs.r2_state_token_value }}' \
+                   '${{ inputs.r2_cache_secret_access_key }}' \
+                   '${{ inputs.gh_admin_token }}'; do
+            echo "::add-mask::$t"
+          done
+
+      - uses: actions/checkout@v4
+
+      - name: Create the environments
+        env:
+          GH_TOKEN: ${{ inputs.gh_admin_token }}
+        run: |
+          set -euo pipefail
+          for e in production preprod; do
+            gh api -X PUT "repos/${{ github.repository }}/environments/$e" >/dev/null
+            echo "environment $e"
+          done
+
+      # Reuse the script that already knows this secret set rather than growing
+      # a second, drifting copy of it here. Its need() helper only prompts when
+      # a variable is unset, so with everything exported it runs unattended.
+      - name: Set the Cloudflare/R2 secrets and variables
+        env:
+          GH_TOKEN: ${{ inputs.gh_admin_token }}
+          CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare_api_token }}
+          CLOUDFLARE_API_TOKEN_USER: ${{ inputs.r2_state_token_value }}
+          R2_ACCESS_KEY_ID: ${{ inputs.r2_state_token_id }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+          ORIGIN_IPV4: ${{ needs.droplets.outputs.prod_ip }}
+          PREPROD_ORIGIN_IPV4: ${{ needs.droplets.outputs.preprod_ip }}
+        run: infra/deploy/scripts/set-ci-secrets.sh production
+
+      - name: Set the secrets and variables that script does not cover
+        env:
+          GH_TOKEN: ${{ inputs.gh_admin_token }}
+          R2_ENDPOINT: ${{ needs.preflight.outputs.r2_endpoint }}
+        run: |
+          set -euo pipefail
+          printf '%s' '${{ inputs.r2_cache_secret_access_key }}' \
+            | gh secret set R2_CACHE_SECRET_ACCESS_KEY --env production
+          gh variable set R2_ENDPOINT      --env production --body "$R2_ENDPOINT"
+          gh variable set NIX_CACHE_BUCKET --env production --body "$CACHE_BUCKET"
+          echo "R2_CACHE_SECRET_ACCESS_KEY, R2_ENDPOINT, NIX_CACHE_BUCKET"
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Regenerating this key on a re-run would orphan every host that already
+      # trusts the old one, so it is generated exactly once. On a re-run the
+      # committed public half is authoritative.
+      - name: Cache signing key
+        id: signing
+        env:
+          GH_TOKEN: ${{ inputs.gh_admin_token }}
+        run: |
+          set -euo pipefail
+          if gh secret list --env production --json name -q '.[].name' \
+               | grep -qx NIX_CACHE_SIGNING_KEY; then
+            pub="$(sed -n "s/^[[:space:]]*default = \"\($CACHE_KEY_NAME:[^\"]*\)\";.*/\\1/p" \
+                   infra/nixos/modules/options.nix | head -1)"
+            if [ -z "$pub" ]; then
+              echo "::warning::NIX_CACHE_SIGNING_KEY already exists but no public half is committed."
+              echo "Nothing here can recover it — the private half is write-only. If the hosts cannot"
+              echo "verify the cache, delete that secret and re-run to mint a fresh pair."
+            fi
+            echo "signing key already set — kept"
+          else
+            umask 077
+            nix key generate-secret --key-name "$CACHE_KEY_NAME" > /tmp/cache-key.sec
+            pub="$(nix key convert-secret-to-public < /tmp/cache-key.sec)"
+            gh secret set NIX_CACHE_SIGNING_KEY --env production < /tmp/cache-key.sec
+            rm -f /tmp/cache-key.sec
+            echo "signing key generated and stored"
+          fi
+          echo "public=$pub" >> "$GITHUB_OUTPUT"
+          echo "public half: $pub"
+
+  # ---------------------------------------------------------------------------
+  # §6. Both of these deliberately fail evaluation while unset, so the Host
+  # workflow cannot publish a closure until they are filled in. A PR, never a
+  # push to main — this edits what can log into your machines.
+  # ---------------------------------------------------------------------------
+  config-pr:
+    needs: github-config
+    if: inputs.open_config_pr
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Mask the tokens
+        run: echo "::add-mask::${{ inputs.gh_admin_token }}"
+
+      # Checkout with the PAT so the branch push below is authenticated as it —
+      # the job's own GITHUB_TOKEN is contents:read and cannot push.
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ inputs.gh_admin_token }}
+
+      - name: Fill in the cache key and the admin key
+        id: edit
+        env:
+          PUBKEY: ${{ needs.github-config.outputs.cache_public_key }}
+        run: |
+          set -euo pipefail
+          [ -n "$PUBKEY" ] || { echo "::error::No cache public key to commit"; exit 1; }
+
+          python3 - "$PUBKEY" '${{ inputs.admin_ssh_pubkey }}' <<'PY'
+          import re, sys
+          pubkey, sshkey = sys.argv[1], sys.argv[2].strip()
+
+          p = "infra/nixos/modules/options.nix"
+          s = open(p).read()
+          if "REPLACE_ME_WITH_CACHE_PUBLIC_KEY" in s:
+              s = s.replace('"REPLACE_ME_WITH_CACHE_PUBLIC_KEY"', f'"{pubkey}"')
+              open(p, "w").write(s)
+              print("options.nix: cachePublicKey set")
+          else:
+              print("options.nix: already set, left alone")
+
+          p = "infra/nixos/admin.nix"
+          s = open(p).read()
+          if sshkey in s:
+              print("admin.nix: key already present, left alone")
+          else:
+              # Insert after the comment block inside sshKeys, so the note about
+              # why the list must not be empty stays above the entries.
+              s2 = re.sub(r"(sshKeys = \[\n(?:[ \t]*#[^\n]*\n)*)",
+                          rf'\1      "{sshkey}"\n', s, count=1)
+              if s2 == s:
+                  raise SystemExit("could not find the sshKeys list in admin.nix")
+              open(p, "w").write(s2)
+              print("admin.nix: admin key added")
+          PY
+
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open the PR
+        if: steps.edit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ inputs.gh_admin_token }}
+        run: |
+          set -euo pipefail
+          branch="bootstrap/host-config-${{ github.run_id }}"
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          git commit -am 'infra: fill in the cache public key and the admin SSH key
+
+          Written by the From scratch workflow (run ${{ github.run_id }}). Both
+          values deliberately fail evaluation while unset, so the Host workflow
+          cannot build a closure until this merges.'
+          git push origin "$branch"
+          gh pr create --fill --base "${{ github.ref_name }}" --head "$branch" \
+            --title 'infra: cache public key + admin SSH key (bootstrap)' \
+            --body 'Generated by the **From scratch** workflow.
+
+          - `infra/nixos/modules/options.nix` — `cachePublicKey`, the public half of the
+            signing key whose private half is now the `NIX_CACHE_SIGNING_KEY` secret.
+          - `infra/nixos/admin.nix` — the admin SSH key. This is who can log into the hosts.
+
+          Merge this before installing NixOS: the Host workflow cannot publish a closure
+          while either is unset, and a host built with no key has no way in at all.'
+
+  # ---------------------------------------------------------------------------
+  # §5 and §8. Credential handling is lifted from the `cloudflare` job in
+  # release.yml so the two cannot drift — in particular the R2 state secret,
+  # which is sha256 of the token VALUE and not the displayed secret key.
+  # ---------------------------------------------------------------------------
+  terraform:
+    needs: [preflight, buckets, droplets, github-config]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare_api_token }}
+      DIGITALOCEAN_TOKEN: ${{ inputs.digitalocean_token }}
+      TF_VAR_account_id: ${{ inputs.cloudflare_account_id }}
+      TF_VAR_zone_name: ${{ inputs.zone_name }}
+      TF_VAR_app_host: ${{ inputs.app_host }}
+      TF_VAR_preprod_host: ${{ inputs.preprod_host }}
+      TF_VAR_worker_route_host: ${{ inputs.worker_route_host }}
+      TF_VAR_origin_ipv4: ${{ needs.droplets.outputs.prod_ip }}
+      TF_VAR_preprod_origin_ipv4: ${{ needs.droplets.outputs.preprod_ip }}
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+    steps:
+      - name: Mask the tokens
+        run: |
+          for t in '${{ inputs.cloudflare_api_token }}' \
+                   '${{ inputs.r2_state_token_value }}' \
+                   '${{ inputs.digitalocean_token }}'; do
+            echo "::add-mask::$t"
+          done
+
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5" # >= 1.10 for native S3/R2 state locking
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+      # The S3 backend needs Access Key ID + Secret, not a bearer token.
+      # Cloudflare derives them: id = the token's ID, secret = SHA-256(value).
+      - name: R2 state credentials
+        run: |
+          set -euo pipefail
+          secret="$(printf '%s' '${{ inputs.r2_state_token_value }}' | sha256sum | cut -d' ' -f1)"
+          echo "::add-mask::$secret"
+          {
+            echo "AWS_ACCESS_KEY_ID=${{ inputs.r2_state_token_id }}"
+            echo "AWS_SECRET_ACCESS_KEY=$secret"
+          } >> "$GITHUB_ENV"
+
+      - name: Cloudflare — init
+        working-directory: infra/cloudflare
+        run: terraform init -input=false -backend-config=backend.hcl
+
+      # §5's documented footgun: a `chat` A record that predates Terraform makes
+      # the apply fail trying to create a duplicate. Import it instead.
+      - name: Cloudflare — adopt an existing app record
+        working-directory: infra/cloudflare
+        env:
+          ZONE_ID: ${{ needs.preflight.outputs.zone_id }}
+          APP_FQDN: ${{ needs.preflight.outputs.app_fqdn }}
+        run: |
+          set -euo pipefail
+          if terraform state list 2>/dev/null | grep -qx 'cloudflare_record.app'; then
+            echo "cloudflare_record.app already in state"
+            exit 0
+          fi
+          rec="$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$APP_FQDN&type=A" \
+            | jq -r '.result[0].id // empty')"
+          if [ -n "$rec" ]; then
+            terraform import -input=false 'cloudflare_record.app' "$ZONE_ID/$rec"
+            echo "imported $APP_FQDN ($rec)"
+          else
+            echo "no existing $APP_FQDN record — Terraform will create it"
+          fi
+
+      - name: Cloudflare — plan
+        working-directory: infra/cloudflare
+        run: terraform plan -input=false -no-color
+
+      - name: Cloudflare — apply
+        if: inputs.apply
+        working-directory: infra/cloudflare
+        run: terraform apply -input=false -auto-approve
+
+      # backend.hcl for the database module still ships a REPLACE_ME endpoint.
+      # Patch it here from the account id rather than failing on it.
+      - name: Database — init
+        if: inputs.include_database
+        working-directory: infra/database
+        run: |
+          set -euo pipefail
+          sed -i "s#https://REPLACE_ME.r2.cloudflarestorage.com#${{ needs.preflight.outputs.r2_endpoint }}#" backend.hcl
+          terraform init -input=false -backend-config=backend.hcl
+
+      - name: Database — plan
+        if: inputs.include_database
+        working-directory: infra/database
+        run: terraform plan -input=false -no-color
+
+      - name: Database — apply
+        if: inputs.include_database && inputs.apply
+        working-directory: infra/database
+        run: terraform apply -input=false -auto-approve
+
+      - name: Summary
+        run: |
+          {
+            echo "### Terraform"
+            echo
+            if [ "${{ inputs.apply }}" = "true" ]; then
+              echo "Applied \`infra/cloudflare\`${{ inputs.include_database && ' and `infra/database`' || '' }}."
+            else
+              echo "Planned only — re-run with \`apply: true\` to make it real."
+            fi
+            echo
+            echo "One thing Terraform is not allowed to do for you: set the zone's"
+            echo "**SSL/TLS → Overview → Full (strict)** in the dashboard. \`manage_zone_settings\`"
+            echo "defaults off because the zone is shared and Terraform would take ownership of"
+            echo "settings other projects rely on (§5)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Everything left needs SSH, which CI does not get. Emit it filled in.
+  # ---------------------------------------------------------------------------
+  handoff:
+    needs: [preflight, droplets, github-config, terraform]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render bootstrap-hosts.sh
+        env:
+          BS_PROD_IP: ${{ needs.droplets.outputs.prod_ip }}
+          BS_PREPROD_IP: ${{ needs.droplets.outputs.preprod_ip }}
+          BS_ZONE: ${{ inputs.zone_name }}
+          BS_APP_FQDN: ${{ needs.preflight.outputs.app_fqdn }}
+          BS_CACHE_FQDN: ${{ needs.preflight.outputs.cache_fqdn }}
+          BS_CACHE_PUBKEY: ${{ needs.github-config.outputs.cache_public_key }}
+          BS_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Restrict envsubst to OUR placeholders, so the script's own shell
+          # variables survive into the output untouched.
+          envsubst '${BS_PROD_IP} ${BS_PREPROD_IP} ${BS_ZONE} ${BS_APP_FQDN} ${BS_CACHE_FQDN} ${BS_CACHE_PUBKEY} ${BS_RUN_ID}' \
+            < infra/deploy/scripts/bootstrap-hosts.sh.tmpl > bootstrap-hosts.sh
+          chmod +x bootstrap-hosts.sh
+          bash -n bootstrap-hosts.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-hosts
+          path: bootstrap-hosts.sh
+          retention-days: 30
+
+      - name: What is left
+        run: |
+          {
+            echo "### Cloud side done — the rest needs SSH"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| prod | \`${{ needs.droplets.outputs.prod_ip }}\` |"
+            echo "| preprod | \`${{ needs.droplets.outputs.preprod_ip }}\` |"
+            echo "| cache | \`${{ needs.preflight.outputs.cache_fqdn }}\` |"
+            echo
+            echo "Download the **bootstrap-hosts** artifact from this run and run it from a"
+            echo "checkout. Your IPs and the cache key are already in it."
+            echo
+            echo '```bash'
+            echo "gh run download ${{ github.run_id }} -n bootstrap-hosts && chmod +x bootstrap-hosts.sh && ./bootstrap-hosts.sh"
+            echo '```'
+            echo
+            echo "In order, and it will walk you through each:"
+            echo
+            echo "1. **Merge the config PR** — the Host workflow cannot publish a closure until"
+            echo "   \`cachePublicKey\` and \`admin.nix\` are filled in, and \`nixos-anywhere\` has"
+            echo "   nothing to install until it has."
+            echo "2. \`nixos-anywhere\` onto **preprod first**, then prod (§6). Destructive — take a"
+            echo "   DigitalOcean snapshot first."
+            echo "3. Origin certificate (§7). Until this runs the site answers Cloudflare **526**,"
+            echo "   which is the expected state and not a fault."
+            echo "4. Database credentials onto the prod host (§8) and host secrets (§9)."
+            echo "5. TOTP enrolment (§6) — **enrol before enabling**, or you are locked out to the"
+            echo "   DigitalOcean web console."
+            echo "6. First release (§10): **Actions → Promote → Run workflow**, target \`prod\`."
+            echo
+            echo "#### Then rotate what you pasted"
+            echo
+            echo "\`workflow_dispatch\` inputs live in this run's event payload in plaintext, readable"
+            echo "by anyone with read access to the repo. The masking above covers the logs only."
+            echo "Revoke and re-mint:"
+            echo
+            echo "- the **DigitalOcean token** — nothing in the pipeline uses it after this;"
+            echo "- the **GitHub PAT** — likewise."
+            echo
+            echo "The Cloudflare and R2 tokens have to keep working, and are now environment"
+            echo "secrets. If you would rather not leave a payload copy of them either, rotate them"
+            echo "in the dashboard and re-run \`infra/deploy/scripts/set-ci-secrets.sh production\`"
+            echo "locally with the new values."
+          } >> "$GITHUB_STEP_SUMMARY"

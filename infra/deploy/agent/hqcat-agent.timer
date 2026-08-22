@@ -1,0 +1,16 @@
+[Unit]
+Description=Poll GHCR for a new HQCAT release
+Documentation=https://github.com/MartinRougeron2/HQChat-Server/blob/main/docs/runbooks/deploy.md
+
+[Timer]
+# Two minutes after boot, then every two minutes. `docker pull` on an unchanged
+# tag is a manifest check, so this is a few HTTP requests, not a download.
+OnBootSec=2min
+OnUnitActiveSec=2min
+# Spread load off exact minute boundaries.
+RandomizedDelaySec=30
+AccuracySec=15
+Unit=hqcat-agent.service
+
+[Install]
+WantedBy=timers.target

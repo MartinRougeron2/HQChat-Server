@@ -1,0 +1,70 @@
+# Local / CI overlay: run the stack against a throwaway Postgres in a container.
+#
+#   docker compose -f infra/deploy/docker-compose.yml \
+#                  -f infra/deploy/docker-compose.local.yml up -d
+#
+# Production has no database container — state lives in a DigitalOcean managed
+# cluster (infra/database), reachable only over the VPC. That is the right shape
+# for production and the wrong shape for a laptop and for CI, neither of which
+# has a VPC or a cluster. This overlay supplies one; `local-secrets/generate.sh`
+# writes the four credential files the base stack requires, so `up` works with
+# nothing provisioned:
+#
+#   sh infra/deploy/local-secrets/generate.sh
+#
+# It is deliberately the SAME file the release workflow's smoke test uses. A
+# separate CI-only compose file would be a second definition of the stack, and
+# the smoke test would stop being evidence about the stack that ships.
+#
+# NOT for production, and it cannot be mistaken for it: the credentials point at a
+# container named `postgres` on the compose network, which does not exist on a
+# host running the real stack.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hqcat
+      POSTGRES_PASSWORD: hqcat
+      POSTGRES_DB: hqcat
+    # Not published to the host by default — the services reach it on the compose
+    # network. Uncomment to point psql or a test run at it from outside.
+    # ports: ["127.0.0.1:5432:5432"]
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hqcat -d hqcat"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    init: true
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  # Wait for it, and only then migrate. In production the cluster is already
+  # there; here it is coming up alongside us.
+  db-migrate:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# Point every secret the base stack demands at a file in ./local-secrets, written
+# by generate.sh. No TLS: this container speaks plain postgres, so
+# `sslmode=disable` and an empty CA file — pg.ts falls back to an unencrypted
+# connection when the CA is empty, and config.ts only insists on verify-full when
+# NODE_ENV is production.
+secrets:
+  database_url:
+    file: ./local-secrets/database_url
+  database_url_direct:
+    file: ./local-secrets/database_url_direct
+  pg_ca_cert:
+    file: ./local-secrets/pg_ca_cert
+  emqx_pg:
+    file: ./local-secrets/emqx_pg

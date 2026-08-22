@@ -1,0 +1,177 @@
+# Pre-production override for the DissQus stack.
+#
+# Pre-prod runs on its OWN VM. It used to sit alongside production on a single
+# droplet, isolated only by a distinct Compose project name and a set of remapped
+# host ports (8183/18183/8190/8191/8192) — one bad `-p` flag away from touching
+# prod, and impossible to load-test without disturbing it. Its own host removes
+# that entirely, and with it the port remapping: pre-prod now uses the SAME ports
+# as prod, so infra/deploy/nginx.conf applies verbatim on both machines.
+#
+# What still differs from prod is only configuration:
+#   - env files under preprod/ (config + Sentry environment tag)
+#   - ADMISSION_POLICY=open (prod is `stripe`)
+#   - APNs disabled (placeholder key file)
+#
+#   # On the pre-prod VM:
+#   export SERVER_IMAGE=ghcr.io/YOUR-GITHUB-ACCOUNT/dissqus-server:preprod
+#   docker compose -p dissqus-preprod \
+#     -f infra/deploy/docker-compose.yml -f infra/deploy/docker-compose.preprod.yml up -d
+#
+#   # nginx is applied by the agent on every rollout; the DNS record is
+#   # Terraform-managed (infra/cloudflare/dns.tf, var preprod_origin_ipv4).
+#
+# The compose project name is kept so the deploy command, the runbooks and the
+# sudoers/nginx automation contract are unchanged, and so a stray `docker compose
+# down` in the wrong checkout still cannot cross stacks.
+#
+# Launch-generated internal secrets stay per-stack: pre-prod's `secrets-init`
+# fills ITS OWN `runtime-secrets` tmpfs volume, so the internal-MQTT and
+# dashboard passwords differ from prod.
+#
+# The database is NOT shared with production, and the separation is a whole
+# cluster rather than a second database on one. Pre-prod runs its own
+# `postgres:17` container, below, on this host.
+#
+# The reason is LAT-4: the load test the architecture's every capacity number
+# depends on runs HERE. On a shared cluster it would saturate the 1 vCPU and the
+# 22 connections production sits on, which makes the one experiment the design
+# needs the one experiment nobody can safely run. Separate users would have
+# stopped accidental cross-reads; they do nothing about CPU, connection
+# exhaustion, or a shared maintenance window.
+#
+# It costs nothing — production keeps the same single-node managed cluster — and
+# it buys a pre-prod that is free to be wiped, reset and hammered. What it gives
+# up is rehearsal of the managed path (TLS verify-full, the pooler, DigitalOcean's
+# maintenance behaviour); that is a connection-string difference, not a code
+# difference, and prod is where those are exercised.
+#
+# (Since Phase 4 there is no monolith here: the vhost's upstreams are emqx 8083,
+# auth 8090 and app-api 8091.)
+#
+# EVERY external secret is redirected to preprod/secrets/. That matters more than
+# it looks: while pre-prod shared the production VM it also shared the checkout,
+# so unoverridden secrets silently resolved to PRODUCTION's ./secrets/stripe_*
+# files. On its own host those do not exist, and leaving them unoverridden would
+# either fail the stack or, worse, be "fixed" by copying live Stripe keys onto a
+# pre-production box. Config lives in preprod/server.env.
+#
+# `!override` REPLACES the matching list from the base file (instead of appending).
+# Needs Docker Compose v2.24+.
+
+services:
+  # Pre-prod's whole database. Production has a managed cluster
+  # (infra/database); this is the deliberate asymmetry — see the note above.
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hqcat
+      POSTGRES_DB: hqcat
+      # Written once by set-host-secrets.sh, alongside the DATABASE_URL that
+      # embeds it. Postgres bakes the password in at initdb time, so the two must
+      # be generated together and must persist — which is why this is a host file
+      # and not a launch-generated runtime secret like the MQTT ones.
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_local_password
+    secrets:
+      - pg_local_password
+    volumes:
+      - preprod-pgdata:/var/lib/postgresql/data
+    # Not published to the host — reachable only on the compose network.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hqcat -d hqcat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    # This host also runs EMQX and five Node services on 2 GB, so the database
+    # gets a deliberate ceiling rather than whatever is left.
+    mem_limit: 512m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Wait for it before migrating. On prod the cluster is already there; here it
+  # comes up alongside the stack.
+  db-migrate:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bot:
+    env_file: !override
+      - preprod/server.env
+    environment:
+      # Tag Sentry events from this stack as "preprod" so they don't mix with prod.
+      SENTRY_ENVIRONMENT: preprod
+
+  auth:
+    env_file: !override
+      - preprod/server.env
+    environment:
+      SENTRY_ENVIRONMENT: preprod
+
+  app-api:
+    env_file: !override
+      - preprod/server.env
+    environment:
+      ADMISSION_POLICY: open
+      SENTRY_ENVIRONMENT: preprod
+
+  push-bridge:
+    env_file: !override
+      - preprod/server.env
+    environment:
+      SENTRY_ENVIRONMENT: preprod
+      EMQX_URL: ws://emqx:8083/mqtt
+
+  broker-watch:
+    env_file: !override
+      - preprod/server.env
+    environment:
+      SENTRY_ENVIRONMENT: preprod
+      EMQX_API_URL: http://emqx:18083
+
+secrets:
+  # Only external secrets remain; the internal ones are generated per-stack.
+  # All of these are redirected away from prod's ./secrets/ — see the note above.
+  # These point at the postgres container above. Nothing on this host holds a
+  # credential that reaches the production cluster — its firewall does not name
+  # this droplet at all.
+  # All four point at the postgres container above, and are written together by
+  # `set-host-secrets.sh preprod` because they have to agree on one password.
+  database_url:
+    file: ./preprod/secrets/database_url
+  database_url_direct:
+    file: ./preprod/secrets/database_url_direct
+  # Empty on this stack: the local container speaks plain postgres, so there is
+  # no certificate to verify. pg.ts falls back to an unencrypted connection when
+  # the CA file is empty.
+  pg_ca_cert:
+    file: ./preprod/secrets/pg_ca_cert
+  emqx_pg:
+    file: ./preprod/secrets/emqx_pg
+  pg_local_password:
+    file: ./preprod/secrets/pg_local_password
+  stripe_secret_key:
+    file: ./preprod/secrets/stripe_secret_key
+  stripe_webhook_secret:
+    file: ./preprod/secrets/stripe_webhook_secret
+  resend_api_key:
+    file: ./preprod/secrets/resend_api_key
+  otp_pepper:
+    file: ./preprod/secrets/otp_pepper
+  apns_key_p8:
+    file: ./preprod/secrets/apns_key_p8
+
+volumes:
+  # Pre-prod's database lives on this host. Losing it costs a `npm run migrate`
+  # and some test accounts, which is the point of pre-prod.
+  preprod-pgdata:

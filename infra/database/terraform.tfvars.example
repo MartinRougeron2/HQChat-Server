@@ -1,0 +1,25 @@
+# Copy to terraform.tfvars and adjust. The DO token comes from the environment
+# (DIGITALOCEAN_TOKEN) — do NOT put it here.
+
+# The droplet already exists; this module only reads it. Name as it appears in
+# the DO control panel. Pre-prod is not here — it runs its own postgres container.
+prod_droplet_name = "dissqus-prod"
+
+cluster_name = "hqcat-pg"
+pg_version   = "17"
+cluster_size = "db-s-1vcpu-1gb"
+
+# 1 = no standby. Maintenance and node failure are a full restart of production.
+# Raise to 2 for a standby + automatic failover; it is an in-place change, the
+# cluster is not recreated.
+node_count = 1
+
+# With node_count = 1 this window IS your outage window. Pick the quiet hour.
+maintenance_window = {
+  day  = "sunday"
+  hour = "03:00:00"
+}
+
+# 22 backend connections on this size, all of them production's. 15 for the pool
+# + 2 for EMQX (direct) = 17, leaving 5 for migrations and ops.
+pool_size = 15

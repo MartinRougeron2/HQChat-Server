@@ -1,0 +1,37 @@
+#cloud-config
+# Bootstrap sketch for a PoP droplet. Installs Docker + WireGuard, then hands
+# off to a deploy step (SSH/CD) that materializes secrets and runs the compose
+# stack. Key material and compose env are delivered OUT OF BAND — never baked
+# into user_data (it is world-readable in the DO metadata service) or TF state.
+#
+# Template vars: pop_name=${pop_name} is_home=${is_home} wg_port=${wg_port}
+#                all_pops=${jsonencode(all_pops)}
+
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-plugin
+  - wireguard
+  - ufw
+
+write_files:
+  - path: /etc/dissqus/pop.env
+    permissions: "0644"
+    content: |
+      POP_NAME=${pop_name}
+      IS_HOME=${is_home}
+      WG_PORT=${wg_port}
+      # Peers to build the backbone mesh against (public IPs injected by the
+      # deploy step, which reads the TF `pop_public_ips` output).
+      PEERS=${join(",", all_pops)}
+
+runcmd:
+  - systemctl enable --now docker
+  # WireGuard backbone: the deploy step drops /etc/wireguard/wg0.conf with this
+  # droplet's private key + each peer's public key/endpoint, then `wg-quick up`.
+  # (Keys generated per-droplet at deploy time; never in TF.)
+  - [ sh, -c, "test -f /etc/wireguard/wg0.conf && wg-quick up wg0 || true" ]
+  # The PoP stack (EMQX + LiveKit + coturn + keys read-replica) comes up from a
+  # compose file placed by the deploy step:
+  #   docker compose -f /opt/dissqus/docker-compose.pop.yml up -d
+  - [ sh, -c, "echo 'PoP ${pop_name} bootstrapped; awaiting deploy step for secrets + compose.'" ]

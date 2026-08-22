@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+#
+# hqcat-agent — pull-based deploy. Runs on the VM as root from a systemd timer.
+#
+# GitHub does not touch this machine. There is no deploy SSH key in GitHub, no
+# inbound SSH needed for a release, and no git checkout on the host: the agent
+# watches ONE channel tag in GHCR, and when its digest moves it pulls the image,
+# extracts the deploy bundle baked into it, and rolls the stack over.
+#
+#   ghcr.io/<owner>/dissqus-server:prod  ──digest changed──▶  pull ▶ extract
+#     ▶ compose up -d ▶ nginx ▶ health check ▶ (roll back if unhealthy)
+#
+# Releasing is therefore "move the channel tag", which the Promote workflow
+# does. Rolling back is moving it to an older digest — or automatic, below.
+#
+# Config: /etc/hqcat/agent.env (root, 0600). Secrets and non-secret config live
+# on THIS host under /etc/hqcat/<stack>/, never in GitHub — they no longer make
+# a round trip through a CI runner.
+set -euo pipefail
+
+CONF=/etc/hqcat/agent.env
+[[ -r "$CONF" ]] || { echo "missing $CONF (run install-agent.sh)" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONF"
+
+: "${STACK:?STACK unset in $CONF (prod|preprod)}"
+: "${IMAGE:?IMAGE unset in $CONF}"
+: "${CHANNEL:=$STACK}"
+BOT_IMAGE_REPO="${BOT_IMAGE_REPO:-${IMAGE}-bot}"
+STATE_DIR="/var/lib/hqcat/$STACK"
+STACK_DIR="/opt/hqcat/$STACK"
+ETC_DIR="/etc/hqcat/$STACK"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"
+
+mkdir -p "$STATE_DIR" "$STACK_DIR"
+
+log() { echo "[hqcat-agent/$STACK] $*"; }
+die() { echo "[hqcat-agent/$STACK] ERROR: $*" >&2; exit 1; }
+
+# Compose invocation for this stack. Pre-prod keeps its own project name so a
+# stray `down` can never cross stacks, and adds the pre-prod overlay.
+compose() {
+  if [[ "$STACK" == preprod ]]; then
+    docker compose -p dissqus-preprod \
+      -f "$STACK_DIR/docker-compose.yml" \
+      -f "$STACK_DIR/docker-compose.preprod.yml" "$@"
+  else
+    docker compose -f "$STACK_DIR/docker-compose.yml" "$@"
+  fi
+}
+
+# --- 1. Registry auth (read-only) -------------------------------------------
+# A read:packages token scoped to pulling. This is the ONLY credential the agent
+# needs, it lives on this host, and it cannot push or reach the repository.
+if [[ -n "${GHCR_TOKEN:-}" ]]; then
+  printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${GHCR_USER:-x}" --password-stdin >/dev/null
+fi
+
+# --- 2. Has the channel moved? ----------------------------------------------
+# `docker pull` on an unchanged tag is a manifest check, not a download, so
+# polling this frequently is cheap.
+log "checking ${IMAGE}:${CHANNEL}"
+docker pull -q "${IMAGE}:${CHANNEL}" >/dev/null || die "cannot pull ${IMAGE}:${CHANNEL}"
+digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${CHANNEL}")"
+
+current=""; current_bot=""
+[[ -f "$STATE_DIR/current" ]]     && current="$(cat "$STATE_DIR/current")"
+[[ -f "$STATE_DIR/current-bot" ]] && current_bot="$(cat "$STATE_DIR/current-bot")"
+if [[ "$digest" == "$current" ]]; then
+  log "up to date ($digest)"
+  exit 0
+fi
+log "new release: $digest (was: ${current:-none})"
+
+docker pull -q "${BOT_IMAGE_REPO}:${CHANNEL}" >/dev/null || die "cannot pull ${BOT_IMAGE_REPO}:${CHANNEL}"
+bot_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${BOT_IMAGE_REPO}:${CHANNEL}")"
+
+# --- 3. Extract the deploy bundle from the image ----------------------------
+# `docker create` does not run the image; this only reads its filesystem.
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+cid="$(docker create "$digest")"
+docker cp "$cid:/deploy-bundle/." "$stage/" || { docker rm -f "$cid" >/dev/null; die "image has no /deploy-bundle"; }
+docker rm -f "$cid" >/dev/null
+
+[[ -f "$stage/docker-compose.yml" ]] || die "bundle is missing docker-compose.yml"
+
+# Replace the stack directory atomically-ish, keeping the previous one so a
+# failed rollout can be reverted without another registry round trip.
+rm -rf "$STACK_DIR.prev"
+[[ -d "$STACK_DIR" ]] && cp -a "$STACK_DIR" "$STACK_DIR.prev"
+rm -rf "${STACK_DIR:?}/"*
+cp -a "$stage/." "$STACK_DIR/"
+
+# Host-owned config and secrets are symlinked in, never copied out of the image
+# and never fetched from GitHub. Compose reads ./secrets/* and ./server.env
+# relative to the compose file, so these two links are the whole contract.
+mkdir -p "$ETC_DIR/secrets"
+chmod 700 "$ETC_DIR" "$ETC_DIR/secrets"
+ln -sfn "$ETC_DIR/secrets" "$STACK_DIR/secrets"
+[[ -f "$ETC_DIR/server.env" ]] || printf '# non-secret config for the %s stack\n' "$STACK" > "$ETC_DIR/server.env"
+ln -sfn "$ETC_DIR/server.env" "$STACK_DIR/server.env"
+# The pre-prod overlay resolves preprod/{server.env,secrets} relative to itself.
+if [[ "$STACK" == preprod ]]; then
+  mkdir -p "$STACK_DIR/preprod"
+  ln -sfn "$ETC_DIR/secrets" "$STACK_DIR/preprod/secrets"
+  ln -sfn "$ETC_DIR/server.env" "$STACK_DIR/preprod/server.env"
+fi
+
+# --- 4. Roll the stack over --------------------------------------------------
+export SERVER_IMAGE="$digest" BOT_IMAGE="$bot_digest"
+log "compose up (server=$digest bot=$bot_digest)"
+compose config -q || die "rendered compose file is invalid"
+compose up -d --no-build
+
+# --- 5. Host nginx ------------------------------------------------------------
+# The agent already runs as root, so there is no sudoers wrapper in this path;
+# the config comes from the bundle we just extracted from an immutable digest.
+if [[ -n "${DOMAIN:-}" ]]; then
+  "$STACK_DIR/scripts/hqcat-apply-nginx" "$STACK" \
+    || log "⚠️ nginx apply failed (containers are up; fix and re-run)"
+fi
+
+# --- 6. Health gate + automatic rollback -------------------------------------
+healthy() {
+  local ok=1
+  for port in 8090 8091; do
+    curl -fsS --max-time 5 "http://127.0.0.1:$port/health" >/dev/null || ok=0
+  done
+  [[ $ok -eq 1 ]]
+}
+
+deadline=$(( SECONDS + HEALTH_TIMEOUT ))
+until healthy; do
+  if (( SECONDS >= deadline )); then
+    log "unhealthy after ${HEALTH_TIMEOUT}s"
+    if [[ -n "$current" && -n "$current_bot" && -d "$STACK_DIR.prev" ]]; then
+      log "rolling back to $current"
+      rm -rf "${STACK_DIR:?}/"*
+      cp -a "$STACK_DIR.prev/." "$STACK_DIR/"
+      # Both digests come from the state file. Deriving the bot ref from the
+      # server digest would strip the digest and silently resolve to :latest.
+      SERVER_IMAGE="$current" BOT_IMAGE="$current_bot" compose up -d --no-build || true
+      die "rollout failed; rolled back to $current"
+    fi
+    die "rollout failed and there is no previous release to roll back to"
+  fi
+  sleep 3
+done
+
+# --- 7. Commit ----------------------------------------------------------------
+printf '%s' "$digest"     > "$STATE_DIR/current"
+printf '%s' "$bot_digest" > "$STATE_DIR/current-bot"
+printf '%s %s %s\n' "$(date -Is)" "$digest" "$bot_digest" >> "$STATE_DIR/history"
+docker image prune -f >/dev/null
+log "✅ deployed $digest"

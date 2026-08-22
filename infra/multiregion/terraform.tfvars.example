@@ -1,0 +1,26 @@
+# Copy to terraform.tfvars and fill in. Tokens come from the environment
+# (DIGITALOCEAN_TOKEN, CLOUDFLARE_API_TOKEN) — do NOT put them here.
+
+zone_name = "example.com"
+app_host  = "chat"
+
+# SSH keys must already exist in DigitalOcean (Settings → Security). Paste their
+# fingerprints (Terraform injects them into every droplet).
+ssh_key_fingerprints = ["aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"]
+
+# Only this CIDR may SSH to the droplets.
+admin_cidr = "203.0.113.7/32"
+
+# STARTER: London only. Uncomment nyc + sgp to grow into the target 3-region set.
+# (DO has no "eastus" slug — its US-East DC is NYC, so US-East => nyc3.)
+pops = {
+  lon = { do_region = "lon1", is_home = true } # London — Europe + Postgres writer
+  # nyc = { do_region = "nyc3" }                # US East
+  # sgp = { do_region = "sgp1" }                # Singapore — APAC/AU/NZ
+}
+
+droplet_size = "s-2vcpu-2gb" # ~$18/mo; co-locates broker+SFU+turn+keys for an MVP
+
+# Cost-gated — leave off for the cheapest first apply, flip on when ready.
+enable_load_balancer    = false # CF geo-steering add-on (~$5/mo)
+enable_managed_postgres = false # DO Managed PG (~$15/mo); else self-host on home droplet
