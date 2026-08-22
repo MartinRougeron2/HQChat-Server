@@ -20,7 +20,7 @@ One image, several entrypoints. All of them run on one VM today.
 | **app-api** | `api/main.ts` | directory, friend graph (which writes the broker's topic ACL), push tokens, account deletion, payments |
 | **push-bridge** | `push/main.ts` | subscribes to every conversation, sends a content-free APNs wake to offline members |
 | **broker-watch** | `ops/broker-watch.ts` | polls EMQX and database health, escalates transitions to Sentry; runs the expiry sweeper |
-| **helper bot** | `bot/bot.ts` | the account every new user starts with — an ordinary MQTT client, no special privileges |
+| **helper bot** | `bot/bot.ts` | the account every new user starts with, and the onboarding: it greets each one once, on an encrypted channel like any other. An ordinary MQTT client, no special privileges — see [bot/README.md](bot/README.md) |
 
 Plus **EMQX** (messaging, per-topic ACL, offline sessions), which is a pulled
 image, and **Postgres** (tokens, ACL, friend graph, directory, sessions, rate

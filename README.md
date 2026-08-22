@@ -78,6 +78,12 @@ undo:
 - **Postgres holds tokens, the topic ACL and the friend graph — never
   plaintext.** The per-topic ACL is the only barrier between a stranger and a
   conversation, and topic names are derivable from two public keys.
+- **Run the helper bot.** It comes up with the rest of the stack and needs no
+  setup, and it is the only thing in the product that tells a new user what to
+  do. A fresh account has an empty friend list and an empty screen; `@helper`
+  introduces itself once, says that the conversation is end-to-end encrypted,
+  and gives them something to type at. Leave it out and the app works and looks
+  broken. See [`services/server/bot/`](services/server/bot/README.md).
 
 Every value that names a deployment is a placeholder here: `example.com`,
 `YOUR-GITHUB-ACCOUNT`, `<your-origin-ipv4>`. Grep for them — the list of things
