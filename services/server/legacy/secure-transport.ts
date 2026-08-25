@@ -32,8 +32,13 @@ export function aesEncrypt(plaintext: string, key: Buffer): string {
 
 export function aesDecrypt(b64: string, key: Buffer): string {
   const d = Buffer.from(b64, "base64");
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, d.subarray(0, 12));
-  decipher.setAuthTag(d.subarray(12, 28));
+  // 16-byte tag, stated and checked — see bot/crypto.ts for why both.
+  const tag = d.subarray(12, 28);
+  if (tag.length !== 16) throw new Error("truncated GCM tag");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, d.subarray(0, 12), {
+    authTagLength: 16,
+  });
+  decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(d.subarray(28)), decipher.final()]).toString("utf8");
 }
 

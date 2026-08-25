@@ -64,7 +64,18 @@ in
   # The TOTP prompt itself. `google-authenticator` must have been run for root
   # BEFORE this is enabled, or SSH becomes impossible — see the option's docs.
   security.pam.services.sshd.googleAuthenticator.enable = lib.mkIf cfg.admin.totp true;
-  environment.systemPackages = lib.mkIf cfg.admin.totp [ pkgs.google-authenticator ];
+
+  # The TOOL is installed unconditionally; only the PAM module above is gated on
+  # the flag. Gating both created a deadlock with the enrolment order this very
+  # file insists on: enrol first, prove a second session works, then enable --
+  # because enabling before enrolling locks SSH. With the package behind the
+  # same flag, `google-authenticator` did not exist until the switch that locks
+  # you out had already been thrown.
+  #
+  # A secret generator sitting unused on disk grants nothing: without
+  # `admin.totp` PAM never consults ~/.google_authenticator, and sshd does not
+  # offer keyboard-interactive at all.
+  environment.systemPackages = [ pkgs.google-authenticator ];
 
   assertions = [
     {

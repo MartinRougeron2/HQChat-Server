@@ -35,6 +35,13 @@ jobs:
   # Re-test the merged commit before we build or ship anything. Reusing ci.yml
   # means the deploy gate is byte-identical to the PR gate — no drift.
   ci:
+    # A called workflow cannot hold a permission its caller lacks, and ci.yml
+    # needs `pull-requests: read` for its path filter. Without this line the
+    # whole release run is rejected before any job starts — `startup_failure`,
+    # with nothing in the log to say why.
+    permissions:
+      contents: read
+      pull-requests: read
     uses: ./.github/workflows/ci.yml
 
   # ---------------------------------------------------------------------------
@@ -121,7 +128,36 @@ jobs:
           printf '%s' 'ci-apns-key-p8'   > infra/deploy/secrets/apns_key_p8
           printf '%s' 'ci-resend-key'    > infra/deploy/secrets/resend_api_key
           printf '%s' 'ci-otp-pepper'    > infra/deploy/secrets/otp_pepper
-          printf 'ADMISSION_POLICY=open\nSERVER_NAME=CI\nAPNS_KEY_ID=ci\nAPNS_TEAM_ID=ci\n' > infra/deploy/server.env
+          # app-api mounts both of these unconditionally (docker-compose.yml
+          # owns /stripe/webhook and /subscribe), so compose refuses to create
+          # the container without the files -- `bind source path does not
+          # exist`. It never mattered while the release could not reach this
+          # step. The values are never used: ADMISSION_POLICY is `open` here.
+          printf '%s' 'sk_test_ci'       > infra/deploy/secrets/stripe_secret_key
+          printf '%s' 'whsec_ci'         > infra/deploy/secrets/stripe_webhook_secret
+          # server.env cannot set ADMISSION_POLICY or MAIL_FROM: compose's
+          # `environment:` wins over `env_file:`, and both services pin
+          # ADMISSION_POLICY to `stripe` there. Writing `open` here looked like
+          # it disabled the paid door and did nothing at all -- auth then
+          # refused to boot on the MAIL_FROM that stripe mode requires. Testing
+          # them in stripe mode is the right thing anyway: it is the mode they
+          # run in, so it is the mode worth proving boots.
+          #
+          # APNS_KEY_ID/APNS_TEAM_ID used to be here and were actively harmful:
+          # neither auth nor app-api is mounted the APNS_KEY_P8 secret (only
+          # `push` is), so two thirds of a config tripped the all-or-nothing
+          # check and both services exited. APNs is absent here, which is a
+          # state config.ts considers correct.
+          # MAIL_FROM belongs in server.env now: the compose file no longer
+          # declares it under `environment:`, so `env_file` is what supplies it
+          # -- the same path a real host uses.
+          # PUBLIC_BASE_URL too: the compose file no longer carries a default
+          # for it, because a default pinned one deployment's hostname into a
+          # file every deployment shares -- and silently won whenever a host set
+          # its own. app-api requires it under ADMISSION_POLICY=stripe, so a
+          # smoke test without it proves nothing about a host that has one.
+          printf 'SERVER_NAME=CI\nMAIL_FROM=ci@example.invalid\nPUBLIC_BASE_URL=https://ci.example.invalid\n' \
+            > infra/deploy/server.env
 
           # Production reaches a managed cluster over a VPC, which a runner does
           # not have. The local overlay adds a throwaway postgres container and
@@ -140,7 +176,13 @@ jobs:
           docker compose $COMPOSE config -q
           # db-migrate is a dependency of both, so this also proves the schema
           # applies cleanly from empty — the step a bad migration fails at.
-          docker compose $COMPOSE up -d --no-build auth app-api
+          # `up` failing prints only `service "x" didn't complete successfully:
+          # exit 1` — the container's own output goes nowhere. db-migrate runs
+          # to completion as a dependency here, so its logs are the only place
+          # a bad migration or a refused connection is visible.
+          docker compose $COMPOSE up -d --no-build auth app-api \
+            || (echo "--- compose failed to start; logs follow ---"; \
+                docker compose $COMPOSE logs; exit 1)
           for svc in "8090:/health" "8091:/health"; do
             port="${svc%%:*}"; path="${svc##*:}"
             for i in $(seq 1 30); do
@@ -219,6 +261,16 @@ jobs:
       TF_VAR_origin_ipv4: ${{ secrets.ORIGIN_IPV4 }}
       TF_VAR_preprod_origin_ipv4: ${{ secrets.PREPROD_ORIGIN_IPV4 }}
       TF_VAR_alert_email: ${{ vars.CLOUDFLARE_ALERT_EMAIL }}
+      # Which zone and which names. These were never passed here, so every
+      # release planned against the module's defaults -- `chat.example.com` --
+      # and died at `no zone found`. The bootstrap workflow has always passed
+      # them, which is why the greenfield apply worked and the pipeline that
+      # follows it did not. The real values live in a gitignored
+      # infra/cloudflare/terraform.tfvars, i.e. on one laptop.
+      TF_VAR_zone_name: ${{ vars.CLOUDFLARE_ZONE_NAME }}
+      TF_VAR_app_host: ${{ vars.CLOUDFLARE_APP_HOST }}
+      TF_VAR_preprod_host: ${{ vars.CLOUDFLARE_PREPROD_HOST }}
+      TF_VAR_worker_route_host: ${{ vars.CLOUDFLARE_WORKER_ROUTE_HOST }}
       TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
     steps:
       - uses: actions/checkout@v4

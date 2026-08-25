@@ -125,8 +125,18 @@ async function checkEmqx(): Promise<Check[]> {
   }
 
   // Authorization sources — the per-conversation topic ACL (Postgres).
+  //
+  // This one is NOT shaped like /authentication above, which really does answer
+  // with a bare array. `GET /authorization/sources` wraps it:
+  //
+  //   sources(get, _) -> ... {200, #{sources => Sources}};
+  //     -- emqx_authz_api_sources.erl, v5.8.6, the version this stack pins
+  //
+  // Reading it as an array threw `authz is not iterable` on every poll, so the
+  // one check that exists to notice a broken topic ACL has never once reported
+  // on it -- it failed before it could look.
   type Authz = { type?: string; enable?: boolean; status?: string; node_error?: unknown[] };
-  const authz = await api<Authz[]>("authorization/sources");
+  const { sources: authz = [] } = await api<{ sources?: Authz[] }>("authorization/sources");
   if (!authz.length) {
     out.push({ name: "emqx.authz", ok: false, detail: "no authorization source configured — the topic ACL is not enforced" });
   }

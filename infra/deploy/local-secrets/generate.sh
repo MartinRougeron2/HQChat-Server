@@ -38,5 +38,17 @@ AUTHZ_PG_PASSWORD=hqcat
 AUTHZ_PG_SSL=false
 EOF
 
-chmod 600 "$DIR/database_url" "$DIR/database_url_direct" "$DIR/pg_ca_cert" "$DIR/emqx_pg"
+# 0644, not 0600. Compose bind-mounts a file secret with the host file's owner
+# and mode intact, and every service in this stack runs as `node` (uid 1000 in
+# node:22-bookworm-slim) -- not as whoever ran this script. On Linux that makes
+# an 0600 file written by uid 1001 unreadable to the container:
+#
+#   config: DATABASE_URL_DIRECT_FILE=/run/secrets/database_url_direct could not
+#   be read: EACCES: permission denied
+#
+# It works on a Mac only because Docker Desktop's file sharing maps ownership on
+# the way in. Nothing is given away by the wider mode: as the header says, these
+# four values authenticate to a throwaway container on a laptop or a CI runner,
+# and the real credentials never come near this directory.
+chmod 644 "$DIR/database_url" "$DIR/database_url_direct" "$DIR/pg_ca_cert" "$DIR/emqx_pg"
 echo "[local-secrets] wrote database_url, database_url_direct, pg_ca_cert, emqx_pg"

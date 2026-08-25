@@ -301,7 +301,14 @@ export class TestClient {
         const f = this.friends[sender];
         if (!f) break;
         f.peerSeed = this.c.hqcDecapsulate(this.sk, Buffer.from(msg.payload, "base64"));
-        this.sendAesSeed(sender);
+        // Answer only while the channel is still being established. Answering
+        // every AES frame makes two clients trade seeds forever: each reply is
+        // itself an AES frame, so the peer replies to the reply. The handshake
+        // settles in three frames and then never stops -- and the server reads
+        // any frame as proof the client is awake, so a "backgrounded" client
+        // that is still ping-ponging is never actually backgrounded, and
+        // nothing is ever queued.
+        if (!f.sharedKey) this.sendAesSeed(sender);
         if (f.mySeed && f.peerSeed) f.sharedKey = this.c.deriveSharedKey(f.mySeed, f.peerSeed);
         break;
       }

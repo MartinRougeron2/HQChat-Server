@@ -22,19 +22,36 @@ case "$STACK" in prod|preprod) ;; *) echo "❌ stack must be prod|preprod" >&2; 
 DIR="/etc/hqcat/$STACK/secrets"
 mkdir -p "$DIR"; chmod 700 "/etc/hqcat" "/etc/hqcat/$STACK" "$DIR"
 
+# 32 random bytes as hex, without openssl. It is not on PATH on the NixOS hosts:
+# nothing installs it globally (modules/default.nix forces
+# environment.defaultPackages empty on purpose), and the units that need it carry
+# it in their own systemd `path`. This script is scp'd and run over SSH, so it
+# gets the plain login environment and has to stand on its own -- and it also has
+# to work on the Ubuntu droplet, before NixOS is installed. /dev/urandom and
+# coreutils are on both.
+rand_hex() { od -vAn -N"$1" -tx1 < /dev/urandom | tr -d ' \n'; }
+
+# 0600, owned by the uid the containers run as. Compose bind-mounts these into
+# /run/secrets with the host's owner and mode intact, and every service that
+# reads one runs as uid 1000 -- `node` in the server image, `emqx` in
+# emqx/emqx:5.8. Root-owned 0600 is unreadable to them, and the stack halts on
+# db-migrate with EACCES. This is ownership, not a loosening: the mode is
+# unchanged, and no user other than root exists on these hosts.
+own() { chmod 600 "$1"; chown 1000:1000 "$1" 2>/dev/null || true; }
+
 # put <file> <env-var> <description> [optional|generate]
 put() {
   local file="$1" var="$2" desc="$3" mode="${4:-}" val="${!2:-}" path="$DIR/$1"
   if [[ -z "$val" && -s "$path" ]]; then echo "·  keep    $file"; return; fi
   if [[ -z "$val" && "$mode" == generate ]]; then
-    openssl rand -hex 32 > "$path"; chmod 600 "$path"; echo "🎲 generate $file"; return
+    rand_hex 32 > "$path"; own "$path"; echo "🎲 generate $file"; return
   fi
   if [[ -z "$val" ]]; then read -r -s -p "  $desc ($var, blank to skip): " val; echo; fi
   if [[ -z "$val" ]]; then
-    if [[ "$mode" == optional ]]; then : > "$path"; chmod 600 "$path"; echo "⏭  empty   $file"; return; fi
+    if [[ "$mode" == optional ]]; then : > "$path"; own "$path"; echo "⏭  empty   $file"; return; fi
     echo "❌ $var is required" >&2; exit 1
   fi
-  printf '%s' "$val" > "$path"; chmod 600 "$path"; echo "🔐 wrote   $file"
+  printf '%s' "$val" > "$path"; own "$path"; echo "🔐 wrote   $file"
 }
 
 # --- Database ---------------------------------------------------------------
@@ -52,7 +69,7 @@ put() {
 if [[ "$STACK" == preprod ]]; then
   PWFILE="$DIR/pg_local_password"
   if [[ ! -s "$PWFILE" ]]; then
-    openssl rand -hex 24 > "$PWFILE"; chmod 600 "$PWFILE"
+    rand_hex 24 > "$PWFILE"; own "$PWFILE"
     echo "🎲 generate pg_local_password"
     # The volume may predate this password. Say so rather than let postgres come
     # up rejecting a connection string that looks correct.

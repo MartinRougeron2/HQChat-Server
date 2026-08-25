@@ -22,8 +22,18 @@ on:
   pull_request:
   workflow_call:
 
+# `pull-requests: read` is what makes the path filter work. dorny/paths-filter
+# asks the Files API which files a PR touched, and without that scope the token
+# gets `Resource not accessible by integration` — the `changes` job FAILS, every
+# job that needs it is skipped, and the PR goes green having run nothing.
+#
+# That is not hypothetical: it is how the Redis-to-Postgres migration merged
+# without its end-to-end suite ever executing, and the schema it shipped could
+# not accept a single real user (see services/server/services/db/migrations/
+# 001_schema.sql, section 0).
 permissions:
   contents: read
+  pull-requests: read
 
 # One CI run per branch; a new push supersedes the old one instead of paying for
 # both. Safe to cancel: nothing here touches the outside world.

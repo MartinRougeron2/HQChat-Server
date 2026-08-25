@@ -224,7 +224,7 @@ const DBImpl = {
       // if it did not exist, and at least one caller relies on that.
       await c.query(
         `INSERT INTO users (pk, username) VALUES ($1, $2)
-         ON CONFLICT (pk) DO UPDATE SET username = EXCLUDED.username`,
+         ON CONFLICT (pk_digest(pk)) DO UPDATE SET username = EXCLUDED.username`,
         [pk, newUsername]
       );
     });
@@ -387,7 +387,7 @@ const DBImpl = {
       // had gone elsewhere.
       await c.query(
         `INSERT INTO subscription_claims (pk, email_hash, claimed_at) VALUES ($1, $2, now())
-         ON CONFLICT (pk) DO UPDATE SET email_hash = EXCLUDED.email_hash, claimed_at = now()`,
+         ON CONFLICT (pk_digest(pk)) DO UPDATE SET email_hash = EXCLUDED.email_hash, claimed_at = now()`,
         [pk, emailHash]
       );
       return 'ok';
@@ -496,7 +496,7 @@ const DBImpl = {
     // We store the invite in the recipient's "inbox"
     await q(
       `INSERT INTO invites (to_pk, from_pk, created_at) VALUES ($1, $2, now())
-       ON CONFLICT (to_pk, from_pk) DO UPDATE SET created_at = now()`,
+       ON CONFLICT (pk_digest(to_pk), pk_digest(from_pk)) DO UPDATE SET created_at = now()`,
       [toPk, fromPk]
     );
   },
@@ -568,7 +568,7 @@ const DBImpl = {
       const [lo, hi] = pair(myPk, fromPk);
       await c.query(
         `INSERT INTO friendships (pk_lo, pk_hi, hash) VALUES ($1, $2, $3)
-         ON CONFLICT (pk_lo, pk_hi) DO NOTHING`,
+         ON CONFLICT (pk_digest(pk_lo), pk_digest(pk_hi)) DO NOTHING`,
         [lo, hi, friendshipHash(myPk, fromPk)]
       );
       return true;
@@ -620,7 +620,7 @@ const DBImpl = {
     const [lo, hi] = pair(pk1, pk2);
     await q(
       `INSERT INTO friendships (pk_lo, pk_hi, hash) VALUES ($1, $2, $3)
-       ON CONFLICT (pk_lo, pk_hi) DO NOTHING`,
+       ON CONFLICT (pk_digest(pk_lo), pk_digest(pk_hi)) DO NOTHING`,
       [lo, hi, friendshipHash(pk1, pk2)]
     );
   },
@@ -658,7 +658,7 @@ const DBImpl = {
     // unchanged case a no-op instead of a new row version to vacuum.
     await q(
       `INSERT INTO push_tokens (pk, platform, token, updated_at) VALUES ($1, $2, $3, now())
-       ON CONFLICT (pk) DO UPDATE SET
+       ON CONFLICT (pk_digest(pk)) DO UPDATE SET
          platform = EXCLUDED.platform, token = EXCLUDED.token, updated_at = now()
        WHERE push_tokens.token IS DISTINCT FROM EXCLUDED.token
           OR push_tokens.platform IS DISTINCT FROM EXCLUDED.platform`,
@@ -726,7 +726,7 @@ const DBImpl = {
     await q(
       `INSERT INTO mqtt_acl (pk, topic, action)
        SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
-       ON CONFLICT (pk, topic) DO UPDATE SET action = EXCLUDED.action`,
+       ON CONFLICT (pk_digest(pk), pk_digest(topic)) DO UPDATE SET action = EXCLUDED.action`,
       [rows.map((r) => r[0]), rows.map((r) => r[1]), rows.map((r) => r[2])]
     );
   },
@@ -801,7 +801,7 @@ const DBImpl = {
     await q(
       `INSERT INTO mqtt_tokens (pk, token_hash, expires_at)
        VALUES ($1, $2, now() + $3::interval)
-       ON CONFLICT (pk) DO UPDATE SET
+       ON CONFLICT (pk_digest(pk)) DO UPDATE SET
          token_hash = EXCLUDED.token_hash, expires_at = EXCLUDED.expires_at`,
       [pk, tokenHash(token), secs(ttlSeconds)]
     );
@@ -867,7 +867,7 @@ const DBImpl = {
     await q(
       `INSERT INTO auth_challenges (pk, proof, expires_at)
        VALUES ($1, $2, now() + $3::interval)
-       ON CONFLICT (pk) DO UPDATE SET proof = EXCLUDED.proof, expires_at = EXCLUDED.expires_at`,
+       ON CONFLICT (pk_digest(pk)) DO UPDATE SET proof = EXCLUDED.proof, expires_at = EXCLUDED.expires_at`,
       [pk, proofHex, secs(ttlSeconds)]
     );
   },
@@ -966,7 +966,7 @@ const DBImpl = {
     const row = await one<{ n: number }>(
       `INSERT INTO rate_counters (key, n, window_ends_at)
        VALUES ($1, 1, now() + $2::interval)
-       ON CONFLICT (key) DO UPDATE SET
+       ON CONFLICT (pk_digest(key)) DO UPDATE SET
          n = CASE WHEN rate_counters.window_ends_at <= now() THEN 1 ELSE rate_counters.n + 1 END,
          window_ends_at = CASE WHEN rate_counters.window_ends_at <= now()
                                THEN now() + $2::interval

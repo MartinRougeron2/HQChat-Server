@@ -43,3 +43,39 @@ test("bot HQC KEM + AES + HKDF round-trip", async (t) => {
   assert.ok(deriveSharedKey(a, b).equals(deriveSharedKey(b, a)), "HKDF symmetry");
   assert.equal(deriveSharedKey(a, b).length, 32, "AES-256 key length");
 });
+
+// A GCM verifier that will compare fewer bytes than it should is a forgery
+// oracle: a 4-byte tag is guessable at 2^-32 instead of 2^-128. Node accepts a
+// short tag unless `authTagLength` says otherwise, and `subarray` hands one over
+// silently when the payload is truncated — so the length is both declared to the
+// cipher and checked before `setAuthTag`. This pins the check.
+test("aesDecrypt refuses a truncated GCM tag", async (t) => {
+  let botCrypto: typeof import("../bot/crypto");
+  try {
+    botCrypto = await import("../bot/crypto");
+  } catch {
+    return t.skip("HQC native lib unavailable on this platform");
+  }
+  const { aesEncrypt, aesDecrypt } = botCrypto;
+
+  const key = nodeCrypto.randomBytes(32);
+  const sealed = Buffer.from(aesEncrypt("hello", key), "base64");
+  assert.equal(aesDecrypt(sealed.toString("base64"), key), "hello", "round-trip still works");
+
+  // iv(12) + tag(16) + ct — chop the payload so the tag slice comes up short.
+  for (const tagBytes of [0, 4, 8, 15]) {
+    const truncated = sealed.subarray(0, 12 + tagBytes);
+    assert.throws(
+      () => aesDecrypt(truncated.toString("base64"), key),
+      /truncated GCM tag/,
+      `a ${tagBytes}-byte tag is rejected by length, before any verification`
+    );
+  }
+
+  // A full-length but wrong tag must still fail — on authentication, not length.
+  const forged = Buffer.from(sealed);
+  forged.writeUInt8(forged.readUInt8(12) ^ 0xff, 12);
+  assert.throws(() => aesDecrypt(forged.toString("base64"), key),
+    (e: Error) => !/truncated GCM tag/.test(e.message),
+    "a 16-byte forgery is refused by GCM itself");
+});

@@ -26,7 +26,7 @@ import { readJson, send, bearer, requireString, HttpError } from "../lib/http";
 import { DB } from "../services/db/api";
 import { EMQX } from "../lib/emqx";
 import { friendshipHash } from "../lib/crypto-utils";
-import { StripeService } from "../services/stripe/api";
+import { StripeService, subscriptionIsEntitling, subscriptionPriceIds } from "../services/stripe/api";
 import { SubscriptionService } from "../services/subscription/api";
 import { handleSubscribe } from "../services/web/subscribe";
 import { ADMISSION_POLICY } from "../lib/admission";
@@ -57,6 +57,63 @@ async function endPremiumAccess(pk: string): Promise<void> {
   await DB.revokeMqttAuth(pk);
   await EMQX.kick(pk);
   logger.info(`🔒 [claim] premium access ended for ${pk.slice(0, 12)}… (${peers.length} conversations)`);
+}
+
+/**
+ * Record a subscription created directly in Stripe, from the dashboard.
+ *
+ * This is a PRIMARY way subscriptions are issued here, not a fallback: comps for
+ * testers and friends are handed out by adding a subscription to a customer in
+ * the Stripe portal, and never touch Checkout.
+ *
+ * Which means no `checkout.session.completed` fires — and that event is the only
+ * other thing that maps a customer id to an email hash. Without this function
+ * the `customer.subscription.created` below finds nothing indexed, logs "no
+ * subscription indexed for customer …; ignoring active", and the recipient can
+ * never claim: `/claim/start` answers 200 and quietly mails nothing, because
+ * there is no active subscription for their address. Nothing anywhere errors.
+ *
+ * It carries the website's paid purchases too, on a deployment whose webhook
+ * endpoint subscribes only the `customer.subscription.*` events: Checkout in
+ * subscription mode always creates a Customer carrying the buyer's address, so
+ * the lookup below finds the same email either way.
+ *
+ * Only for prices on `ENTITLING_PRICE_IDS`. Granting premium from any live
+ * subscription object in the account would mean an unrelated product — or a
+ * leftover test — silently entitled its holder. Stripe decides WHO is
+ * subscribed; this file still decides WHAT counts as a subscription.
+ *
+ * A no-op once the customer is known, so the ordinary paid path (which indexed
+ * itself at checkout) is untouched and re-delivered events cost one lookup.
+ */
+async function adoptStripeCreatedSubscription(sub: any): Promise<void> {
+  const customerId = typeof sub?.customer === "string" ? sub.customer : sub?.customer?.id;
+  if (!customerId) return;
+  if (await DB.emailHashForCustomer(customerId)) return; // already indexed
+
+  if (!subscriptionIsEntitling(sub)) {
+    logger.warn(
+      `[claim] subscription for ${customerId} is on ${JSON.stringify(subscriptionPriceIds(sub))}, ` +
+      `which entitles nothing — ignoring. Add the price to STRIPE_COMP_PRICE_IDS if it should.`
+    );
+    return;
+  }
+
+  const email = await StripeService.customerEmail(customerId);
+  if (!email) {
+    // Loud: the operator did the work in Stripe and the recipient will meet a
+    // claim that answers 200 and mails nothing. A customer with no address on
+    // it is the one thing this path cannot work around.
+    logger.error(`❌ [claim] entitling subscription for ${customerId} has no email on the customer — cannot record it`);
+    return;
+  }
+
+  // recordPurchase also mails "your subscription is active, open the app and
+  // enter this address" — which is exactly what someone handed a comp plan
+  // needs, since they never saw a checkout success page telling them.
+  const emailHash = await SubscriptionService.recordPurchase(email, customerId);
+  await StripeService.tagCustomerEmailHash(customerId, emailHash);
+  logger.info(`🎟️  [claim] adopted a Stripe-created subscription for customer ${customerId}`);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -131,6 +188,10 @@ const server = http.createServer(async (req, res) => {
           if (event.type.startsWith("customer.subscription.")) {
             const sub = event.data.object as any;
             const active = sub.status === "active" || sub.status === "trialing";
+            // A comp subscription issued from the dashboard arrives here FIRST
+            // and has never been indexed, so index it before asking to flip its
+            // state — otherwise there is nothing to flip.
+            if (active) await adoptStripeCreatedSubscription(sub);
             const pks = await SubscriptionService.setStateForCustomer(
               sub.customer,
               active ? "active" : "cancelled"

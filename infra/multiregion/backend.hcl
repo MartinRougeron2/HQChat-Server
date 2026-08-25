@@ -5,8 +5,9 @@
 bucket = "your-tfstate-bucket"
 key    = "multiregion/terraform.tfstate"
 
-# R2 S3 endpoint: https://<accountid>.r2.cloudflarestorage.com
-endpoint                    = "https://REPLACE_ME.r2.cloudflarestorage.com"
+# `endpoints.s3`, not the deprecated bare `endpoint`; account id committed
+# rather than a placeholder, for the same reasons as infra/database/backend.hcl.
+endpoints                   = { s3 = "https://<your-cloudflare-account-id>.r2.cloudflarestorage.com" }
 region                      = "auto"
 skip_credentials_validation = true
 skip_region_validation      = true

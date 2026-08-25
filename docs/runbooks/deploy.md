@@ -255,6 +255,46 @@ Put the signing secret in `infra/deploy/secrets/stripe_webhook_secret`, then
 `stripe listen --forward-to localhost:8091/stripe/webhook` (app-api owns
 `/stripe/webhook` now).
 
+### Complimentary subscriptions (testers, friends)
+
+An annual price charged nothing, listed in `STRIPE_COMP_PRICE_IDS`. It entitles
+premium exactly as the paid price does — nothing downstream asks which plan a key
+is on, only whether it is on a live subscription.
+
+It is not on the website and cannot be: `createCheckout` is hard-wired to
+`STRIPE_PRICE_ID`, so a visitor cannot ask for a different price than the one the
+server builds. Being unlisted IS the access control, which is why the checkout
+price is pinned rather than taken from the request — see the test
+`the website never sells the comp price`.
+
+To grant one: Stripe Dashboard → Customers → the person → add a subscription on
+the comp price. The `customer.subscription.created` webhook records it, they
+receive the same "open the app and enter this address" email a paying customer
+gets, and they claim by code as usual. (A Payment Link on the comp price also
+works, via `checkout.session.completed`.)
+
+**The customer must have an email address set.** It is what the entire claim flow
+is keyed on, and a customer without one cannot be recorded — that logs at
+`error`, because the recipient would otherwise meet a claim that answers 200 and
+mails nothing, with no trace anywhere. If you hit that: set the email on the
+customer, then Developers → Events → resend the `customer.subscription.created`.
+
+### Which webhook events you actually need
+
+The code handles four and ignores the rest:
+
+| Event | What it does |
+|---|---|
+| `customer.subscription.created` / `.updated` / `.deleted` | activates or ends access. **Also records a portal-issued subscription the first time it is seen** — this is the path comps take |
+| `checkout.session.completed` | records a purchase made through the website's own checkout |
+
+A deployment that issues subscriptions from the portal and also sells on the
+website can run on the three `customer.subscription.*` events alone: Checkout in
+subscription mode always creates a Customer carrying the buyer's address, so a
+paid purchase is recorded by the same path. Subscribing `checkout.session.completed`
+as well is still preferable for the paid route — it carries the address the buyer
+typed at checkout, and records the purchase without a round trip back to Stripe.
+
 Note the split: `/stripe/*` and `/subscribe` are **app-api** (8091), but
 `/claim/*` is **auth** (8090) — the claim happens before a session exists.
 `nginx.conf` states `/claim/` explicitly for that reason; a config that lets the

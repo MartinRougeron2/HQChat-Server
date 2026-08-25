@@ -35,8 +35,13 @@ export function createTestClient(hexSeed: string, myHandle: string, targetHandle
 
     const decryptAES = (b64: string, key: Buffer) => {
         const buf = Buffer.from(b64, 'base64');
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(0, 12));
-        decipher.setAuthTag(buf.subarray(12, 28));
+        // 16-byte tag, stated and checked — see bot/crypto.ts for why both.
+        const tag = buf.subarray(12, 28);
+        if (tag.length !== 16) throw new Error('truncated GCM tag');
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(0, 12), {
+            authTagLength: 16,
+        });
+        decipher.setAuthTag(tag);
         return decipher.update(buf.subarray(28)) + decipher.final('utf8');
     };
 

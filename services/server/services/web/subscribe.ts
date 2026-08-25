@@ -43,12 +43,37 @@ function page(title: string, inner: string): string {
 <body><div class="card"><div class="logo">✦</div>${inner}</div></body></html>`;
 }
 
+/**
+ * Where Stripe Checkout is served from, and therefore where the POST below
+ * redirects the browser.
+ *
+ * This is in the CSP, and it has to be. `form-action` is enforced across
+ * REDIRECTS, not just on the initial submission target: with `form-action
+ * 'self'` the browser blocks the 302 out to Stripe, and blocks it *silently* —
+ * the server logs a clean 302, the page simply does not move, and the only
+ * evidence is a console line the user never sees. That is what "no error, just
+ * nothing" looked like.
+ *
+ * If Stripe Checkout is ever moved to a custom domain, this constant moves with
+ * it, or the button goes dead again in exactly the same invisible way.
+ */
+export const CHECKOUT_ORIGIN = "https://checkout.stripe.com";
+
+/**
+ * No scripts on these pages; only inline styles. Locked down apart from the one
+ * hole the flow genuinely needs — see `CHECKOUT_ORIGIN`.
+ */
+export const CSP = [
+  "default-src 'none'",
+  "style-src 'unsafe-inline'",
+  `form-action 'self' ${CHECKOUT_ORIGIN}`,
+  "base-uri 'none'",
+].join("; ");
+
 function send(res: ServerResponse, status: number, body: string) {
   res.writeHead(status, {
     "Content-Type": "text/html; charset=utf-8",
-    // No scripts on this page; only inline styles. Lock it down.
-    "Content-Security-Policy":
-      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'",
+    "Content-Security-Policy": CSP,
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
@@ -88,6 +113,16 @@ export async function handleSubscribe(req: IncomingMessage, res: ServerResponse)
 
   try {
     const checkoutUrl = await StripeService.createCheckout(baseUrl(req));
+    // Say so if Stripe ever hands back a host the page's CSP will not let the
+    // browser follow. Without this the redirect is issued, the browser drops it
+    // on the floor, and the server log shows a perfectly healthy 302 — the exact
+    // failure that made this bug invisible the first time.
+    if (!checkoutUrl.startsWith(`${CHECKOUT_ORIGIN}/`)) {
+      logger.error(
+        `[subscribe] checkout URL origin is not ${CHECKOUT_ORIGIN} — the CSP form-action ` +
+        `will block this redirect and the button will do nothing. Got: ${new URL(checkoutUrl).origin}`
+      );
+    }
     res.writeHead(302, { Location: checkoutUrl });
     res.end();
   } catch (e: any) {

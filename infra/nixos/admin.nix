@@ -10,6 +10,7 @@
       # Replace with your public key (cat ~/.ssh/id_ed25519.pub).
       # Evaluation fails while this list is empty — deliberately, because a host
       # with no key and no password has no way in at all.
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICDVXbtAt7thKmgjRO5gVDmiEDCOPCI9Z7ATziyA2H7V martinrougeron@Martins-MacBook-Pro.local"
     ];
 
     # Second factor on SSH. Turn on ONLY after running `google-authenticator`

@@ -17,6 +17,10 @@
 #   R2_ACCESS_KEY_ID=...            # the R2 token's ID (Access Key ID; not secret)
 #   ORIGIN_IPV4=...                 # prod VM public IPv4
 #   PREPROD_ORIGIN_IPV4=...         # pre-prod VM public IPv4 (its OWN host; optional)
+#   CLOUDFLARE_ZONE_NAME=...        # apex zone, e.g. example.com
+#   CLOUDFLARE_APP_HOST=...         # prod subdomain (default: chat)
+#   CLOUDFLARE_PREPROD_HOST=...     # pre-prod subdomain (default: preprod.chat)
+#   CLOUDFLARE_WORKER_ROUTE_HOST=.. # host the legal pages overlay (default: the zone)
 #   CLOUDFLARE_ACCOUNT_ID=... \
 #   infra/deploy/scripts/set-ci-secrets.sh production
 #
@@ -46,6 +50,16 @@ PREPROD_ORIGIN_IPV4="${PREPROD_ORIGIN_IPV4:-}"
 need CLOUDFLARE_ACCOUNT_ID     "Cloudflare account id"
 CLOUDFLARE_ALERT_EMAIL="${CLOUDFLARE_ALERT_EMAIL:-}"
 
+# Which zone, and which names in it. Terraform has no defaults for the zone any
+# more, and release.yml reads these four as environment variables: without them
+# the deploy pipeline cannot plan at all. They used to live only in a gitignored
+# terraform.tfvars, so the release job planned against `chat.example.com` and
+# failed with `no zone found`.
+need CLOUDFLARE_ZONE_NAME      "Cloudflare zone (apex domain)"
+CLOUDFLARE_APP_HOST="${CLOUDFLARE_APP_HOST:-chat}"
+CLOUDFLARE_PREPROD_HOST="${CLOUDFLARE_PREPROD_HOST:-preprod.chat}"
+CLOUDFLARE_WORKER_ROUTE_HOST="${CLOUDFLARE_WORKER_ROUTE_HOST:-$CLOUDFLARE_ZONE_NAME}"
+
 # Secrets
 for s in CLOUDFLARE_API_TOKEN CLOUDFLARE_API_TOKEN_USER ORIGIN_IPV4; do
   printf '%s' "${!s}" | gh secret set "$s" --env "$ENVIRONMENT"
@@ -63,6 +77,10 @@ gh variable set R2_ACCESS_KEY_ID --env "$ENVIRONMENT" --body "$R2_ACCESS_KEY_ID"
 echo "📋 variable R2_ACCESS_KEY_ID"
 gh variable set CLOUDFLARE_ACCOUNT_ID --env "$ENVIRONMENT" --body "$CLOUDFLARE_ACCOUNT_ID"
 echo "📋 variable CLOUDFLARE_ACCOUNT_ID"
+for v in CLOUDFLARE_ZONE_NAME CLOUDFLARE_APP_HOST CLOUDFLARE_PREPROD_HOST CLOUDFLARE_WORKER_ROUTE_HOST; do
+  gh variable set "$v" --env "$ENVIRONMENT" --body "${!v}"
+  echo "📋 variable $v"
+done
 if [[ -n "$CLOUDFLARE_ALERT_EMAIL" ]]; then
   gh variable set CLOUDFLARE_ALERT_EMAIL --env "$ENVIRONMENT" --body "$CLOUDFLARE_ALERT_EMAIL"
   echo "📋 variable CLOUDFLARE_ALERT_EMAIL"

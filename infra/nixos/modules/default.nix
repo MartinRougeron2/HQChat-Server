@@ -7,6 +7,8 @@
   imports = [
     ./options.nix
     ./hardware.nix
+    ./disk.nix
+    ./network.nix
     ./hardening.nix
     ./firewall.nix
     ./docker.nix

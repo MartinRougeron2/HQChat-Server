@@ -83,7 +83,14 @@ Locally you need `gh`, `terraform` (≥1.10), `nix`, and `ssh`. On macOS:
 
 ```bash
 brew install gh terraform && curl -L https://nixos.org/nix/install | sh
+mkdir -p ~/.config/nix && printf 'experimental-features = nix-command flakes\n' >> ~/.config/nix/nix.conf
 ```
+
+The second line is not optional. Every nix command in step 6 is `nix run` or
+`--flake`, and the official installer enables neither feature — without it the
+first one fails with `experimental Nix feature 'nix-command' is disabled`. The
+Determinate installer (`curl -fsSL https://install.determinate.systems/nix | sh
+-s -- install`) turns both on for you and needs no nix.conf.
 
 ---
 
@@ -154,12 +161,20 @@ Create **two**, so that a leak of one is limited:
    You need both halves: the token **ID** (`R2_ACCESS_KEY_ID`) and its **value**
    (`CLOUDFLARE_API_TOKEN_USER`).
 2. **Nix cache** — Object Read & Write on `dissqus-nix-cache`.
-   Here you want the **Secret Access Key** shown on creation
+   You need both halves here too: the token **ID**
+   (`R2_CACHE_ACCESS_KEY_ID`) and the **Secret Access Key** shown on creation
    (`R2_CACHE_SECRET_ACCESS_KEY`).
 
 > Terraform derives its S3 secret as `SHA-256(token value)`, which is why it
 > needs the token *value* and not the displayed secret key. The Nix cache uses
 > the S3 credentials directly. They are genuinely different — do not mix them.
+
+> **Each token's id goes with its own secret.** The Host workflow used to sign
+> the cache upload with the *state* token's id and the *cache* token's secret,
+> which R2 refuses — `Access Denied` on `nix-cache-info` — leaving the cache
+> empty and every host with nothing to pull. `R2_ACCESS_KEY_ID` is the state
+> token's; `R2_CACHE_ACCESS_KEY_ID` is the cache token's. If you would rather
+> run one token for both buckets, set both variables to that token's id.
 
 ---
 
@@ -209,6 +224,11 @@ gh secret set PREPROD_ORIGIN_IPV4         --env production --body '<preprod-ip>'
 gh variable set CLOUDFLARE_ACCOUNT_ID --env production --body '<account-id>'
 gh variable set R2_ENDPOINT           --env production --body 'https://<account-id>.r2.cloudflarestorage.com'
 gh variable set NIX_CACHE_BUCKET      --env production --body 'dissqus-nix-cache'
+gh variable set R2_CACHE_ACCESS_KEY_ID --env production --body '<cache-token-id>'
+gh variable set CLOUDFLARE_ZONE_NAME         --env production --body '<your-domain>'
+gh variable set CLOUDFLARE_APP_HOST          --env production --body 'chat'
+gh variable set CLOUDFLARE_PREPROD_HOST      --env production --body 'preprod.chat'
+gh variable set CLOUDFLARE_WORKER_ROUTE_HOST --env production --body '<your-domain>'
 gh variable set CLOUDFLARE_ALERT_EMAIL --env production --body 'you@example.com'   # optional
 ```
 
@@ -568,7 +588,9 @@ healthy.
 | Agent logs `cannot pull` | GHCR token missing or expired — step 9 |
 | SSH asks for a code you cannot supply | TOTP was enabled before enrolling. Recover via the DigitalOcean droplet console, run `google-authenticator`, or set `totp = false` and redeploy |
 | Host agent logs `cannot reach` | `cache.<domain>` not resolving, or the bucket is not public — step 3 |
+| Host workflow: `Access Denied` uploading `nix-cache-info` | The cache upload is signed with two halves of different R2 tokens. `R2_CACHE_ACCESS_KEY_ID` must be the id of the token whose secret is in `R2_CACHE_SECRET_ACCESS_KEY` — step 4 |
 | `docker compose up` fails on a secret | a secret file is missing; `ls -l /etc/hqcat/prod/secrets/` |
 | Stack stops, `db-migrate` exits non-zero | the database credentials are empty or wrong, or the cluster is unreachable. `docker compose logs db-migrate`, then re-check step 8 |
 | `broker-watch` reports `authz-pg` disconnected | EMQX's own database link is down — its credentials are a separate file (`emqx_pg`) from the services'. This is an incident: `deny_action = disconnect` drops every client that touches a topic |
 | Terraform: record already exists | import it — step 5 |
+| Terraform: `no zone found`, plan shows `*.example.com` | The zone/host variables are not set on the environment. `terraform.tfvars` is gitignored, so CI cannot read it — step 4 |

@@ -115,6 +115,19 @@ export function assertConfig(needs: ConfigNeed[] = []): void {
     }
   }
 
+  // The test account is a real hole in the paid door, and the reason it is safe
+  // is that everyone running the server knows it is open. Say so at every boot
+  // that has it enabled, so it is never a surprise found in a code read.
+  if (needs.includes("mail")) {
+    const testEmail = (process.env.TEST_ACCOUNT_EMAIL ?? "test@test.test").trim();
+    if (testEmail) {
+      warnings.push(
+        `TEST_ACCOUNT_EMAIL=${testEmail} is enabled — that address links any number of devices ` +
+        `with a fixed code and no payment. Set TEST_ACCOUNT_EMAIL= (empty) to close it.`
+      );
+    }
+  }
+
   for (const w of warnings) console.warn(`⚠️  config: ${w}`);
   if (errors.length) {
     console.error("\n❌ Invalid configuration — refusing to start:\n  - " + errors.join("\n  - ") + "\n");

@@ -5,10 +5,45 @@
 CREATE EXTENSION IF NOT EXISTS citext;
 
 -- ============================================================
+-- 0. WHY NO PUBLIC KEY IS EVER A BTREE KEY
+-- ============================================================
+-- An HQC-256 public key is 7237 bytes (lib/hqc.ts), and it travels as hex: a
+-- 14474-character string. A btree index entry may not exceed a third of a page,
+-- ~2704 bytes, so `pk text PRIMARY KEY` is not a slow schema -- it is a schema
+-- that cannot accept a single real user:
+--
+--   ERROR: index row requires 14488 bytes, maximum size is 8191
+--
+-- (The literal error from the first end-to-end run against Postgres. Nothing
+-- caught it earlier because CI's `changes` job was failing on every pull
+-- request -- paths-filter could not read the file list without
+-- `pull-requests: read` -- so e2e was skipped and the PR went green having run
+-- nothing. Fixed in .github/workflows/ci.yml alongside this.)
+--
+-- So keys are indexed two ways, and neither is a btree over the key itself:
+--
+--   * uniqueness -- a UNIQUE index over pk_digest(pk). Constraints still cannot
+--     be raced, which was the whole point of moving off Redis; they are simply
+--     enforced over a 32-byte digest instead of a 14 kB string.
+--   * lookup -- a HASH index on the raw column. Hash indexes store only the hash
+--     code, so they have no size limit, and they serve exactly the `=` that
+--     every query here uses. That is what keeps `WHERE pk = $1` untouched in
+--     both the application AND in EMQX's authorizer query, which is configured
+--     on the broker and does not live in this repo.
+--
+-- The digest is a function rather than a stored column so that no INSERT has to
+-- remember it. `convert_to` is formally STABLE (it reads the server encoding),
+-- which an index expression may not be; a database's encoding is fixed when it
+-- is created and this one is UTF8, so IMMUTABLE is the truth here.
+CREATE OR REPLACE FUNCTION pk_digest(t text) RETURNS bytea
+  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+  AS $$ SELECT sha256(convert_to(t, 'UTF8')) $$;
+
+-- ============================================================
 -- 1. IDENTITY
 -- ============================================================
 CREATE TABLE IF NOT EXISTS users (
-  pk         text PRIMARY KEY,
+  pk         text NOT NULL,
   -- UNIQUE is the whole point: the Redis version did SISMEMBER then a
   -- non-atomic pipeline, so two simultaneous registrations could both pass the
   -- check and both write. A constraint cannot be raced.
@@ -20,6 +55,8 @@ CREATE TABLE IF NOT EXISTS users (
   created_at timestamptz NOT NULL DEFAULT now(),
   tier       text NOT NULL DEFAULT 'free'
 );
+CREATE UNIQUE INDEX IF NOT EXISTS users_pk_key      ON users (pk_digest(pk));
+CREATE INDEX        IF NOT EXISTS users_pk_hash_idx ON users USING hash (pk);
 
 -- ============================================================
 -- 2. SOCIAL GRAPH
@@ -39,10 +76,14 @@ CREATE TABLE IF NOT EXISTS friendships (
   -- test vector, and it should keep exactly one definition.
   hash       text NOT NULL UNIQUE,
   created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (pk_lo, pk_hi),
   CHECK (pk_lo COLLATE "C" < pk_hi COLLATE "C")
 );
-CREATE INDEX IF NOT EXISTS friendships_pk_hi_idx ON friendships (pk_hi);
+-- Was PRIMARY KEY (pk_lo, pk_hi) -- see section 0. Still one row per pair, and
+-- still answerable from either direction.
+CREATE UNIQUE INDEX IF NOT EXISTS friendships_pair_key
+  ON friendships (pk_digest(pk_lo), pk_digest(pk_hi));
+CREATE INDEX IF NOT EXISTS friendships_pk_lo_idx ON friendships USING hash (pk_lo);
+CREATE INDEX IF NOT EXISTS friendships_pk_hi_idx ON friendships USING hash (pk_hi);
 
 -- An invite lives in the recipient's inbox, keyed by the sender — same shape as
 -- `invites:{to}` was. The index on from_pk is what replaces deleteUser's SCAN
@@ -50,20 +91,24 @@ CREATE INDEX IF NOT EXISTS friendships_pk_hi_idx ON friendships (pk_hi);
 CREATE TABLE IF NOT EXISTS invites (
   to_pk      text NOT NULL,
   from_pk    text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (to_pk, from_pk)
+  created_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS invites_from_pk_idx ON invites (from_pk);
+CREATE UNIQUE INDEX IF NOT EXISTS invites_pair_key
+  ON invites (pk_digest(to_pk), pk_digest(from_pk));
+CREATE INDEX IF NOT EXISTS invites_to_pk_idx   ON invites USING hash (to_pk);
+CREATE INDEX IF NOT EXISTS invites_from_pk_idx ON invites USING hash (from_pk);
 
 -- ============================================================
 -- 3. PUSH
 -- ============================================================
 CREATE TABLE IF NOT EXISTS push_tokens (
-  pk         text PRIMARY KEY,
+  pk         text NOT NULL,
   platform   text NOT NULL DEFAULT 'ios',
   token      text NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS push_tokens_pk_key      ON push_tokens (pk_digest(pk));
+CREATE INDEX        IF NOT EXISTS push_tokens_pk_hash_idx ON push_tokens USING hash (pk);
 
 -- ============================================================
 -- 4. SUBSCRIPTIONS
@@ -90,10 +135,14 @@ CREATE TABLE IF NOT EXISTS subscription_customers (
 -- public key: revoking a lapsed subscriber means editing mqtt_acl and kicking
 -- {pk} off the broker, and a blinded key can address neither.
 CREATE TABLE IF NOT EXISTS subscription_claims (
-  pk         text PRIMARY KEY,
+  pk         text NOT NULL,
   email_hash text NOT NULL,
   claimed_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS subscription_claims_pk_key
+  ON subscription_claims (pk_digest(pk));
+CREATE INDEX IF NOT EXISTS subscription_claims_pk_hash_idx
+  ON subscription_claims USING hash (pk);
 CREATE INDEX IF NOT EXISTS subscription_claims_email_hash_idx
   ON subscription_claims (email_hash);
 
@@ -104,8 +153,12 @@ CREATE INDEX IF NOT EXISTS subscription_claims_email_hash_idx
 -- so it is admitted under any policy without an operator hand-copying a key that
 -- goes stale whenever the bot's identity changes.
 CREATE TABLE IF NOT EXISTS admission_exempt (
-  pk text PRIMARY KEY
+  pk text NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS admission_exempt_pk_key
+  ON admission_exempt (pk_digest(pk));
+CREATE INDEX IF NOT EXISTS admission_exempt_pk_hash_idx
+  ON admission_exempt USING hash (pk);
 
 -- ============================================================
 -- 6. MQTT AUTHORIZATION
@@ -116,12 +169,19 @@ CREATE TABLE IF NOT EXISTS admission_exempt (
 --
 -- The topic name is derivable by anyone who knows both public keys, so
 -- authorization rests ENTIRELY on this table — never on topic-name secrecy.
+-- `topic` embeds a public key too (`u/{pk}/presence`), so it is no more usable as
+-- a btree key than `pk` is: both halves of the pair go through pk_digest. The
+-- hash index on `pk` is the one the broker's authorizer uses -- its query is
+-- `WHERE pk = $1`, it is configured on EMQX rather than here, and it keeps
+-- working unchanged.
 CREATE TABLE IF NOT EXISTS mqtt_acl (
   pk     text NOT NULL,
   topic  text NOT NULL,
-  action text NOT NULL CHECK (action IN ('publish', 'subscribe', 'all')),
-  PRIMARY KEY (pk, topic)
+  action text NOT NULL CHECK (action IN ('publish', 'subscribe', 'all'))
 );
+CREATE UNIQUE INDEX IF NOT EXISTS mqtt_acl_pk_topic_key
+  ON mqtt_acl (pk_digest(pk), pk_digest(topic));
+CREATE INDEX IF NOT EXISTS mqtt_acl_pk_hash_idx ON mqtt_acl USING hash (pk);
 
 -- The one table the broker's role may read (see 000_roles.sql).
 GRANT SELECT ON mqtt_acl TO ${EMQX_ROLE};

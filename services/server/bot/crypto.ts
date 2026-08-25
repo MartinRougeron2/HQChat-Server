@@ -34,12 +34,25 @@ export function aesEncrypt(plaintext: string, key: Buffer): string {
   return Buffer.concat([iv, tag, ct]).toString("base64");
 }
 
+/** GCM tags are 16 bytes here and nowhere else. Stated to the cipher AND checked
+ *  before `setAuthTag`, because neither alone is enough: node accepts a short tag
+ *  without `authTagLength`, and `subarray` silently yields a short one from a
+ *  truncated payload rather than throwing. A verifier that will compare fewer
+ *  bytes than it should is a forgery oracle — 2^-32 for a 4-byte tag instead of
+ *  2^-128. The sender is `aesEncrypt` above, which always writes 16. */
+const GCM_TAG_BYTES = 16;
+
 export function aesDecrypt(b64: string, key: Buffer): string {
   const data = Buffer.from(b64, "base64");
   const iv = data.subarray(0, 12);
-  const tag = data.subarray(12, 28);
-  const ct = data.subarray(28);
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  const tag = data.subarray(12, 12 + GCM_TAG_BYTES);
+  const ct = data.subarray(12 + GCM_TAG_BYTES);
+  if (tag.length !== GCM_TAG_BYTES) {
+    throw new Error(`aesDecrypt: truncated GCM tag (${tag.length} of ${GCM_TAG_BYTES} bytes)`);
+  }
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv, {
+    authTagLength: GCM_TAG_BYTES,
+  });
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
 }

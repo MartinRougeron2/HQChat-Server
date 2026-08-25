@@ -72,6 +72,10 @@ on:
         description: "R2 state token VALUE → CLOUDFLARE_API_TOKEN_USER. The VALUE, not the displayed secret key: Terraform derives its S3 secret as sha256(value)."
         type: string
         required: true
+      r2_cache_token_id:
+        description: "R2 cache token ID -> R2_CACHE_ACCESS_KEY_ID. Must be the SAME token as the secret below: the cache push signs with the pair, and the state token's id pairs with nothing here."
+        type: string
+        required: true
       r2_cache_secret_access_key:
         description: "R2 cache token Secret Access Key (this one IS the displayed secret key)"
         type: string
@@ -472,6 +476,13 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
           ORIGIN_IPV4: ${{ needs.droplets.outputs.prod_ip }}
           PREPROD_ORIGIN_IPV4: ${{ needs.droplets.outputs.preprod_ip }}
+          # The same four names this run applies Terraform with, so the release
+          # pipeline that follows plans against the zone that was just built
+          # rather than against the module's defaults.
+          CLOUDFLARE_ZONE_NAME: ${{ inputs.zone_name }}
+          CLOUDFLARE_APP_HOST: ${{ inputs.app_host }}
+          CLOUDFLARE_PREPROD_HOST: ${{ inputs.preprod_host }}
+          CLOUDFLARE_WORKER_ROUTE_HOST: ${{ inputs.worker_route_host }}
         run: infra/deploy/scripts/set-ci-secrets.sh production
 
       - name: Set the secrets and variables that script does not cover
@@ -482,9 +493,14 @@ jobs:
           set -euo pipefail
           printf '%s' '${{ inputs.r2_cache_secret_access_key }}' \
             | gh secret set R2_CACHE_SECRET_ACCESS_KEY --env production
+          # Its id travels as a variable, like the state token's: an Access Key
+          # ID is not a secret, and keeping the pair together under one name
+          # prefix is what stops the two tokens being mixed the way they were.
+          gh variable set R2_CACHE_ACCESS_KEY_ID --env production \
+            --body '${{ inputs.r2_cache_token_id }}'
           gh variable set R2_ENDPOINT      --env production --body "$R2_ENDPOINT"
           gh variable set NIX_CACHE_BUCKET --env production --body "$CACHE_BUCKET"
-          echo "R2_CACHE_SECRET_ACCESS_KEY, R2_ENDPOINT, NIX_CACHE_BUCKET"
+          echo "R2_CACHE_ACCESS_KEY_ID, R2_CACHE_SECRET_ACCESS_KEY, R2_ENDPOINT, NIX_CACHE_BUCKET"
 
       - uses: cachix/install-nix-action@v30
         with:
@@ -693,14 +709,11 @@ jobs:
         working-directory: infra/cloudflare
         run: terraform apply -input=false -auto-approve
 
-      # backend.hcl for the database module still ships a REPLACE_ME endpoint.
-      # Patch it here from the account id rather than failing on it.
       - name: Database — init
         if: inputs.include_database
         working-directory: infra/database
         run: |
           set -euo pipefail
-          sed -i "s#https://REPLACE_ME.r2.cloudflarestorage.com#${{ needs.preflight.outputs.r2_endpoint }}#" backend.hcl
           terraform init -input=false -backend-config=backend.hcl
 
       - name: Database — plan

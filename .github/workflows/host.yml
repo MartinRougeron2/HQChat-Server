@@ -92,10 +92,35 @@ jobs:
           nix store sign --key-file /tmp/cache-key.sec --recursive "${{ steps.build.outputs.path }}"
           rm -f /tmp/cache-key.sec
 
+      # The two halves must come from the SAME R2 token. They did not: the id was
+      # `R2_ACCESS_KEY_ID`, which docs/runbooks/from-scratch.md mints as the
+      # Terraform *state* token, while the secret is the *cache* token's. R2
+      # answered exactly what a mismatched pair deserves —
+      #
+      #   error: AWS error uploading 'nix-cache-info': Access Denied
+      #
+      # — and the cache stayed empty, which strands every host: they pull their
+      # closure from it and there was nothing to pull.
+      - name: Check the cache credentials are a pair
+        if: github.event_name == 'push'
+        env:
+          CACHE_KEY_ID: ${{ vars.R2_CACHE_ACCESS_KEY_ID }}
+          CACHE_SECRET: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
+        run: |
+          [ -n "$CACHE_KEY_ID" ] || {
+            echo "::error::R2_CACHE_ACCESS_KEY_ID is not set on this environment. It is the"
+            echo "::error::Access Key ID of the NIX CACHE R2 token — the one whose Secret Access"
+            echo "::error::Key is in R2_CACHE_SECRET_ACCESS_KEY. Do not reuse R2_ACCESS_KEY_ID:"
+            echo "::error::that belongs to the Terraform state token and pairs with nothing here."
+            echo "::error::  gh variable set R2_CACHE_ACCESS_KEY_ID --env production --body '<id>'"
+            exit 1
+          }
+          [ -n "$CACHE_SECRET" ] || { echo "::error::R2_CACHE_SECRET_ACCESS_KEY is not set"; exit 1; }
+
       - name: Push the closure to R2
         if: github.event_name == 'push'
         env:
-          AWS_ACCESS_KEY_ID: ${{ vars.R2_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+          AWS_ACCESS_KEY_ID: ${{ vars.R2_CACHE_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
           CACHE_BUCKET: ${{ vars.NIX_CACHE_BUCKET }}
@@ -112,7 +137,7 @@ jobs:
       - name: Move the ${{ matrix.host }} channel pointer
         if: github.event_name == 'push'
         env:
-          AWS_ACCESS_KEY_ID: ${{ vars.R2_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+          AWS_ACCESS_KEY_ID: ${{ vars.R2_CACHE_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
           CACHE_BUCKET: ${{ vars.NIX_CACHE_BUCKET }}

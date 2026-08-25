@@ -66,10 +66,15 @@ tar -czf - -C "$stage" origin.pem origin.key \
     tar -xzf - -C \"\$tmp\"
     install -m 0644 -o root -g ssl-cert \"\$tmp/origin.pem\" /etc/ssl/cloudflare/origin.pem
     install -m 0640 -o root -g ssl-cert \"\$tmp/origin.key\" /etc/ssl/cloudflare/origin.key
-    # Re-run the guard so it picks up the real pair instead of the placeholder,
-    # then validate before reloading — a bad config must not take nginx down.
+    # Re-run the guard so it picks up the real pair instead of the placeholder.
     systemctl restart hqcat-origin-cert.service
-    nginx -t
+    # `nginx -t` used to run here and could not: nothing puts the nginx binary on
+    # root's PATH on these hosts -- nginx is a service, not an installed package,
+    # and modules/default.nix forces environment.defaultPackages empty. It was
+    # also unnecessary. The unit's own ExecReload is
+    #   nginx -c /nix/store/...-nginx.conf -t
+    #   kill -HUP \$MAINPID
+    # so a reload already refuses to signal a config that does not test clean.
     systemctl reload nginx
     echo '   nginx reloaded'"
 

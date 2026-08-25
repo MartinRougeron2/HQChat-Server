@@ -16,6 +16,7 @@ import * as crypto from "crypto";
 import { DB } from "../db/api";
 import { logger } from "../../lib/logger";
 import { sendMail } from "../../lib/mailer";
+import { isTestAccount, testAccountCodeMatches, claimTestAccountDevice, TEST_ACCOUNT_EMAIL } from "./test-account";
 
 /** How many devices one subscription admits. A cap, not a lock: re-claiming a
  *  device already bound costs nothing, and forgetDevices() is the way out. */
@@ -144,11 +145,27 @@ export const SubscriptionService = {
     const H = emailHash(email);
 
     const byIp = await DB.bumpCounter(`claim:ip:${ip}`, CLAIM_WINDOW_SECONDS);
-    const byEmail = await DB.bumpCounter(`claim:email:${H}`, CLAIM_WINDOW_SECONDS);
+    // The test account is exempt from the per-ADDRESS limit and only that one:
+    // it is a single shared address, so three starts a quarter-hour is a global
+    // choke on everyone testing at once. The per-IP limit still applies to it,
+    // and that is the one that actually bounds a stranger hammering this.
+    const byEmail = isTestAccount(email)
+      ? 0
+      : await DB.bumpCounter(`claim:email:${H}`, CLAIM_WINDOW_SECONDS);
     if (byIp > CLAIM_IP_LIMIT || byEmail > CLAIM_EMAIL_LIMIT) {
       // Rate limiting is the one thing that may be visible: it is a property of
       // the CALLER, and reveals nothing about the address.
       return { ok: false, reason: "rate_limited" };
+    }
+
+    if (isTestAccount(email)) {
+      // Nothing to send: the address is not deliverable and the code is a
+      // constant. The subscription is created here rather than at verify time
+      // so that a tester who only ever taps "send code" still ends up with the
+      // account in the state the next screen expects.
+      await DB.setSubscription(H, "active");
+      logger.info(`[claim] start for the TEST account (${TEST_ACCOUNT_EMAIL}) — no mail, the code is fixed`);
+      return { ok: true, sent: false };
     }
 
     const sub = await DB.getSubscription(H);
@@ -193,6 +210,15 @@ export const SubscriptionService = {
   async verifyClaim(email: string, code: string, pkHex: string): Promise<VerifyResult> {
     if (!validEmail(email)) return { ok: false, reason: "invalid_email" };
     const H = emailHash(email);
+
+    if (isTestAccount(email)) {
+      if (!testAccountCodeMatches(code)) return { ok: false, reason: "bad_code" };
+      // Deliberately independent of startClaim: the code never changes and
+      // never expires, so a tester who types it straight in is not left waiting
+      // on an OTP row that no email was ever going to announce.
+      await claimTestAccountDevice(H, pkHex);
+      return { ok: true };
+    }
 
     const pending = await DB.takeOtpAttempt(H);
     if (!pending) return { ok: false, reason: "no_code" };

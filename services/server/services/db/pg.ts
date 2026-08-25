@@ -16,8 +16,8 @@
 //     ordinary parameterised queries are fine. Do not add `name:` to a query.
 
 import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
-import * as fs from "fs";
 import { logger } from "../../lib/logger";
+import { tls, withoutSslMode } from "./ssl";
 
 // `max: 3` × five services = 15 client connections, which the 15-backend pool
 // absorbs because a transaction-mode pooler hands a backend to a statement
@@ -25,33 +25,16 @@ import { logger } from "../../lib/logger";
 // infra/database/variables.tf.
 const POOL_MAX = Number(process.env.PG_POOL_MAX) || 3;
 
-function ssl() {
-  const path = process.env.PGSSLROOTCERT;
-  // DigitalOcean requires TLS. With the cluster CA on disk we go further than
-  // its default `sslmode=require` (encrypted, but unauthenticated) and verify
-  // the certificate AND the hostname, so a redirected host fails the handshake
-  // instead of quietly serving.
-  //
-  // The file must be non-EMPTY, not merely present: the local/CI overlay mounts
-  // an empty placeholder (compose has no way to omit a secret one service in the
-  // stack does need), and an empty CA with rejectUnauthorized would fail every
-  // handshake rather than fall back.
-  const ca = path && fs.existsSync(path) ? fs.readFileSync(path, "utf8").trim() : "";
-  if (ca) return { ca, rejectUnauthorized: true };
-
-  // No CA: local development against a plain `postgres:17` container, which
-  // speaks no TLS at all. config.ts warns about this combination in production.
-  return false as const;
-}
-
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  // See ./ssl.ts for why the URI's own sslmode has to come off before the
+  // driver sees it.
+  connectionString: withoutSslMode(process.env.DATABASE_URL),
   max: POOL_MAX,
   // A pooled backend that has been idle this long is given back. Keeps a quiet
   // service from holding a scarce connection all night.
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
-  ssl: ssl(),
+  ssl: tls(),
 });
 
 // An idle client erroring (the cluster restarted, the pooler dropped us) emits

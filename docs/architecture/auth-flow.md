@@ -30,6 +30,27 @@ The entitlement is decided once, at the door, and **stored in the session**. No
 later request re-derives it: `/friends/invite` reads one column, not the
 subscription tables and certainly not Stripe.
 
+There is no door-less `/auth/init`. It was one endpoint once; anything still
+calling that path gets a 404, not a fallback.
+
+### The helper bot uses the paid door
+
+`bot/bot.ts` knocks on `/auth/paid/*`, which looks wrong — the bot pays nobody —
+and is nonetheless the only door that works for it.
+
+Admission is not the reason. The bot registers its own public key in
+`admission_exempt` at startup, so `checkAdmission` waves it through either door.
+The **scope** is the reason: the bot's job is accepting invites, and
+`POST /friends/accept` refuses a `free` session with 402 `PREMIUM_REQUIRED`. On
+the free door the bot would authenticate, report itself healthy, and silently
+never accept an invite again. The paid door also re-runs
+`regrantAllFriendTopics`, which is what restores the bot's conversation ACLs
+after a restart.
+
+So: exemption decides *whether* a caller gets in, the door decides *what it may
+then do*, and a privileged non-paying client needs the paid door for the second
+of those.
+
 ## The flow
 
 ```mermaid
@@ -130,6 +151,32 @@ plaintext.
 a million preimages; without a server-side secret in the hash, anyone reading a
 database dump inverts every pending code with a for-loop.
 
+### The test account
+
+One address short-circuits all of the above: `TEST_ACCOUNT_EMAIL`
+(`test@test.test` by default) links **any number of devices** with the fixed code
+`TEST_ACCOUNT_CODE` (`000000`), with no purchase behind it and no mail sent — the
+address is not deliverable and the code never changes. It exists because the
+claim screen is otherwise untestable without a card: App Review cannot buy a
+subscription, and a fresh preprod stack has no Stripe data in it.
+
+It lives alone in `services/subscription/test-account.ts` and touches the rest of
+the flow in exactly two places (`startClaim`, `verifyClaim`). The paid door knows
+nothing about it: the branch writes a real `subscriptions` row, so `isClaimed()`
+finds an active subscription the same way it would for a buyer.
+
+This is a **deliberate hole**, and both halves of it are in the public tree. What
+it grants is the premium *scope* and nothing more — every device still holds its
+own keypair and its own conversations — so the cost is a subscription that was
+not paid for, not a route into anyone's messages. Two things keep it honest:
+every boot with it enabled prints a config warning, and every new device that
+links this way mails `TEST_ACCOUNT_ALERT_TO`.
+
+Closing it is `TEST_ACCOUNT_EMAIL=` (empty) plus a restart. That stops new links
+only — a device bound earlier holds an ordinary claim row by then, and revoking
+it means cancelling the subscription and deleting the claims (the alert mail
+carries both statements).
+
 ## Why it is shaped like this
 
 **Two tokens, two jobs.** The MQTT token (12 h) is the credential that travels as
@@ -186,9 +233,13 @@ top for the MQTT leg.
 | `/auth/paid/init` returns 402 `NOT_CLAIMED` | no live subscription for this key — the client falls back to the free door, which is a normal signed-in state |
 | `/auth/*/init` returns 403 `NOT_ADMITTED` | an allowlist server that does not want this key. Retrying the other door asks the same question |
 | `/friends/invite` returns 402 `PREMIUM_REQUIRED` | a free session. The user must claim a subscription, then sign in again |
+| The subscribe button 302s and the browser does nothing | the page's CSP `form-action` does not permit the redirect target. It is enforced across redirects, so a cross-origin 302 out of a form POST needs the destination listed — see `CHECKOUT_ORIGIN` in `services/web/subscribe.ts`. The server log looks perfectly healthy |
+| The app reports "Couldn't reach the server (404)" on a claim | the client built the URL from the `/auth` prefix. `/claim/*` is served BY the auth service but mounted at the ROOT by nginx, so `/auth/claim/start` is a 404. `ServerConfig.claimBaseURL` is the origin for exactly this reason |
 | `/claim/start` returns 200 but no code arrives | either that address bought nothing, or mail is failing. The response cannot tell you which — check the server log, which can |
 | `/claim/verify` returns `NO_CODE` after wrong guesses | the code was burned at 5 attempts. Request a new one |
 | CONNACK returns code 5 (not authorised) | the MQTT token expired or was already consumed — refresh and reconnect |
 | `/auth/verify` returns 401 | the challenge expired (60 s) or the device holds the wrong key for that pk |
 | `/auth/refresh` returns 401 | the session lapsed — a full handshake is needed, and the user sees a prompt |
+| `/auth/init` returns 404, on repeat, from a service | that caller predates the two-door split and was never moved. There is no un-doored init path; pick `/auth/free/*` or `/auth/paid/*` by the scope the caller needs |
+| A service authenticates fine, then 402s on every write | it authenticated through the free door but needs `premium`. The door, not the admission exemption, is what to change |
 | Premium user suddenly cannot message friends | the subscription lapsed and the webhook revoked the topics. Resubscribing restores them on the next paid login |

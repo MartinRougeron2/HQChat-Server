@@ -33,6 +33,13 @@ COPY bot/ ./bot/
 
 # Drop privileges. `node` owns the workdir for the bot's runtime writes
 # (.bot-seed / .bot-state.json when no volume is mounted).
+# BOT_STATE_DIR must EXIST in the image. Docker initialises an empty named
+# volume from the image's directory at that path -- contents and ownership -- and
+# creates it root-owned when there is nothing there to copy. The bot runs as
+# `node`, so the volume it was given was one it could not write:
+#
+#   EACCES: permission denied, open '/app/bot-state/.bot-seed'
+RUN mkdir -p /app/bot-state
 RUN chown -R node:node /app
 USER node
 

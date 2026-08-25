@@ -56,7 +56,12 @@ in
     # Trust Cloudflare's ranges for CF-Connecting-IP. Same source of truth as
     # the firewall — one list, two consumers.
     commonHttpConfig = ''
-      server_tokens off;
+      # No `server_tokens off;` here. The nginx module emits it already (from
+      # services.nginx.serverTokens, which defaults to false), and a duplicate
+      # directive is fatal to nginx, not merely redundant:
+      #   nginx: [emerg] "server_tokens" directive is duplicate in nginx.conf:27
+      # which failed the pre-start config test, hit the restart limit, and left
+      # the host with no web server at all.
 
       limit_req_zone $binary_remote_addr zone=api:10m   rate=20r/s;
       limit_req_zone $binary_remote_addr zone=claim:10m rate=1r/s;

@@ -46,6 +46,18 @@ preconditions() {
   for c in ssh nix terraform; do
     command -v "$c" >/dev/null || die "$c is not installed. See from-scratch.md §0."
   done
+
+  # Installed is not the same as usable here. Every nix invocation below is
+  # `nix run` or `--flake`, and the installer from-scratch.md names enables
+  # neither experimental feature, so step 1 would die on its first command --
+  # after the confirm prompt, which reads as though the install had begun.
+  # `nix eval` is itself a nix-command subcommand, so it fails exactly when the
+  # feature is off.
+  if ! nix eval --expr '1' --impure >/dev/null 2>&1; then
+    die "nix is installed but its experimental features are not enabled.
+   \`nix run\` and \`--flake\` both need them:
+     mkdir -p ~/.config/nix && printf 'experimental-features = nix-command flakes\\n' >> ~/.config/nix/nix.conf"
+  fi
   [[ -d "$REPO_ROOT/infra/nixos" ]] || die "run this from a checkout of the repo (looked in $REPO_ROOT)"
 
   if grep -q REPLACE_ME_WITH_CACHE_PUBLIC_KEY "$REPO_ROOT/infra/nixos/modules/options.nix"; then
@@ -131,14 +143,22 @@ step_3() {
   info "and step 4 generates its credentials."
 
   cd "$REPO_ROOT/infra/database"
-  if [[ ! -d .terraform ]]; then
-    info "initialising the database module (needs AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
-    info "for the R2 state backend — the state token id, and sha256 of its value)"
-    terraform init -backend-config=backend.hcl
-  fi
+  # `-d .terraform` used to gate this, and a directory is not initialisation: an
+  # init that fails on credentials still leaves one behind holding `providers/`.
+  # After that this skipped init, `terraform output` had no backend to read, and
+  # the failure below blamed the From scratch workflow for state that was sitting
+  # exactly where it belonged. init is idempotent -- just run it.
+  info "initialising the database module (needs AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+  info "for the R2 state backend — the STATE token, the one scoped to your-tfstate-bucket)"
+  terraform init -input=false -backend-config=backend.hcl >/dev/null || die \
+    "terraform init failed. Almost always the R2 state credentials:
+   AWS_ACCESS_KEY_ID     the state token's Access Key ID
+   AWS_SECRET_ACCESS_KEY its Secret Access Key, i.e. sha256 of the token VALUE
+   Not the cache token — that one is scoped to a different bucket."
 
   terraform output -raw private_host >/dev/null 2>&1 \
-    || die "no database outputs — has the From scratch workflow run with apply:true and include_database:true?"
+    || die "initialised, but the state holds no database outputs — has the From
+   scratch workflow run with apply:true and include_database:true?"
 
   confirm "Write the four credential files to $PROD_IP?" || return 0
   for o in database_url database_url_direct pg_ca_cert emqx_pg; do

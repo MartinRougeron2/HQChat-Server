@@ -17,8 +17,8 @@
 # Overrides: EMQX_SSH_HOST, EMQX_SSH_USER, EMQX_STACK_DIR, EMQX_LOCAL_PORT.
 set -euo pipefail
 
-SSH_HOST="${EMQX_SSH_HOST:-chat.example.com}"
-SSH_USER="${EMQX_SSH_USER:-deploy}"
+SSH_HOST="${EMQX_SSH_HOST:-178.128.171.214}"
+SSH_USER="${EMQX_SSH_USER:-root}"
 STACK="prod"
 STACK_DIR_OVERRIDE=""
 MODE="tunnel"          # tunnel | status | password

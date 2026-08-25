@@ -27,17 +27,24 @@ CREATE UNLOGGED TABLE IF NOT EXISTS sessions (
   expires_at timestamptz NOT NULL
 );
 -- revokeAllSessions(pk) — logout, account deletion, a lapsed subscription.
-CREATE INDEX IF NOT EXISTS sessions_pk_idx ON sessions (pk);
+CREATE INDEX IF NOT EXISTS sessions_pk_idx ON sessions USING hash (pk);
 CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions (expires_at);
 
 -- ============================================================
 -- Fixed-window rate counters
 -- ============================================================
+-- `key` is not always short: auth/main.ts counts per public key, so
+-- `init:pk:{hex}` and `verify:fail:{hex}` carry a whole 14 kB key. Same
+-- treatment as the identity tables (001, section 0).
 CREATE UNLOGGED TABLE IF NOT EXISTS rate_counters (
-  key             text PRIMARY KEY,
+  key             text NOT NULL,
   n               integer NOT NULL DEFAULT 0,
   window_ends_at  timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS rate_counters_key_key
+  ON rate_counters (pk_digest(key));
+CREATE INDEX IF NOT EXISTS rate_counters_key_hash_idx
+  ON rate_counters USING hash (key);
 CREATE INDEX IF NOT EXISTS rate_counters_window_ends_at_idx
   ON rate_counters (window_ends_at);
 
@@ -58,10 +65,14 @@ CREATE INDEX IF NOT EXISTS otp_expires_at_idx ON otp (expires_at);
 -- HQC-KEM handshake challenges
 -- ============================================================
 CREATE UNLOGGED TABLE IF NOT EXISTS auth_challenges (
-  pk         text PRIMARY KEY,
+  pk         text NOT NULL,
   proof      text NOT NULL,
   expires_at timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS auth_challenges_pk_key
+  ON auth_challenges (pk_digest(pk));
+CREATE INDEX IF NOT EXISTS auth_challenges_pk_hash_idx
+  ON auth_challenges USING hash (pk);
 CREATE INDEX IF NOT EXISTS auth_challenges_expires_at_idx
   ON auth_challenges (expires_at);
 
@@ -70,10 +81,14 @@ CREATE INDEX IF NOT EXISTS auth_challenges_expires_at_idx
 -- ============================================================
 -- The opaque connect token, again by hash only.
 CREATE UNLOGGED TABLE IF NOT EXISTS mqtt_tokens (
-  pk         text PRIMARY KEY,
+  pk         text NOT NULL,
   token_hash text NOT NULL,
   expires_at timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS mqtt_tokens_pk_key
+  ON mqtt_tokens (pk_digest(pk));
+CREATE INDEX IF NOT EXISTS mqtt_tokens_pk_hash_idx
+  ON mqtt_tokens USING hash (pk);
 CREATE INDEX IF NOT EXISTS mqtt_tokens_expires_at_idx ON mqtt_tokens (expires_at);
 
 -- Single-use CONNECT nonces. `SET NX EX` becomes an INSERT that either takes the

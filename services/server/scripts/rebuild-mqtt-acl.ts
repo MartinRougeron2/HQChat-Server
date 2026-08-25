@@ -37,7 +37,7 @@ async function main() {
      )
      INSERT INTO mqtt_acl (pk, topic, action)
      SELECT pk, topic, action FROM grants
-     ON CONFLICT (pk, topic) DO UPDATE SET action = EXCLUDED.action
+     ON CONFLICT (pk_digest(pk), pk_digest(topic)) DO UPDATE SET action = EXCLUDED.action
      RETURNING pk`
   );
 
@@ -49,7 +49,7 @@ async function main() {
      SELECT pk, 'u/' || pk || '/presence', 'publish' FROM users
      UNION ALL
      SELECT pk, 'u/' || pk || '/inbox', 'all' FROM users
-     ON CONFLICT (pk, topic) DO UPDATE SET action = EXCLUDED.action
+     ON CONFLICT (pk_digest(pk), pk_digest(topic)) DO UPDATE SET action = EXCLUDED.action
      RETURNING pk`
   );
 

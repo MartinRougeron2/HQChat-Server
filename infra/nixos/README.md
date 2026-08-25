@@ -75,6 +75,7 @@ so hosts fetch over HTTPS from `cache.<zone>`:
 ```bash
 gh variable set NIX_CACHE_BUCKET --env production --body 'dissqus-nix-cache'
 gh variable set R2_ENDPOINT      --env production --body 'https://<account>.r2.cloudflarestorage.com'
+gh variable set R2_CACHE_ACCESS_KEY_ID     --env production   # that token's Access Key ID
 gh secret   set R2_CACHE_SECRET_ACCESS_KEY --env production   # write token for that bucket
 ```
 

@@ -18,6 +18,51 @@
       description = "Public hostname this origin serves behind Cloudflare.";
     };
 
+    # DigitalOcean serves NO DHCP. Its droplets get their addressing from a
+    # cloud-init config drive (`vdb`, iso9660 "config-2"), which is why the
+    # stock Ubuntu image comes up fine and why `networking.useDHCP = true`
+    # produced a host that booted, showed a login prompt, and answered nothing.
+    # The addresses are read off the droplet with `ip route; ip -4 addr show`.
+    net = {
+      publicV4 = lib.mkOption {
+        type = lib.types.str;
+        example = "203.0.113.10/20";
+        description = "Public address on eth0, WITH prefix length. Also `origin_ipv4` in infra/cloudflare and ORIGIN_IPV4 in CI.";
+      };
+      gatewayV4 = lib.mkOption {
+        type = lib.types.str;
+        example = "203.0.113.1";
+        description = "Default gateway for the public network.";
+      };
+      anchorV4 = lib.mkOption {
+        type = lib.types.str;
+        example = "10.16.0.6/16";
+        description = ''
+          The droplet's anchor address, also on eth0. DigitalOcean's metadata
+          service answers to it; dropping it costs nothing visible until
+          something asks 169.254.169.254 a question.
+        '';
+      };
+      vpcV4 = lib.mkOption {
+        type = lib.types.str;
+        example = "10.106.0.3/20";
+        description = ''
+          Address on eth1, the VPC interface. NOT optional: the managed Postgres
+          admits connections only from the VPC (infra/database trusted sources),
+          so a host without this boots, serves HTTP and cannot reach its
+          database.
+        '';
+      };
+      nameservers = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [
+          "67.207.67.2"
+          "67.207.67.3"
+        ];
+        description = "DigitalOcean's resolvers. Static addressing means declaring these too — otherwise the host has a network and still cannot resolve ghcr.io or the cache.";
+      };
+    };
+
     imageRepo = lib.mkOption {
       type = lib.types.str;
       default = "ghcr.io/YOUR-GITHUB-ACCOUNT/dissqus-server";
@@ -63,7 +108,7 @@
       type = lib.types.str;
       # Generated once by the bootstrap (see infra/nixos/README.md). The PUBLIC
       # half is safe to commit; the private half lives only in GitHub secrets.
-      default = "REPLACE_ME_WITH_CACHE_PUBLIC_KEY";
+      default = "hqcat-cache-1:dmAeHPrDW7ZxsaWxhxAIeSiX70ylFSFc4Qnv2iVgPDA=";
       example = "hqcat-cache-1:hqA1...=";
       description = ''
         Public half of the signing key CI uses. Nix refuses any store path that

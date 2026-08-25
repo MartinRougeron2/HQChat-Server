@@ -83,7 +83,7 @@ Still to do on THIS host (nothing of this goes into GitHub):
   1. Put the stack's secrets in /etc/hqcat/$STACK/secrets/ :
        stripe_secret_key  stripe_webhook_secret  resend_api_key
        otp_pepper         apns_key_p8
-     (openssl rand -hex 32 > /etc/hqcat/$STACK/secrets/otp_pepper)
+     (od -vAn -N32 -tx1 < /dev/urandom | tr -d ' \n' > /etc/hqcat/$STACK/secrets/otp_pepper)
   2. Put non-secret config in /etc/hqcat/$STACK/server.env (see .env.example).
   3. Install the Cloudflare Origin cert at /etc/ssl/cloudflare/origin.{pem,key}.
 

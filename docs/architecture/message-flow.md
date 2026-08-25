@@ -283,6 +283,50 @@ and `:176`. They carry HQC-KEM ciphertexts rather than message content:
 - **`aes`** — first contact. Each side encapsulates to the other's public key and
   publishes the ciphertext; both derive the same channel key from the two shared
   secrets. Neither side's contribution ever exists on the server.
+
+  **Both sides answer an offer, and neither answers an answer.** An `aes` frame
+  carrying `isReply: true` is an answer and is never replied to; anything else is
+  an offer and is answered whenever it still tells us something (the peer's
+  contribution changed, or we hold no channel key yet). Each side keeps the
+  ciphertext it sent — `myCt` in the bot, `myAESCiphertext` in the app — so a
+  re-offer re-sends the *same* encapsulation and the two settle on one key
+  instead of trading new secrets.
+
+  Both halves of that rule are load-bearing, and the asymmetry that used to exist
+  cost an outage. The bot answered every offer; the app answered only while it
+  held no seed of its own. So a bot whose state volume came up empty re-offered
+  into an app that would never reply: it could not derive the key, and dropped
+  every message that arrived — with no log, in either direction, indefinitely.
+  Answering unconditionally on both sides fixes the healing but reintroduces an
+  infinite ping-pong, which is what `isReply` exists to stop. See
+  `services/server/test/kem-handshake.test.ts`, which pins all four properties.
+
+  **And someone has to send the first offer.** That rule says what to do with an
+  `aes` frame; it says nothing about who publishes one, and for a while the
+  answer was "only the side that accepted the invite". Accepting grants BOTH
+  members their topics server-side
+  ([`api/main.ts` `/friends/accept`](../../services/server/api/main.ts)) and
+  **tells neither of them** — the acceptor syncs because it made the request, and
+  the inviter finds out on its next sync. There was no next sync: the app's
+  `refreshDirectory` ran on connect, on reconnect, on link-up, and on the iOS
+  foreground, so a Mac that stayed connected never ran one at all.
+
+  The acceptor therefore subscribed and published its offer into a topic with no
+  subscriber on it. MQTT drops that — there is nothing to queue for a client that
+  never subscribed, and `aes` is published unretained — and neither side ever
+  spoke again. Both contacts sat at "setting up" with both devices online.
+
+  `ChatSession.startDirectoryPoll` re-asks for the graph on a timer: 15s while
+  anyone lacks a channel, 60s otherwise. A poll is not the elegant answer — a
+  nudge on the peer's `u/<pk>/inbox` topic is, and the client already subscribes
+  to it — but it needs no new server plumbing, and it also removes the V0 wart
+  where an invite arriving while the app is open only appeared after a relaunch.
+
+  Re-offers back off per peer (0s, 15s, 30s, 60s, capped) because **an offer
+  costs the peer a biometric prompt**: answering one means decapsulating, which
+  reads their private key. `beginKeyBurstUnlock` covers a 20s burst, so offering
+  faster than that turns a stuck handshake into a Face ID treadmill on the other
+  device.
 - **`key_rotate`** — a Tier-1 epoch change, triggered every `ROTATE_AFTER_MESSAGES`
   by `noteMessageSentAndMaybeRotate`
   (`FriendService.swift:109`) or manually. Symmetric: each side sends exactly one

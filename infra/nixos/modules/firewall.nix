@@ -55,7 +55,32 @@ in
           ip6 saddr @cloudflare_v6 tcp dport { 80, 443 } accept
         }
 
-        chain forward { type filter hook forward priority filter; policy drop; }
+        # `policy drop` says this box is not a router, which is right -- but the
+        # chain had no rules at all, and every container's traffic is forwarded
+        # traffic. The daemon writes its own rules into the legacy `ip filter`
+        # table; this chain sees the same packets and dropped them, so the whole
+        # stack came up unable to reach anything:
+        #
+        #   [migrate] failed: connect ETIMEDOUT <private-db>:25060
+        #
+        # from a container, while the host itself reached that address fine.
+        # With br_netfilter loaded (docker loads it) this also covers
+        # container-to-container on one bridge, so pre-prod's postgres was
+        # equally unreachable from the services next to it.
+        chain forward {
+          type filter hook forward priority filter; policy drop;
+
+          ct state established,related accept
+          ct state invalid drop
+
+          # Anything leaving a docker bridge: the compose stack reaching the
+          # managed database over the VPC, GHCR, APNs, Stripe, and each other.
+          # Return traffic arrives on the `established` rule above, so nothing
+          # needs to be opened INTO a container -- nginx reaches them from the
+          # host, which is locally-originated and never forwarded.
+          iifname "docker0" accept
+          iifname "br-*" accept
+        }
         chain output  { type filter hook output  priority filter; policy accept; }
       }
     '';

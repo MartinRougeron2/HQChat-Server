@@ -13,7 +13,10 @@ variable "account_id" {
 variable "zone_name" {
   description = "The Cloudflare zone (apex domain)."
   type        = string
-  default     = "example.com"
+  # Deliberately no default. `example.com` was one, and when release.yml did not
+  # pass a value the plan came out as `chat.example.com` ->
+  # `chat.example.com`: a plan that, applied, would have retargeted every record
+  # in the module at a domain nobody owns. An unset zone must fail, not default.
 }
 
 variable "origin_ipv4" {
@@ -59,7 +62,8 @@ variable "manage_worker" {
 variable "worker_route_host" {
   description = "Host the legal pages are served on (overlays whatever already answers this host — e.g. the Vercel apex)."
   type        = string
-  default     = "example.com"
+  # No default, for the same reason as zone_name: a Worker route silently bound
+  # to example.com is a route that does nothing, on a zone that is not yours.
 }
 
 variable "worker_legal_paths" {

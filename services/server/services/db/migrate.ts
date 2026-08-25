@@ -16,6 +16,7 @@ import { Client } from "pg";
 import * as fs from "fs";
 import * as path from "path";
 import { logger } from "../../lib/logger";
+import { tls, withoutSslMode } from "./ssl";
 
 const DIR = path.join(__dirname, "migrations");
 
@@ -42,13 +43,13 @@ async function main() {
   const url = process.env.DATABASE_URL_DIRECT || process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL_DIRECT (or DATABASE_URL) is required");
 
-  const ca = process.env.PGSSLROOTCERT;
+  // TLS policy and the sslmode strip both live in ./ssl.ts, shared with pg.ts
+  // so the two cannot disagree about how this stack reaches its database.
   const client = new Client({
-    connectionString: url,
-    ssl: ca && fs.existsSync(ca)
-      ? { ca: fs.readFileSync(ca, "utf8"), rejectUnauthorized: true }
-      : false,
+    connectionString: withoutSslMode(url),
+    ssl: tls(),
   });
+
   await client.connect();
 
   // Whoever we connected as is the fallback for both roles, so a local

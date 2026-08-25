@@ -14,6 +14,7 @@ import { DB } from "../services/db/api";
 import { pgAvailable, closePg, NEEDS_PG } from "./pg-helper";
 import { setLogLevel } from "../lib/logger";
 import { SubscriptionService, emailHash, validEmail, DEVICE_CAP } from "../services/subscription/api";
+import { TEST_ACCOUNT_EMAIL } from "../services/subscription/test-account";
 
 // Set before anything hashes a code, so the test computes the same value the
 // service does. In production this is a deploy secret; here it only has to be
@@ -209,7 +210,83 @@ test("deleting an account releases its device slot but not the subscription", as
   assert.equal((await DB.getSubscription(emailHash(EMAIL)))?.state, "active");
 });
 
+// --- the test account -------------------------------------------------------
+// A deliberate hole in the paid door (services/subscription/test-account.ts).
+// These tests pin its EDGES: what it lets through is meant to be exactly one
+// address with exactly one code, and nothing about the real claim path may
+// loosen because it exists.
+
+const TEST_PK_A = "ee".repeat(64);
+const TEST_PK_B = "ef".repeat(64);
+
+test("the test account links a device with the fixed code and no subscription behind it", async (t) => {
+  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
+  await reset(TEST_ACCOUNT_EMAIL);
+
+  // Nothing was purchased and no code was planted: the whole point is that a
+  // reviewer with no card and no mailbox can still get through this screen.
+  assert.deepEqual(
+    await SubscriptionService.verifyClaim(TEST_ACCOUNT_EMAIL, "000000", TEST_PK_A),
+    { ok: true }
+  );
+  assert.equal(await SubscriptionService.isClaimed(TEST_PK_A), true);
+});
+
+test("the test account takes the fixed code and nothing else", async (t) => {
+  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
+  await reset(TEST_ACCOUNT_EMAIL);
+
+  assert.deepEqual(
+    await SubscriptionService.verifyClaim(TEST_ACCOUNT_EMAIL, "123456", TEST_PK_B),
+    { ok: false, reason: "bad_code" }
+  );
+  assert.equal(await SubscriptionService.isClaimed(TEST_PK_B), false);
+});
+
+test("the test account has no device cap", async (t) => {
+  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
+  await reset(TEST_ACCOUNT_EMAIL);
+
+  // Two past the cap a paying subscription would stop at — "linked to all
+  // devices" means the fourth tester is not the one who cannot open the app.
+  const pks = Array.from({ length: DEVICE_CAP + 2 }, (_, i) => "e" + String(i).repeat(127));
+  for (const pk of pks) {
+    assert.deepEqual(await SubscriptionService.verifyClaim(TEST_ACCOUNT_EMAIL, "000000", pk), { ok: true });
+  }
+  assert.equal((await DB.claimedDevices(emailHash(TEST_ACCOUNT_EMAIL))).length, DEVICE_CAP + 2);
+});
+
+test("a real address still cannot be claimed with the test account's code", async (t) => {
+  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
+  await reset(EMAIL);
+  await SubscriptionService.recordPurchase(EMAIL, CUSTOMER);
+
+  // No code planted, so this is the state a stranger typing 000000 is in.
+  assert.deepEqual(
+    await SubscriptionService.verifyClaim(EMAIL, "000000", PK_B),
+    { ok: false, reason: "no_code" }
+  );
+  assert.equal(await SubscriptionService.isClaimed(PK_B), false);
+});
+
+test("starting a claim for the test account is not throttled by the per-address limit", async (t) => {
+  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
+  await reset(TEST_ACCOUNT_EMAIL);
+  await DB.clearCounter(`claim:ip:5.6.7.8`);
+
+  // One shared address means the per-email counter would be a global choke on
+  // everyone testing at once. The per-IP one still applies, which is why each
+  // call here comes from its own address.
+  for (let i = 0; i < 5; i++) {
+    const r = await SubscriptionService.startClaim(TEST_ACCOUNT_EMAIL, `5.6.7.${i}`);
+    assert.deepEqual(r, { ok: true, sent: false }, `start ${i + 1} should not be rate limited`);
+  }
+});
+
 test.after(async () => {
-  if (await pgAvailable()) await reset(EMAIL);
+  if (await pgAvailable()) {
+    await reset(EMAIL);
+    await reset(TEST_ACCOUNT_EMAIL);
+  }
   await closePg();
 });

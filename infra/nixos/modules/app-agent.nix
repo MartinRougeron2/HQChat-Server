@@ -92,7 +92,21 @@ in
     "d /opt/hqcat/${cfg.stack} 0755 root root -"
     "d /var/lib/hqcat/${cfg.stack} 0700 root root -"
   ]
-  ++ map (n: "f /etc/hqcat/${cfg.stack}/secrets/${n} 0600 root root -") [
+  # Owned by 1000:1000, not root. Compose bind-mounts each of these to
+  # /run/secrets/<name> with the host's owner and mode intact, and every
+  # container that reads one runs as uid 1000 -- `node` in the server image,
+  # `emqx` in emqx/emqx:5.8, which happen to agree. Left as root:root the mode
+  # is 0600 against a process that is not root, so the first thing the stack
+  # does is:
+  #
+  #   config: DATABASE_URL_DIRECT_FILE=/run/secrets/database_url_direct could
+  #   not be read: EACCES: permission denied
+  #   [migrate] failed: DATABASE_URL_DIRECT (or DATABASE_URL) is required
+  #
+  # and the rollout halts on db-migrate. The mode stays 0600: this is ownership,
+  # not a loosening. Root still reads them; the containers now can too, and
+  # nothing else on the host runs as 1000 (there are no other users at all).
+  ++ map (n: "f /etc/hqcat/${cfg.stack}/secrets/${n} 0600 1000 1000 -") [
     # The database credentials. On prod they come from `terraform output` in
     # infra/database; on pre-prod set-host-secrets.sh generates them for the
     # postgres container that stack runs. Empty placeholders only: `f` creates
@@ -108,6 +122,22 @@ in
     "emqx_pg"
     # Pre-prod only (its postgres container reads it); harmless on prod, which
     # has no such service and never mounts it.
+    "pg_local_password"
+    "stripe_secret_key"
+    "stripe_webhook_secret"
+    "resend_api_key"
+    "apns_key_p8"
+    "otp_pepper"
+  ]
+  # `f` applies ownership only when it CREATES the file, and every secret on an
+  # existing host was written root-owned by set-host-secrets.sh before this
+  # changed. `z` adjusts what is already there, on every activation, so a host is
+  # corrected by a rebuild instead of by someone remembering to chown.
+  ++ map (n: "z /etc/hqcat/${cfg.stack}/secrets/${n} 0600 1000 1000 -") [
+    "database_url"
+    "database_url_direct"
+    "pg_ca_cert"
+    "emqx_pg"
     "pg_local_password"
     "stripe_secret_key"
     "stripe_webhook_secret"

@@ -231,18 +231,34 @@ async function api(method: string, path: string, body?: unknown): Promise<any> {
 }
 
 /**
+ * Which door of auth/main.ts the bot knocks on.
+ *
+ * The PAID door, not the free one. The bot is admission-exempt (registerExempt
+ * below), so both doors let it through — but the door decides the SCOPE the
+ * session carries, and a free scope is refused by `POST /friends/accept`
+ * (api/main.ts: `scope !== "premium"` → 402). Accepting invites is the bot's
+ * whole job, so the free door would authenticate it and then leave it unable to
+ * do that job. The paid door also re-grants its conversation topics on login,
+ * which is what restores the bot's MQTT ACLs after a restart.
+ *
+ * There is no plain `/auth/init` any more: the doors split in 0b10528 and the
+ * bot was not moved with them, which is the 404 it has been retrying against.
+ */
+const AUTH_DOOR = "/auth/paid";
+
+/**
  * The HQC-KEM handshake, over REST (auth/main.ts): the server encapsulates to
  * our public key, we decapsulate and return HKDF(ss,"auth") to prove we hold the
  * secret key. We never send ss or any decrypted plaintext. Yields a REST session
  * bearer plus the first (~5m) MQTT connect token.
  */
 async function handshake(): Promise<void> {
-  const init = await httpJson(`${AUTH_BASE}/auth/init`, { method: "POST", body: { pk: pkHex } });
+  const init = await httpJson(`${AUTH_BASE}${AUTH_DOOR}/init`, { method: "POST", body: { pk: pkHex } });
   if (init.status !== 200 || typeof init.body?.ct !== "string") {
-    throw new Error(`/auth/init → ${init.status}`);
+    throw new Error(`${AUTH_DOOR}/init → ${init.status}`);
   }
   const ss = hqcDecapsulate(sk, Buffer.from(init.body.ct, "base64"));
-  const verify = await httpJson(`${AUTH_BASE}/auth/verify`, {
+  const verify = await httpJson(`${AUTH_BASE}${AUTH_DOOR}/verify`, {
     method: "POST",
     body: { pk: pkHex, solution: authProof(ss).toString("base64") },
   });
@@ -252,7 +268,7 @@ async function handshake(): Promise<void> {
     throw new Error(`not admitted (${verify.status}) — the admission exemption did not stick`);
   }
   if (verify.status !== 200 || typeof verify.body?.sessionToken !== "string") {
-    throw new Error(`/auth/verify → ${verify.status}`);
+    throw new Error(`${AUTH_DOOR}/verify → ${verify.status}`);
   }
   sessionToken = verify.body.sessionToken;
   mqttToken = String(verify.body.mqttToken || "");
@@ -366,6 +382,10 @@ interface Envelope {
   messageId?: string;
   epoch?: number;
   idx?: number;
+  /** Set on an `aes` frame that ANSWERS an offer, so it is not answered back.
+   *  Absent on an offer, and on anything sent by a peer predating this field —
+   *  which reads as an offer, the safe default (it may be answered once). */
+  isReply?: boolean;
 }
 
 function publish(peerPk: string, envelope: Envelope) {
@@ -377,8 +397,23 @@ function publish(peerPk: string, envelope: Envelope) {
 
 function subscribeConversation(peerPk: string) {
   if (!client?.connected) return; // (re)subscribed wholesale on CONNACK
-  client.subscribe(convoTopic(peerPk), { qos: 1 }, (err) => {
-    if (err) logger.error(`🤖 [bot] subscribe ${label(peerPk)}: ${err.message}`);
+  client.subscribe(convoTopic(peerPk), { qos: 1 }, (err, granted) => {
+    if (err) {
+      logger.error(`🤖 [bot] subscribe ${label(peerPk)}: ${err.message}`);
+      return;
+    }
+    // A broker that REFUSES a subscription does not produce an error: MQTT
+    // returns it in the SUBACK as granted QoS 0x80, and mqtt.js reports that in
+    // `granted` with `err` null. Checking only `err` meant an ACL denial looked
+    // exactly like success — the bot would sit there, subscribed to nothing,
+    // answering nobody, with a clean log.
+    const refused = (granted ?? []).some((g) => g.qos === 128);
+    if (refused) {
+      logger.error(
+        `🤖 [bot] subscribe REFUSED for ${label(peerPk)} on ${convoTopic(peerPk)} — ` +
+        `the EMQX ACL has no grant for this pair (mqtt_acl); nothing will be received`
+      );
+    }
   });
 }
 
@@ -475,12 +510,22 @@ async function onEnvelope(topic: string, raw: Buffer) {
       try {
         // Decapsulate the peer's KEM ciphertext → the shared secret they contributed.
         const peerSs = hqcDecapsulate(sk, Buffer.from(String(env.payload), "base64"));
-        f.peerSeed = peerSs.toString("hex");
-        // (Re)send OUR encapsulation so the peer can derive too. sendAesSeed reuses
-        // our stored ciphertext (f.myCt) if present, so on a re-handshake we resend
-        // the SAME encapsulation rather than a new one — both sides stay on one key.
-        // The peer only replies while it has no secret of its own, so this can't loop.
-        sendAesSeed(sender);
+        const incoming = peerSs.toString("hex");
+        // Answer anything that is not itself an answer, and only while it still
+        // tells us something new. Both halves are load-bearing:
+        //
+        //   - answering an OFFER unconditionally is what heals a peer that lost
+        //     its state. The old rule here answered everything, and the app's
+        //     answered only when it held no seed of its own — so an app that had
+        //     one never replied, and a bot with a fresh state volume could never
+        //     derive the key. It dropped every message, silently, for good.
+        //   - never answering an ANSWER is what stops the two sides trading
+        //     frames forever once both of them answer offers.
+        const advanced = f.peerSeed !== incoming || !f.sharedKey;
+        f.peerSeed = incoming;
+        // sendAesSeed reuses our stored ciphertext (f.myCt), so a re-handshake
+        // resends the SAME encapsulation and both sides stay on one key.
+        if (env.isReply !== true && advanced) sendAesSeed(sender, /* isReply */ true);
         if (f.mySeed && f.peerSeed) {
           const key = deriveSharedKey(Buffer.from(f.mySeed, "hex"), Buffer.from(f.peerSeed, "hex"));
           f.sharedKey = key.toString("hex");
@@ -511,7 +556,22 @@ async function onEnvelope(topic: string, raw: Buffer) {
           text = aesDecrypt(aesB64, mk);
           saveState();
         } else {
-          if (!f.sharedKey) break;
+          if (!f.sharedKey) {
+            // The peer thinks we share a channel and we do not — our side of
+            // the key agreement is missing (lost state, or a handshake that
+            // never completed). This used to be a bare `break`: the message
+            // vanished with no log at any level, which is precisely why "the
+            // bot stopped answering" came with nothing to go on.
+            logger.error(
+              `🤖 [bot] message from @${label(sender)} with no shared key — ` +
+              `key agreement incomplete (mySeed=${!!f.mySeed}, peerSeed=${!!f.peerSeed}); re-offering`
+            );
+            // Ask for their half again. Throttled to once per HANDSHAKE_RETRY_MS,
+            // so a peer that cannot answer does not turn every message into a
+            // publish. A peer that CAN answer heals the channel from here.
+            maybeOfferSeed(sender);
+            break;
+          }
           text = aesDecrypt(aesB64, Buffer.from(f.sharedKey, "hex"));
         }
         const answer = reply(text);
@@ -627,7 +687,7 @@ function bumpAndMaybeRotate(peerPk: string, f: FriendState) {
 }
 
 // ── Crypto-aware senders ─────────────────────────────────────────────────────
-function sendAesSeed(peerPk: string) {
+function sendAesSeed(peerPk: string, isReply = false) {
   const f = state.friends[peerPk];
   if (!f?.pk) return;
   // Encapsulate ONCE and remember (ss, ct). Re-sends reuse the stored ciphertext
@@ -638,7 +698,7 @@ function sendAesSeed(peerPk: string) {
     f.myCt = ct.toString("base64");
     saveState();
   }
-  publish(peerPk, { type: "aes", sender: pkHex, payload: f.myCt });
+  publish(peerPk, { type: "aes", sender: pkHex, payload: f.myCt, ...(isReply ? { isReply: true } : {}) });
 }
 
 /** The first thing a new user ever receives. The server auto-friends the bot to
@@ -683,6 +743,8 @@ function sendMessage(peerPk: string, text: string) {
       type: "message",
       sender: pkHex,
       payload: aesEncrypt(text, mk),
+      // nosemgrep: javascript.node-stdlib.cryptography.crypto-insecure-random.crypto-insecure-random
+      // A message identifier, not key material — and randomUUID is a CSPRNG already.
       messageId: crypto.randomUUID(),
       epoch: f.cur.epoch,
       idx: f.cur.sendIdx,
@@ -699,6 +761,8 @@ function sendMessage(peerPk: string, text: string) {
     type: "message",
     sender: pkHex,
     payload: aesEncrypt(text, Buffer.from(f.sharedKey, "hex")),
+    // nosemgrep: javascript.node-stdlib.cryptography.crypto-insecure-random.crypto-insecure-random
+    // A message identifier, not key material — and randomUUID is a CSPRNG already.
     messageId: crypto.randomUUID(),
   });
   bumpAndMaybeRotate(peerPk, f);
