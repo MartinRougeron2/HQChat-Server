@@ -60,16 +60,23 @@ variable "manage_worker" {
 }
 
 variable "worker_route_host" {
-  description = "Host the legal pages are served on (overlays whatever already answers this host — e.g. the Vercel apex)."
+  description = "Host the site is served on. This is the APP host (hqchat.<zone>), which also answers the API — not the apex, which belongs to an unrelated site."
   type        = string
   # No default, for the same reason as zone_name: a Worker route silently bound
   # to example.com is a route that does nothing, on a zone that is not yours.
 }
 
-variable "worker_legal_paths" {
-  description = "Exact paths routed to the Worker. Intentionally NOT '/' so a shared apex (Vercel) keeps serving its homepage."
+variable "worker_paths" {
+  description = "Exact paths routed to the Worker. NEVER '/*' — this host also serves the API, and a glob would swallow /auth, /mqtt, /subscribe and /health."
   type        = list(string)
-  default     = ["/privacy", "/terms", "/support"]
+  default     = ["/", "/crypto", "/privacy", "/terms", "/support"]
+
+  validation {
+    # "/" is a single exact path and is fine. A wildcard is not: it would put the
+    # marketing Worker in front of every API request on this host.
+    condition     = alltrue([for p in var.worker_paths : !strcontains(p, "*")])
+    error_message = "worker_paths must be exact paths. A '*' here routes the API to the marketing Worker."
+  }
 }
 
 # SHARED ZONE GUARDRAILS — example.com also hosts Vercel/backend/bbia/yt +
@@ -88,14 +95,14 @@ variable "manage_security_rules" {
 }
 
 variable "worker_name" {
-  description = "Name of the marketing/legal Worker script (matches apps/web/wrangler.toml so TF adopts the existing one)."
+  description = "Name of the marketing/legal Worker script. Changing it forces replacement — see workers.tf before you do."
   type        = string
   default     = "dissqus-home"
 }
 
 variable "worker_compatibility_date" {
   type    = string
-  default = "2025-01-01" # matches apps/web/wrangler.toml
+  default = "2025-01-01" # matches apps/site/wrangler.toml
 }
 
 # --- PRO-plan features ------------------------------------------------------

@@ -37,16 +37,20 @@ async function login(): Promise<string> {
 }
 
 /** One admin call, re-authenticating once on 401 so an expired token self-heals. */
-async function call(method: string, path: string, retry = true): Promise<Response> {
+async function call(method: string, path: string, body?: unknown, retry = true): Promise<Response> {
   if (!token) token = await login();
   const res = await fetch(`${API}/${path}`, {
     method,
-    headers: { authorization: `Bearer ${token}` },
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(5000),
   });
   if (res.status === 401 && retry) {
     token = null;
-    return call(method, path, false);
+    return call(method, path, body, false);
   }
   return res;
 }
@@ -102,5 +106,50 @@ export const EMQX = {
   /** Both members of a friendship, off the shared topic. */
   async revokeTopic(pkA: string, pkB: string, topic: string): Promise<void> {
     await Promise.all([EMQX.unsubscribe(pkA, topic), EMQX.unsubscribe(pkB, topic)]);
+  },
+
+  /**
+   * Tell these clients their friend graph changed, so they pull it now instead
+   * of on their next poll.
+   *
+   * The graph is the one piece of state the server owns and the client can only
+   * learn by asking. Nothing pushed it, so every change waited on a 60-second
+   * timer — which is why an invite needed a manual refresh to appear, and why an
+   * `init` from a freshly accepted contact could arrive before the recipient had
+   * any idea who the sender was. The frame named a client id the recipient's
+   * directory did not contain yet, so it was dropped.
+   *
+   * A nudge carries NOTHING but the fact that something changed. It travels on a
+   * topic the owner alone may subscribe to, and the client answers it by calling
+   * the same authenticated `/friends` it always did — so this adds no way to
+   * learn anything that endpoint would not already tell that caller, and a
+   * spoofed nudge costs one directory fetch.
+   *
+   * Not retained: a client that was offline pulls the directory on connect
+   * anyway, so a retained nudge would only make every reconnect do it twice.
+   *
+   * Best-effort by design. Every caller is a state change that has ALREADY been
+   * committed; failing to announce it costs latency, not correctness, because
+   * the poll is still there underneath.
+   */
+  async notifyGraphChanged(ids: string[]): Promise<void> {
+    if (!EMQX.enabled) return;
+    await Promise.all(ids.filter(Boolean).map(async (id) => {
+      try {
+        const res = await call("POST", "publish", {
+          topic: `u/${id}/graph`,
+          payload: JSON.stringify({ t: "graph" }),
+          qos: 1,
+          retain: false,
+        });
+        // 202 is EMQX's "accepted, but no subscriber right now" — the ordinary
+        // answer for an offline client, and not a failure.
+        if (!res.ok && res.status !== 202) {
+          logger.warn(`[emqx] graph nudge ${id.slice(0, 12)}… → ${res.status}`);
+        }
+      } catch (e) {
+        logger.warn(`[emqx] graph nudge failed for ${id.slice(0, 12)}…: ${(e as Error).message}`);
+      }
+    }));
   },
 };

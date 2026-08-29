@@ -5,16 +5,24 @@
 // metadata only — never plaintext.
 //
 // Presence is learned purely over MQTT (no EMQX API key needed): clients publish
-// a RETAINED `u/{pk}/presence` = {"s":"online"} on connect and set an LWT
+// a RETAINED `u/{id}/presence` = {"s":"online"} on connect and set an LWT
 // {"s":"offline"} so a drop flips them offline. The bridge tracks this in-memory
 // from the `u/+/presence` wildcard (each replica sees all presence). The message
 // subscription is SHARED (`$share/…`) so replicas split the fan-in.
 //
+// ⚠️ This file PARSES topics, which makes it the one service that would keep
+// working while being wrong if the topic scheme changed under it. `{id}` here is
+// the client id — sha256(hex(pk)), 64 hex characters — and the `online` set,
+// `getHashMembers` and `ApnsService.send` are all keyed on that same value.
+// Extracting one form and looking up the other would produce a bridge that
+// never wakes anybody and never logs an error.
+//
 // It authenticates to EMQX with the privileged internal credential, which the
 // auth server's /mqtt/authn grants superuser (bypassing the per-topic ACL).
 
-// Must be first: loads .env + resolves *_FILE secrets before anything reads env.
-import "../lib/config";
+// Must be first: importing it loads .env + resolves *_FILE secrets before
+// anything reads env. `assertConfig` is called below, once the log sink is up.
+import { assertConfig } from "../lib/config";
 import { initObservability } from "../lib/observability";
 initObservability("push-bridge");
 import { healthMonitor } from "../lib/health-monitor";
@@ -22,7 +30,34 @@ import { logger } from "../lib/logger";
 import * as http from "http";
 import mqtt from "mqtt";
 import { DB } from "../services/db/api";
-import { ApnsService } from "../services/apns/api";
+import { ApnsService, keyProblem, type SendOutcome } from "../services/apns/api";
+import { apnsGaps, apnsIntended, apnsSummary } from "../lib/apns-config";
+
+// The one service that sends a push is the one that validates APNs. That used
+// to be nobody: `assertConfig` was called by auth and app-api — neither of which
+// is mounted the .p8 — and never here, so a half-configured or entirely absent
+// APNs setup produced a bridge that booted cleanly and woke no one, forever.
+//
+// It warns rather than exits (see lib/config.ts): waking nobody is what both a
+// half-config and no config do, and only one of those also crash-loops the
+// container. What this service adds is the escalation — an INTENDED but broken
+// APNs setup is a deploy mistake somebody is waiting on, so it goes to
+// logger.error and therefore to Sentry, once, at boot.
+assertConfig(["apns"]);
+const keyIssue = keyProblem();
+if (keyIssue && apnsIntended(process.env) && !apnsGaps(process.env).includes("APNS_KEY_P8")) {
+  // The key is present and unusable — a different failure from a missing one,
+  // and the only one that used to reach the log as an OpenSSL stack trace.
+  logger.error(`[push-bridge] APNs key is unusable: ${keyIssue}. No device will be woken.`);
+}
+if (apnsGaps(process.env).length && apnsIntended(process.env)) {
+  logger.error(
+    `[push-bridge] ${apnsSummary(process.env)}. An APNs key is present but the rest ` +
+    `is not, so every wake will be dropped in silence. The credentials are secrets; ` +
+    `APNS_KEY_ID / APNS_TEAM_ID / APNS_TOPIC_IOS / APNS_TOPIC_MACOS / APNS_ENV are not ` +
+    `and belong in server.env. scripts/check-push.ts reports the full picture.`
+  );
+}
 
 const PORT = Number(process.env.PORT || 8080);
 const EMQX_URL = process.env.EMQX_URL || "ws://emqx:8083/mqtt";
@@ -30,7 +65,8 @@ const INTERNAL_MQTT_USER = process.env.INTERNAL_MQTT_USER || "svc-internal";
 const INTERNAL_MQTT_SECRET = process.env.INTERNAL_MQTT_SECRET || "";
 const SHARE_GROUP = process.env.PUSH_SHARE_GROUP || "pushbridge";
 
-// In-memory presence, kept current from retained/LWT `u/{pk}/presence` messages.
+// In-memory presence by client id, kept current from retained/LWT
+// `u/{id}/presence` messages.
 const online = new Set<string>();
 
 // --- Health endpoint (compose healthcheck) ---------------------------------
@@ -65,6 +101,10 @@ const client = mqtt.connect(EMQX_URL, {
 
 client.on("connect", () => {
   logger.startup(`📨 push-bridge connected to EMQX at ${EMQX_URL}`);
+  // Said on every connect, not just at boot: this line is the answer to "why
+  // did my phone not buzz", and it should be in the log the operator is already
+  // reading rather than one they have to go find.
+  logger.startup(`📨 ${apnsSummary(process.env)}`);
   // Presence: every user (unshared so this replica sees all of them).
   client.subscribe("u/+/presence", { qos: 0 });
   // Conversation fan-in: SHARED so replicas split the load; QoS1 for reliability.
@@ -76,31 +116,103 @@ client.on("reconnect", () => logger.warn("[push-bridge] reconnecting to EMQX…"
 
 client.on("message", async (topic, payload) => {
   try {
-    // Presence update: u/{pk}/presence
-    const pres = topic.match(/^u\/([^/]+)\/presence$/);
+    // Presence update: u/{id}/presence
+    //
+    // The id pattern is spelled out rather than left as `[^/]+`: a topic that
+    // does not carry a well-formed id is one this bridge would happily add to
+    // `online` under a name nothing else uses, and the only symptom would be a
+    // device that stops being woken.
+    const pres = topic.match(/^u\/([0-9a-f]{64})\/presence$/);
     if (pres && pres[1]) {
-      const pk = pres[1];
+      const id = pres[1];
       const s = payloadState(payload);
-      if (s === "online") online.add(pk);
-      else online.delete(pk); // "offline" or a cleared retained message
+      if (s === "online") online.add(id);
+      else online.delete(id); // "offline" or a cleared retained message
       return;
     }
 
     // Conversation message: c/{hash} → wake offline members.
-    const convo = topic.match(/^c\/([0-9a-f]+)$/);
+    const convo = topic.match(/^c\/([0-9a-f]{64})$/);
     if (convo && convo[1]) {
       const hash = convo[1];
+      // Ids, same as `online` holds and same as ApnsService keys push tokens on.
       const members = await DB.getHashMembers(hash);
-      for (const pk of members) {
-        if (online.has(pk)) continue; // sender is online; recipients online skip
+      if (members.length === 0) {
+        // The bridge parses a topic the broker authorized, so an unknown hash
+        // means the friendship row and the topic scheme disagree — the exact
+        // silent-and-wrong failure this file's header warns about. Once per
+        // hash: it would otherwise repeat for every message in a conversation
+        // that is going to keep having them.
+        sayOnce(`hash:${hash}`,
+                `[push-bridge] no friendship row for ${short(hash)} — nobody to wake. ` +
+                `The topic scheme and friendships.hash disagree.`);
+        return;
+      }
+      for (const id of members) {
+        // The sender is online and skipped here too: that is not a special case,
+        // it is the same rule.
+        if (online.has(id)) continue;
         // Content-free wake — the payload is ciphertext and never inspected.
-        ApnsService.send(pk, "New message", "You have a new message");
+        const outcome = await ApnsService.send(id, "New message", "You have a new message");
+        report(id, outcome);
       }
     }
   } catch (e) {
     logger.error(`[push-bridge] handling ${topic}: ${(e as Error).message}`);
   }
 });
+
+/** Ids are 64 hex characters and unreadable at full length; 8 is enough to
+ *  correlate a line with `check-push` output without putting a whole identifier
+ *  in a log file. */
+function short(id: string): string {
+  return `${id.slice(0, 8)}…`;
+}
+
+// A wake failure repeats on every single message, so each reason is said once
+// and then kept quiet — otherwise the one line worth reading is buried under
+// thousands of copies of itself.
+//
+// Deploy mistakes are the SAME for every account, so they are deduplicated
+// globally rather than per id: `no-config` on ten thousand users is one fact,
+// not ten thousand. Per-device failures keep their id.
+const said = new Set<string>();
+
+/** Warn the first time this key is seen, and never again. */
+function sayOnce(key: string, message: string): void {
+  if (said.has(key)) return;
+  said.add(key);
+  logger.warn(message);
+}
+
+/** Log what became of one wake, without drowning the log in repeats. */
+function report(id: string, outcome: SendOutcome): void {
+  switch (outcome) {
+    case "sent":
+      logger.debug(`[push-bridge] woke ${short(id)}`);
+      return;
+    case "no-token":
+      // Ordinary: a peer who has never opened the app on a device that
+      // registered, or a macOS-only account. Nothing to fix.
+      logger.debug(`[push-bridge] ${short(id)} is offline and has no push token`);
+      return;
+    case "bad-key":
+    case "no-config":
+    case "no-topic-ios":
+    case "no-topic-macos":
+      // Not about this account — it is the same for everyone. Say it once,
+      // globally, and point at the fix.
+      sayOnce(outcome,
+              `[push-bridge] waking NOBODY: ${outcome}. ${apnsSummary(process.env)} — ` +
+              `run scripts/check-push.ts for the full report.`);
+      return;
+    case "rejected":
+    case "error":
+      // These are per-device: a token Apple refuses belongs to one install.
+      sayOnce(`${id}:${outcome}`, `[push-bridge] could not wake ${short(id)}: ${outcome}`);
+      return;
+  }
+}
 
 /** Parse a presence payload → "online" | "offline". Empty/cleared retained = offline. */
 function payloadState(payload: Buffer): "online" | "offline" {

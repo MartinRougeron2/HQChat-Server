@@ -117,6 +117,9 @@ services:
     command: ["node", "--import", "tsx", "services/db/migrate.ts"]
     restart: "no"
     env_file:
+      # Bundle defaults from GitHub variables first, host config second —
+      # compose lets the later file win, so the host always overrides.
+      - release.env
       - server.env
     environment:
       NODE_ENV: production
@@ -169,6 +172,9 @@ services:
     # under the read-only rootfs. See the Dockerfile CMD for the rationale.
     command: ["node", "--import", "tsx", "bot/bot.ts"]
     env_file:
+      # Bundle defaults from GitHub variables first, host config second —
+      # compose lets the later file win, so the host always overrides.
+      - release.env
       - server.env
     environment:
       NODE_ENV: production
@@ -332,6 +338,9 @@ services:
         condition: service_completed_successfully
     command: ["node", "--import", "tsx", "auth/main.ts"]
     env_file:
+      # Bundle defaults from GitHub variables first, host config second —
+      # compose lets the later file win, so the host always overrides.
+      - release.env
       - server.env
     environment:
       NODE_ENV: production
@@ -394,6 +403,9 @@ services:
         condition: service_started
     command: ["node", "--import", "tsx", "api/main.ts"]
     env_file:
+      # Bundle defaults from GitHub variables first, host config second —
+      # compose lets the later file win, so the host always overrides.
+      - release.env
       - server.env
     environment:
       NODE_ENV: production
@@ -462,6 +474,9 @@ services:
         condition: service_started
     command: ["node", "--import", "tsx", "push/main.ts"]
     env_file:
+      # Bundle defaults from GitHub variables first, host config second —
+      # compose lets the later file win, so the host always overrides.
+      - release.env
       - server.env
     environment:
       NODE_ENV: production
@@ -518,6 +533,9 @@ services:
         condition: service_completed_successfully
     command: ["node", "--import", "tsx", "ops/broker-watch.ts"]
     env_file:
+      # Bundle defaults from GitHub variables first, host config second —
+      # compose lets the later file win, so the host always overrides.
+      - release.env
       - server.env
     environment:
       NODE_ENV: production

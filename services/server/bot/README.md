@@ -1,7 +1,7 @@
 # The helper bot
 
 `@helper` is the account every new user starts with. It is an ordinary protocol
-client — HQC auth, the AES secure-channel handshake, HQC+AES message crypto — so
+client — HQC auth, the v2 prekey handshake, and the KEM double ratchet — so
 its replies are end-to-end encrypted exactly like anyone else's and the server
 can no more read them than it can read yours.
 

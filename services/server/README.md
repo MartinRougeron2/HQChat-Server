@@ -29,7 +29,7 @@ droplet in pre-prod, described in [`infra/database`](../../infra/database/README
 Neither runs from this repo.
 
 `legacy/` is the retired single-WebSocket monolith. It does not run; it is kept
-for its end-to-end tests. See [legacy/README.md](legacy/README.md).
+for its end-to-end tests. See legacy/README.md.
 
 ## Running it
 

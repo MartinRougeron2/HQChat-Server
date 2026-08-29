@@ -33,9 +33,14 @@ localhost port (emqx `8083`, auth `8090`, app-api `8091`).
 Prereqs you provide: a **VPS/VM** (Linux x86_64, Ubuntu 24.04), Docker + the
 compose plugin, a **domain** on Cloudflare, and your **live Stripe keys**.
 
-> **The model in one line:** GitHub is the single source of truth for secrets,
-> CI builds the image once and pushes it to **GHCR**, and the VM **pulls** it and
-> **materializes secrets** from GitHub at deploy time. See
+> **The model in one line:** CI builds the image once and pushes it to **GHCR**,
+> the VM **pulls** it, and nothing in GitHub can reach a server. **Secrets** live
+> on the host that uses them and never enter GitHub; **non-secret config** lives
+> in GitHub repository variables and rides to the host inside the release bundle,
+> where `/etc/hqcat/<stack>/server.env` can still override it. (This line used to
+> say GitHub was the source of truth for *secrets* and that the VM materialized
+> them from GitHub at deploy time — that was the pre-agent model, and had been
+> false since it was retired.) See
 > [ARCHITECTURE.md](../architecture/overview.md) for the full picture. The manual steps below
 > are the **first-time VM bootstrap**. **Pre-prod** deploys automatically on push
 > to `preprod`. **Production is human-gatekept** — push to `main` builds the image,
@@ -115,6 +120,20 @@ The server **fails fast at boot** (`assertConfig()`) if required settings are
 missing for the chosen `ADMISSION_POLICY`, so a half-configured box won't run.
 
 ## 3. Bring up the stack
+
+> **One-off, for the `004_identity_by_hash` release: restart EMQX after the
+> migration.** Clients are named by `sha256(hex(pk))` from that migration onward,
+> and the broker's authorization cache holds entries keyed on the OLD clientids
+> for `15m` (`emqx.conf`). A cached grant for a name nothing uses any more is
+> fifteen minutes of every client being refused on every topic, and with
+> `deny_action = disconnect` that is a connect/drop loop, not an error message.
+> `docker compose restart emqx` clears it immediately.
+>
+> The same release drops and recreates the identity tables — **users
+> re-register**, and existing friendships and usernames do not survive. Paid
+> subscriptions do (they are keyed by email hash), but each device re-links with
+> the code flow. See the migration's own header for why a backfill was not the
+> answer.
 
 You do not run `docker compose` by hand, and the VM never builds. The agent does
 it, from the stack directory it extracted out of the released image:
@@ -423,10 +442,33 @@ and its helper scripts stay current with no action from you.
 
 ### GitHub config
 
-The app secrets that used to live in GitHub Environments are no longer read by
-anything — **delete them** once the hosts have their own copies:
+The app **secrets** that used to live in GitHub Environments are no longer read
+by anything — **delete them** once the hosts have their own copies:
 `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `RESEND_API_KEY`, `OTP_PEPPER`,
-`APNS_KEY_P8`, `BOT_SEED`, and all four `DEPLOY_*`. The database credentials
+`APNS_KEY_P8`, `BOT_SEED`, and all four `DEPLOY_*`. A live APNs `.p8` or Stripe
+key sitting in a GitHub Environment is production key material readable by anyone
+who can add a workflow — the exposure this model was built to remove.
+
+Non-secret **variables** are the opposite: GitHub is where they belong. The
+release workflow bakes an explicit list into `infra/deploy/release.env`, which
+ships in the deploy bundle and reaches every host on its next rollover:
+
+```
+APNS_KEY_ID  APNS_TEAM_ID  APNS_TOPIC_IOS  APNS_TOPIC_MACOS  APNS_ENV  SENTRY_DSN
+```
+
+`SENTRY_DSN` is one value for all six server services — `initObservability()`
+tags each event with its component, and `SENTRY_ENVIRONMENT` (per stack, in
+compose) separates prod from preprod. A DSN can only *send*, so it is not a
+secret. It ships inside the image, though: if the GHCR package is public, put it
+in the host's `server.env` instead of a GitHub variable.
+
+**Repository-level, not Environment-level.** One image is built and then promoted
+to both `:preprod` and `:prod`, so it cannot carry an Environment's values — and
+putting `environment: production` on the build job would gate every build behind
+prod's protection rules. Anything that genuinely differs per stack goes in that
+host's `server.env`, which compose reads *after* `release.env` and which therefore
+wins — `APNS_ENV=sandbox` on a pre-prod box, for instance. The database credentials
 were never in GitHub and must not be put there: they go from `terraform output`
 straight to the host.
 
@@ -440,7 +482,8 @@ prod IP is configured — `DEPLOY_HOST` used to hold the same value separately.
 
 ```bash
 systemctl list-timers hqcat-agent.timer   # when the next poll is
-systemctl start hqcat-agent.service       # poll now
+systemctl start hqcat-agent.service       # poll now (no-op if the digest hasn't moved)
+/opt/hqcat/<stack>/agent/hqcat-agent --reapply   # after editing server.env
 journalctl -u hqcat-agent.service -n 100  # what it did
 cat /var/lib/hqcat/prod/current           # digest currently deployed
 cat /var/lib/hqcat/prod/history           # every rollout, timestamped

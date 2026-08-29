@@ -107,6 +107,7 @@ services:
 
   bot:
     env_file: !override
+      - release.env
       - preprod/server.env
     environment:
       # Tag Sentry events from this stack as "preprod" so they don't mix with prod.
@@ -114,12 +115,14 @@ services:
 
   auth:
     env_file: !override
+      - release.env
       - preprod/server.env
     environment:
       SENTRY_ENVIRONMENT: preprod
 
   app-api:
     env_file: !override
+      - release.env
       - preprod/server.env
     environment:
       ADMISSION_POLICY: open
@@ -127,6 +130,7 @@ services:
 
   push-bridge:
     env_file: !override
+      - release.env
       - preprod/server.env
     environment:
       SENTRY_ENVIRONMENT: preprod
@@ -134,6 +138,7 @@ services:
 
   broker-watch:
     env_file: !override
+      - release.env
       - preprod/server.env
     environment:
       SENTRY_ENVIRONMENT: preprod

@@ -1,6 +1,7 @@
 import { logger } from '../../lib/logger';
 import * as crypto from 'crypto';
 import { friendshipHash } from '../../lib/crypto-utils';
+import { isPeerId, peerId } from '../../lib/identity';
 import { queryMetrics } from '../../lib/metrics';
 import { performance } from 'perf_hooks';
 import { q, one, tx, disconnect as pgDisconnect } from './pg';
@@ -68,7 +69,9 @@ const AUTH_CHALLENGE_TTL_SECONDS = 60;
 export type SessionScope = 'free' | 'premium';
 
 export interface SessionInfo {
-  pk: string;
+  /** The caller's client id — sha256(hex(pk)), 64 hex characters. Not the key:
+   *  nothing a session-authenticated route does needs one. */
+  id: string;
   scope: SessionScope;
 }
 
@@ -90,9 +93,10 @@ function tokenHash(token: string): string {
 
 /** The friendship pair, normalised. Must sort exactly the way friendshipHash
  *  does (JS default lexicographic), which is also why the CHECK constraint in
- *  001_schema.sql carries COLLATE "C". */
-function pair(pk1: string, pk2: string): [string, string] {
-  const [lo, hi] = [pk1, pk2].sort();
+ *  004_identity_by_hash.sql carries COLLATE "C". Asserted from both sides in
+ *  test/identity.test.ts. */
+function pair(id1: string, id2: string): [string, string] {
+  const [lo, hi] = [id1, id2].sort();
   return [lo!, hi!];
 }
 
@@ -104,15 +108,41 @@ const DBImpl = {
   // 1. IDENTITY & USER MANAGEMENT
   // ============================================================
 
-  async createUser(pk: string, username: string) {
+  /**
+   * Record an identity: its id AND the key that id names.
+   *
+   * This is the ONE write that needs both. `users.identity_pk` is the only
+   * durable copy of an account's identity key in the system — nothing else
+   * stores one — so it is what `GET /peer/{id}/key` serves and what the auth
+   * server encapsulates a challenge to. The pair is checked by the database
+   * (`encode(pk_digest(identity_pk),'hex') = id`), which means a row whose key
+   * does not match its id cannot exist.
+   *
+   * Called from the auth server's verify path, where key possession has just
+   * been proved, so an identity is recorded only by whoever holds its secret.
+   * Idempotent: re-authenticating is the ordinary case.
+   */
+  async ensureUser(id: string, identityPk: string): Promise<void> {
+    await q(
+      `INSERT INTO users (id, identity_pk, created_at, tier)
+       VALUES ($1, $2, now(), 'free')
+       ON CONFLICT (id) DO NOTHING`,
+      [id, identityPk.toLowerCase()]
+    );
+  },
+
+  /** Record an identity AND claim a username in one go. Used by tests and
+   *  fixtures; the live path is ensureUser + setUsername, because a client
+   *  authenticates before it ever picks a name. */
+  async createUser(id: string, identityPk: string, username: string) {
     // One statement, and the UNIQUE index decides. The Redis version read
     // `usernames:taken`, then wrote a pipeline — two clients could both pass the
     // read and both write, and the loser silently overwrote the winner's binding.
     try {
       await q(
-        `INSERT INTO users (pk, username, created_at, tier)
-         VALUES ($1, $2, now(), 'free')`,
-        [pk, username]
+        `INSERT INTO users (id, identity_pk, username, created_at, tier)
+         VALUES ($1, $2, $3, now(), 'free')`,
+        [id, identityPk.toLowerCase(), username]
       );
     } catch (e) {
       const code = (e as { code?: string }).code;
@@ -127,53 +157,82 @@ const DBImpl = {
     }
   },
 
-  async getUser(pk: string) {
-    const row = await one<{ pk: string; username: string | null; created_at: Date; tier: string }>(
-      `SELECT pk, username, created_at, tier FROM users WHERE pk = $1`,
-      [pk]
+  async getUser(id: string) {
+    const row = await one<{ id: string; username: string | null; created_at: Date; tier: string }>(
+      `SELECT id, username, created_at, tier FROM users WHERE id = $1`,
+      [id]
     );
-    // `{}` for an unknown key, as HGETALL gave.
+    // `{}` for an unknown id, as HGETALL gave.
     if (!row) return {} as Record<string, string>;
     return {
-      pk: row.pk,
+      id: row.id,
       username: row.username || '',
       created_at: String(row.created_at.getTime()),
       tier: row.tier,
     } as Record<string, string>;
   },
 
-  async getUsername(pk: string): Promise<string | null> {
+  async getUsername(id: string): Promise<string | null> {
     const row = await one<{ username: string | null }>(
-      `SELECT username FROM users WHERE pk = $1`, [pk]
+      `SELECT username FROM users WHERE id = $1`, [id]
     );
     return row?.username ?? null;
   },
 
-  async getPkByUsername(username: string): Promise<string | null> {
+  /**
+   * The public key an id names.
+   *
+   * Served at friend-add (GET /peer/{id}/key) and used by the auth server. The
+   * caller MUST check it against the id it asked for — `keyMatchesId` in
+   * lib/identity.ts — which is what makes a substituted key impossible rather
+   * than merely unlikely. This server cannot be trusted to answer honestly, and
+   * with the commitment it does not have to be.
+   */
+  async identityKey(id: string): Promise<string | null> {
+    const row = await one<{ identity_pk: string }>(
+      `SELECT identity_pk FROM users WHERE id = $1`, [id]
+    );
+    return row?.identity_pk ?? null;
+  },
+
+  async getIdByUsername(username: string): Promise<string | null> {
     // `username` is citext, so this is case-insensitive — which is the point.
     // `username:{u}` was a case-SENSITIVE key while the reserved-handle list
     // lowercased, so `Helper` was claimable while `helper` was not.
-    const row = await one<{ pk: string }>(`SELECT pk FROM users WHERE username = $1`, [username]);
-    return row?.pk ?? null;
+    const row = await one<{ id: string }>(`SELECT id FROM users WHERE username = $1`, [username]);
+    return row?.id ?? null;
   },
 
   // NOTE: the bulk user directory (getUserDirectory / getAllUsernames) was
   // removed. Returning every username + pk to any authenticated user was a
   // social-graph enumeration leak, and pk → SHA-256(pk) → billing/linking code
-  // (M3). Discovery is now exact-username lookup only (getPkByUsername), used by
+  // (M3). Discovery is now exact-username lookup only (getIdByUsername), used by
   // the GET_ALL_USERS handler in server.ts.
 
   /**
-   * Helper used by the server to handle inputs that could be either a PK or Username
+   * Read an identifier that may be either a client id or a username.
+   *
+   * The two forms cannot be confused: an id is exactly 64 lowercase hex
+   * characters, and a username is 3–32 of `[A-Za-z0-9_]`. So this is a shape
+   * test, not the `length > 50` heuristic it replaces — which worked only
+   * because the other form was 14474 characters, and would have read a full
+   * public key as an id the moment a caller sent one.
+   *
+   * Returning the id unchanged does NOT mean it names anybody. Callers check
+   * that separately (friendship, or a `users` lookup); an id is a name, never a
+   * claim.
    */
-  async resolveToPk(identifier: string): Promise<string | null> {
+  async resolveToId(identifier: string): Promise<string | null> {
     if (!identifier) return null;
-    // Assuming HQC Public Keys are long hex strings (> 50 chars)
-    if (identifier.length > 50) return identifier;
-    return await this.getPkByUsername(identifier);
+    // Lowercased first, so an uppercase id is read as the id it is rather than
+    // as a username nobody could hold. A username is at most 32 characters, so
+    // it can never take this branch.
+    const lowered = identifier.toLowerCase();
+    if (isPeerId(lowered)) return lowered;
+    return await this.getIdByUsername(identifier);
   },
 
-  async setUsername(pk: string, newUsername: string) {
+  async setUsername(id: string, newUsername: string) {
     // check new username 
     if (!newUsername || newUsername.length < 3 || newUsername.length > 32) {
       throw new Error("Username must be between 3 and 32 characters.");
@@ -186,16 +245,16 @@ const DBImpl = {
       // normal users. A trusted service identity that self-registered in
       // `admission_exempt` — i.e. the helper bot — is allowed to claim its
       // reserved handle; that's the whole reason the handle is reserved.
-      if (!(await this.isAdmissionExempt(pk))) {
+      if (!(await this.isAdmissionExempt(id))) {
         throw new Error("This username is not allowed.");
       }
     }
     // Who currently owns this name (if anyone)?
-    const currentOwner = await this.getPkByUsername(newUsername);
+    const currentOwner = await this.getIdByUsername(newUsername);
 
     // Idempotent: re-setting the name you already own is a no-op success
-    // (previously this threw "Username taken." against your own pk).
-    if (currentOwner === pk) return;
+    // (previously this threw "Username taken." against your own identity).
+    if (currentOwner === id) return;
 
     // A name owned by a *different* pk may NOT be transferred — blindly handing
     // it over let any authenticated user take over (impersonate) another user or
@@ -205,10 +264,13 @@ const DBImpl = {
     // self-registered `admission_exempt` row it writes on startup — so this needs
     // no manual, stale-prone BOT_PUBLIC_KEY list. The static env is still honoured
     // as an optional override. Everything else is refused.
-    if (currentOwner && currentOwner !== pk) {
-      const botKeys = (process.env.BOT_PUBLIC_KEY || '')
-        .split(',').map((s) => s.trim()).filter(Boolean);
-      const trusted = botKeys.includes(pk) || (await this.isAdmissionExempt(pk));
+    if (currentOwner && currentOwner !== id) {
+      // BOT_PUBLIC_KEY is a KEY, as its name says and as an operator would set
+      // it — so it is compared after being reduced to the id it names, not
+      // against the id directly.
+      const trustedIds = (process.env.BOT_PUBLIC_KEY || '')
+        .split(',').map((s) => s.trim()).filter(Boolean).map((k) => peerId(k));
+      const trusted = trustedIds.includes(id) || (await this.isAdmissionExempt(id));
       if (!trusted) {
         throw new Error('USERNAME_TAKEN');
       }
@@ -217,16 +279,18 @@ const DBImpl = {
     // Releasing the old owner's name and taking it must not be two round trips:
     // between them the name belongs to nobody, and a third caller could claim it.
     await tx(async (c) => {
-      if (currentOwner && currentOwner !== pk) {
-        await c.query(`UPDATE users SET username = NULL WHERE pk = $1`, [currentOwner]);
+      if (currentOwner && currentOwner !== id) {
+        await c.query(`UPDATE users SET username = NULL WHERE id = $1`, [currentOwner]);
       }
-      // Upsert rather than update: `hset user:{pk} username` created the record
-      // if it did not exist, and at least one caller relies on that.
-      await c.query(
-        `INSERT INTO users (pk, username) VALUES ($1, $2)
-         ON CONFLICT (pk_digest(pk)) DO UPDATE SET username = EXCLUDED.username`,
-        [pk, newUsername]
+      // An UPDATE, where this used to upsert. It cannot create the row any more:
+      // `users.identity_pk` is NOT NULL and this function has no key to put in
+      // it. Nothing is lost, because the row already exists by the time anyone
+      // can call this — a username is set with a session bearer, and the auth
+      // server writes the identity (ensureUser) before it mints one.
+      const res = await c.query(
+        `UPDATE users SET username = $2 WHERE id = $1`, [id, newUsername]
       );
+      if (!res.rowCount) throw new Error('UNKNOWN_IDENTITY');
     });
   },
 
@@ -247,39 +311,50 @@ const DBImpl = {
    * through an index it had to delete last), and then SCANned every `invites:*`
    * key in the database — on a user-facing request — because invites this user
    * SENT lived in other people's inboxes with nothing pointing back. An index on
-   * `invites.from_pk` makes that last part a single statement.
+   * `invites.from_id` makes that last part a single statement.
    */
-  async deleteUser(pk: string): Promise<void> {
+  async deleteUser(id: string): Promise<void> {
     await tx(async (c) => {
       // Each friend also holds ACL rows naming this user: the shared
       // conversation topic and this user's presence topic. Without removing
       // them the deleted account's grants survive, and every friend keeps a
-      // dangling entry for a pk that no longer exists.
+      // dangling entry for an id that no longer exists.
       const { rows: peers } = await c.query<{ peer: string; hash: string }>(
-        `SELECT CASE WHEN pk_lo = $1 THEN pk_hi ELSE pk_lo END AS peer, hash
-           FROM friendships WHERE pk_lo = $1 OR pk_hi = $1`,
-        [pk]
+        `SELECT CASE WHEN id_lo = $1 THEN id_hi ELSE id_lo END AS peer, hash
+           FROM friendships WHERE id_lo = $1 OR id_hi = $1`,
+        [id]
       );
       for (const { peer, hash } of peers) {
-        await c.query(`DELETE FROM mqtt_acl WHERE pk = $1 AND topic = ANY($2::text[])`, [
+        await c.query(`DELETE FROM mqtt_acl WHERE id = $1 AND topic = ANY($2::text[])`, [
           peer,
-          [`c/${hash}`, this.presenceTopic(pk)],
+          // Every topic of THIS user that a peer holds a grant on — the shared
+          // conversation, this user's presence, and (since 003) this user's
+          // inbox. Missing one leaves the peer a dangling grant on an id that no
+          // longer exists.
+          [`c/${hash}`, this.presenceTopic(id), this.inboxTopic(id)],
         ]);
       }
 
-      await c.query(`DELETE FROM friendships WHERE pk_lo = $1 OR pk_hi = $1`, [pk]);
-      await c.query(`DELETE FROM invites WHERE to_pk = $1 OR from_pk = $1`, [pk]);
-      await c.query(`DELETE FROM mqtt_acl WHERE pk = $1`, [pk]);
+      await c.query(`DELETE FROM friendships WHERE id_lo = $1 OR id_hi = $1`, [id]);
+      await c.query(`DELETE FROM invites WHERE to_id = $1 OR from_id = $1`, [id]);
+      await c.query(`DELETE FROM mqtt_acl WHERE id = $1`, [id]);
       // MQTT connect credential + every live REST bearer.
-      await c.query(`DELETE FROM mqtt_tokens WHERE pk = $1`, [pk]);
-      await c.query(`DELETE FROM sessions WHERE pk = $1`, [pk]);
-      await c.query(`DELETE FROM push_tokens WHERE pk = $1`, [pk]);
+      await c.query(`DELETE FROM mqtt_tokens WHERE id = $1`, [id]);
+      await c.query(`DELETE FROM sessions WHERE id = $1`, [id]);
+      await c.query(`DELETE FROM push_tokens WHERE id = $1`, [id]);
+      // Both prekey tiers. These are public keys, so leaving them would leak
+      // nothing — but account-delete.e2e asserts that NO row anywhere survives,
+      // and that assertion is the App Store evidence. A new table that forgets
+      // to appear here is exactly the silent regression it exists to catch.
+      await c.query(`DELETE FROM prekeys_medium WHERE id = $1`, [id]);
+      await c.query(`DELETE FROM prekeys_onetime WHERE id = $1`, [id]);
       // Release the subscription claim (and its device slot). The subscription
       // record itself is deliberately untouched: it belongs to whoever paid, not
       // to the identity being deleted.
-      await c.query(`DELETE FROM subscription_claims WHERE pk = $1`, [pk]);
-      // Last: the identity, which also frees the username.
-      await c.query(`DELETE FROM users WHERE pk = $1`, [pk]);
+      await c.query(`DELETE FROM subscription_claims WHERE id = $1`, [id]);
+      // Last: the identity — which frees the username AND is the only copy of
+      // this account's public key the server held.
+      await c.query(`DELETE FROM users WHERE id = $1`, [id]);
     });
   },
 
@@ -295,15 +370,15 @@ const DBImpl = {
   //   subscriptions           state (waiting|active|cancelled) + Stripe customer
   //   subscription_customers  reverse index, so a webhook carrying only a
   //                           customer id resolves without calling Stripe
-  //   subscription_claims     the public keys that have claimed it (capped) —
+  //   subscription_claims     the identities that have claimed it (capped) —
   //                           and, read the other way, the hot path on every
   //                           paid-door auth
   //   otp                     the pending code's HASH + its attempt count
   //
-  // Devices are recorded by RAW public key, not a blinded one. Blinding existed
-  // to keep the crypto identity away from Stripe, and nothing here goes to
-  // Stripe; meanwhile revoking a lapsed subscriber means editing `mqtt_acl` and
-  // kicking `{pk}` off the broker, neither of which a hash can address.
+  // Devices are recorded by client id. Revoking a lapsed subscriber means
+  // editing `mqtt_acl` and kicking that client off the broker, and both address
+  // an id — which, at 64 characters, is finally short enough for the broker's
+  // admin API to accept in a URL.
   //
   // Entitlement lives in the claim rather than on the user row: `users`
   // describes an identity, and an identity is not the thing that was paid for.
@@ -361,7 +436,7 @@ const DBImpl = {
   /** Bind a device (public key) to a subscription, up to `cap` devices.
    *  Re-claiming a device already bound is a no-op that does NOT spend a slot,
    *  so a repeated OTP does not lock a user out of their own subscription. */
-  async addClaimedDevice(emailHash: string, pk: string, cap: number): Promise<'ok' | 'cap'> {
+  async addClaimedDevice(emailHash: string, id: string, cap: number): Promise<'ok' | 'cap'> {
     return await tx(async (c) => {
       // Count-then-insert lets two devices race past the cap, which is why this
       // was a Lua script. Locking the subscription row is the same guarantee
@@ -370,8 +445,8 @@ const DBImpl = {
       await c.query(`SELECT 1 FROM subscriptions WHERE email_hash = $1 FOR UPDATE`, [emailHash]);
 
       const already = await c.query(
-        `SELECT 1 FROM subscription_claims WHERE pk = $1 AND email_hash = $2`,
-        [pk, emailHash]
+        `SELECT 1 FROM subscription_claims WHERE id = $1 AND email_hash = $2`,
+        [id, emailHash]
       );
       if (already.rowCount) return 'ok';
 
@@ -381,14 +456,14 @@ const DBImpl = {
       );
       if ((rows[0]?.n ?? 0) >= cap) return 'cap';
 
-      // ON CONFLICT moves a key that was bound to a DIFFERENT subscription,
+      // ON CONFLICT moves a device that was bound to a DIFFERENT subscription,
       // which also releases the slot it held there — `SET claim:{pk} H` moved
       // the forward pointer but left the old `sub:pks` set naming a device that
       // had gone elsewhere.
       await c.query(
-        `INSERT INTO subscription_claims (pk, email_hash, claimed_at) VALUES ($1, $2, now())
-         ON CONFLICT (pk_digest(pk)) DO UPDATE SET email_hash = EXCLUDED.email_hash, claimed_at = now()`,
-        [pk, emailHash]
+        `INSERT INTO subscription_claims (id, email_hash, claimed_at) VALUES ($1, $2, now())
+         ON CONFLICT (id) DO UPDATE SET email_hash = EXCLUDED.email_hash, claimed_at = now()`,
+        [id, emailHash]
       );
       return 'ok';
     });
@@ -396,30 +471,30 @@ const DBImpl = {
 
   /** The subscription a device is bound to, or null. Read on every paid-door
    *  `/auth/paid/init`, which is why it is one primary-key lookup. */
-  async emailHashForClaim(pk: string): Promise<string | null> {
+  async emailHashForClaim(id: string): Promise<string | null> {
     const row = await one<{ email_hash: string }>(
-      `SELECT email_hash FROM subscription_claims WHERE pk = $1`,
-      [pk]
+      `SELECT email_hash FROM subscription_claims WHERE id = $1`,
+      [id]
     );
     return row?.email_hash ?? null;
   },
 
   async claimedDevices(emailHash: string): Promise<string[]> {
-    const res = await q<{ pk: string }>(
-      `SELECT pk FROM subscription_claims WHERE email_hash = $1 ORDER BY claimed_at, pk`,
+    const res = await q<{ id: string }>(
+      `SELECT id FROM subscription_claims WHERE email_hash = $1 ORDER BY claimed_at, id`,
       [emailHash]
     );
-    return res.rows.map((r) => r.pk);
+    return res.rows.map((r) => r.id);
   },
 
-  /** Release every device bound to a subscription. Returns the public keys that
-   *  were released, so the caller can also end whatever they still have open. */
+  /** Release every device bound to a subscription. Returns the ids that were
+   *  released, so the caller can also end whatever they still have open. */
   async forgetClaimedDevices(emailHash: string): Promise<string[]> {
-    const res = await q<{ pk: string }>(
-      `DELETE FROM subscription_claims WHERE email_hash = $1 RETURNING pk`,
+    const res = await q<{ id: string }>(
+      `DELETE FROM subscription_claims WHERE email_hash = $1 RETURNING id`,
       [emailHash]
     );
-    return res.rows.map((r) => r.pk);
+    return res.rows.map((r) => r.id);
   },
 
   /** Store the HASH of a pending OTP. One live code per address: a resend
@@ -455,49 +530,56 @@ const DBImpl = {
   },
 
   /**
-   * Self-registered admission exemptions. The helper bot writes its own pk here
+   * Self-registered admission exemptions. The helper bot writes its own id here
    * on startup (see bot/bot.ts) so it's admitted under any policy without an
    * operator hand-copying its key into EXEMPT_PUBLIC_KEYS — which would go stale
    * whenever the bot's seed/identity changes. Being exempt only waives the
    * payment/allowlist gate; the caller still had to pass HQC auth, so only the
    * holder of that private key benefits.
+   *
+   * An id is derivable by anyone holding the public key, so this table is not a
+   * secret and being IN it proves nothing on its own — it is read only after
+   * the KEM proof has already established who is asking.
    */
-  async addAdmissionExempt(pk: string) {
+  async addAdmissionExempt(id: string) {
     await q(
-      `INSERT INTO admission_exempt (pk) VALUES ($1) ON CONFLICT DO NOTHING`,
-      [pk.toLowerCase()]
+      `INSERT INTO admission_exempt (id) VALUES ($1) ON CONFLICT DO NOTHING`,
+      [id.toLowerCase()]
     );
   },
 
-  /** Whether this pk self-registered an admission exemption. */
-  async isAdmissionExempt(pk: string): Promise<boolean> {
-    const row = await one(`SELECT 1 FROM admission_exempt WHERE pk = $1`, [pk.toLowerCase()]);
+  /** Whether this identity self-registered an admission exemption. */
+  async isAdmissionExempt(id: string): Promise<boolean> {
+    const row = await one(`SELECT 1 FROM admission_exempt WHERE id = $1`, [id.toLowerCase()]);
     return row !== null;
   },
 
   /** Withdraw an exemption. The bot re-registers its own on every startup, so
    *  this is for an operator retiring a key - or a test cleaning up after one. */
-  async removeAdmissionExempt(pk: string): Promise<void> {
-    await q(`DELETE FROM admission_exempt WHERE pk = $1`, [pk.toLowerCase()]);
+  async removeAdmissionExempt(id: string): Promise<void> {
+    await q(`DELETE FROM admission_exempt WHERE id = $1`, [id.toLowerCase()]);
   },
 
   // ============================================================
   // 3. INVITES & SOCIAL
   // ============================================================
 
-  async invite(fromPk: string, toIdentifier: string) {
-    const toPk = await this.resolveToPk(toIdentifier);
-    if (!toPk) throw new Error("User not found");
-    if (fromPk === toPk) throw new Error("Self-invite not allowed");
-    if (!(await one(`SELECT 1 FROM users WHERE pk = $1`, [toPk]))) throw new Error("User not found");
+  async invite(fromId: string, toIdentifier: string) {
+    const toId = await this.resolveToId(toIdentifier);
+    if (!toId) throw new Error("User not found");
+    if (fromId === toId) throw new Error("Self-invite not allowed");
+    // The `users` lookup is what stops an id being a way to address a stranger:
+    // resolveToId hands back any well-formed id unchecked, deliberately, and
+    // this is where "does anyone hold that name" is decided.
+    if (!(await one(`SELECT 1 FROM users WHERE id = $1`, [toId]))) throw new Error("User not found");
 
-    if (await this.areFriends(fromPk, toPk)) throw new Error("Already friends");
+    if (await this.areFriends(fromId, toId)) throw new Error("Already friends");
 
     // We store the invite in the recipient's "inbox"
     await q(
-      `INSERT INTO invites (to_pk, from_pk, created_at) VALUES ($1, $2, now())
-       ON CONFLICT (pk_digest(to_pk), pk_digest(from_pk)) DO UPDATE SET created_at = now()`,
-      [toPk, fromPk]
+      `INSERT INTO invites (to_id, from_id, created_at) VALUES ($1, $2, now())
+       ON CONFLICT (to_id, from_id) DO UPDATE SET created_at = now()`,
+      [toId, fromId]
     );
   },
 
@@ -507,38 +589,43 @@ const DBImpl = {
    * pending invite had no way to be taken back at all.
    * Returns true when an invite was actually removed.
    */
-  async cancelInvite(fromPk: string, toIdentifier: string): Promise<boolean> {
-    const toPk = await this.resolveToPk(toIdentifier);
-    if (!toPk) return false;
+  async cancelInvite(fromId: string, toIdentifier: string): Promise<boolean> {
+    const toId = await this.resolveToId(toIdentifier);
+    if (!toId) return false;
     // The invite lives in the *recipient's* inbox, keyed by the sender.
-    const res = await q(`DELETE FROM invites WHERE to_pk = $1 AND from_pk = $2`, [toPk, fromPk]);
+    const res = await q(`DELETE FROM invites WHERE to_id = $1 AND from_id = $2`, [toId, fromId]);
     return (res.rowCount ?? 0) > 0;
   },
 
   /** Decline an invite addressed to this user. */
-  async declineInvite(myPk: string, fromIdentifier: string): Promise<boolean> {
-    const fromPk = await this.resolveToPk(fromIdentifier);
-    if (!fromPk) return false;
-    const res = await q(`DELETE FROM invites WHERE to_pk = $1 AND from_pk = $2`, [myPk, fromPk]);
+  async declineInvite(myId: string, fromIdentifier: string): Promise<boolean> {
+    const fromId = await this.resolveToId(fromIdentifier);
+    if (!fromId) return false;
+    const res = await q(`DELETE FROM invites WHERE to_id = $1 AND from_id = $2`, [myId, fromId]);
     return (res.rowCount ?? 0) > 0;
   },
 
-  async getMyInvites(myPk: string) {
+  async getMyInvites(myId: string) {
     // One join, where the Redis version did an HGETALL and then a round trip per
     // sender to look up a username.
-    const res = await q<{ pk: string; username: string | null; sent_at: string }>(
-      `SELECT i.from_pk AS pk,
+    const res = await q<{ id: string; username: string | null; sent_at: string }>(
+      `SELECT i.from_id AS id,
               u.username::text AS username,
               (EXTRACT(epoch FROM i.created_at) * 1000)::bigint::text AS sent_at
          FROM invites i
-         LEFT JOIN users u ON u.pk = i.from_pk
-        WHERE i.to_pk = $1
+         LEFT JOIN users u ON u.id = i.from_id
+        WHERE i.to_id = $1
         ORDER BY i.created_at`,
-      [myPk]
+      [myId]
     );
     return res.rows.map((r) => ({
-      pk: r.pk,
-      username: r.username || "Unknown",
+      id: r.id,
+      // NULL, not "Unknown". A placeholder here is a display decision the server
+      // has no business making, and it is actively harmful: the client detects a
+      // changed identity by finding a DIFFERENT id under the same display name,
+      // so two nameless accounts sharing a placeholder would read as one of them
+      // having re-keyed. The client labels a nameless peer by its id.
+      username: r.username || null,
       sent_at: Number(r.sent_at),
     }));
   },
@@ -551,13 +638,13 @@ const DBImpl = {
    * two simultaneous accepts cannot both succeed — the Redis version checked
    * HEXISTS and then wrote, with a window in between.
    */
-  async acceptInvite(fromIdentifier: string, myPk: string): Promise<boolean> {
-    const fromPk = await this.resolveToPk(fromIdentifier);
-    if (!fromPk) return false;
+  async acceptInvite(fromIdentifier: string, myId: string): Promise<boolean> {
+    const fromId = await this.resolveToId(fromIdentifier);
+    if (!fromId) return false;
 
     return await tx(async (c) => {
-      const taken = await c.query(`DELETE FROM invites WHERE to_pk = $1 AND from_pk = $2`, [
-        myPk, fromPk,
+      const taken = await c.query(`DELETE FROM invites WHERE to_id = $1 AND from_id = $2`, [
+        myId, fromId,
       ]);
       if (!taken.rowCount) return false;
 
@@ -565,63 +652,75 @@ const DBImpl = {
       // and not the blind hash, so `checkFriendship` — which reads the hash —
       // answered false for a friendship the friend LIST showed. There is nothing
       // left to keep in sync.
-      const [lo, hi] = pair(myPk, fromPk);
+      const [lo, hi] = pair(myId, fromId);
       await c.query(
-        `INSERT INTO friendships (pk_lo, pk_hi, hash) VALUES ($1, $2, $3)
-         ON CONFLICT (pk_digest(pk_lo), pk_digest(pk_hi)) DO NOTHING`,
-        [lo, hi, friendshipHash(myPk, fromPk)]
+        `INSERT INTO friendships (id_lo, id_hi, hash) VALUES ($1, $2, $3)
+         ON CONFLICT (id_lo, id_hi) DO NOTHING`,
+        [lo, hi, friendshipHash(myId, fromId)]
       );
       return true;
     });
   },
 
-  async getFriendsList(myPk: string) {
-    const res = await q<{ pk: string; username: string | null }>(
-      `SELECT peer.pk, u.username::text AS username
+  /**
+   * The friend graph as the client sees it: an id and a display name per peer.
+   *
+   * This used to ship a 14474-character public key per friend — about 160 kB
+   * every sixty seconds for eleven friends, on a poll that exists only because
+   * nothing pushes graph changes. It ships 64 characters now, and the client
+   * fetches the KEY separately (GET /peer/{id}/key), once, at friend-add — and
+   * verifies it against the id before pinning it.
+   */
+  async getFriendsList(myId: string) {
+    const res = await q<{ id: string; username: string | null }>(
+      `SELECT peer.id, u.username::text AS username
          FROM friendships f
          CROSS JOIN LATERAL (
-           SELECT CASE WHEN f.pk_lo = $1 THEN f.pk_hi ELSE f.pk_lo END AS pk
+           SELECT CASE WHEN f.id_lo = $1 THEN f.id_hi ELSE f.id_lo END AS id
          ) peer
-         LEFT JOIN users u ON u.pk = peer.pk
-        WHERE f.pk_lo = $1 OR f.pk_hi = $1`,
-      [myPk]
+         LEFT JOIN users u ON u.id = peer.id
+        WHERE f.id_lo = $1 OR f.id_hi = $1`,
+      [myId]
     );
-    return res.rows.map((r) => ({ pk: r.pk, username: r.username || 'Anonymous' }));
+    // NULL rather than 'Anonymous', for the same reason getMyInvites returns
+    // null: a shared placeholder name is indistinguishable from a re-keyed
+    // contact to the client's username-fallback detection.
+    return res.rows.map((r) => ({ id: r.id, username: r.username ?? null }));
   },
 
   /** Just the peers, for the ACL walks below. */
-  async friendPks(myPk: string): Promise<string[]> {
-    const res = await q<{ pk: string }>(
-      `SELECT CASE WHEN pk_lo = $1 THEN pk_hi ELSE pk_lo END AS pk
-         FROM friendships WHERE pk_lo = $1 OR pk_hi = $1`,
-      [myPk]
+  async friendIds(myId: string): Promise<string[]> {
+    const res = await q<{ id: string }>(
+      `SELECT CASE WHEN id_lo = $1 THEN id_hi ELSE id_lo END AS id
+         FROM friendships WHERE id_lo = $1 OR id_hi = $1`,
+      [myId]
     );
-    return res.rows.map((r) => r.pk);
+    return res.rows.map((r) => r.id);
   },
 
-  async areFriends(pkA: string, pkB: string): Promise<boolean> {
-    const [lo, hi] = pair(pkA, pkB);
-    const row = await one(`SELECT 1 FROM friendships WHERE pk_lo = $1 AND pk_hi = $2`, [lo, hi]);
+  async areFriends(idA: string, idB: string): Promise<boolean> {
+    const [lo, hi] = pair(idA, idB);
+    const row = await one(`SELECT 1 FROM friendships WHERE id_lo = $1 AND id_hi = $2`, [lo, hi]);
     return row !== null;
   },
 
-  async removeFriend(fromPk: string, toIdentifier: string): Promise<boolean> {
-    const toPk = await this.resolveToPk(toIdentifier);
-    if (!toPk) return false;
+  async removeFriend(fromId: string, toIdentifier: string): Promise<boolean> {
+    const toId = await this.resolveToId(toIdentifier);
+    if (!toId) return false;
 
     // Deleting the one row is both directions and the blind hash at once; the
     // "are they actually friends" check is its rowcount.
-    const [lo, hi] = pair(fromPk, toPk);
-    const res = await q(`DELETE FROM friendships WHERE pk_lo = $1 AND pk_hi = $2`, [lo, hi]);
+    const [lo, hi] = pair(fromId, toId);
+    const res = await q(`DELETE FROM friendships WHERE id_lo = $1 AND id_hi = $2`, [lo, hi]);
     return (res.rowCount ?? 0) > 0;
   },
 
-  async createFriendship(pk1: string, pk2: string) {
-    const [lo, hi] = pair(pk1, pk2);
+  async createFriendship(id1: string, id2: string) {
+    const [lo, hi] = pair(id1, id2);
     await q(
-      `INSERT INTO friendships (pk_lo, pk_hi, hash) VALUES ($1, $2, $3)
-       ON CONFLICT (pk_digest(pk_lo), pk_digest(pk_hi)) DO NOTHING`,
-      [lo, hi, friendshipHash(pk1, pk2)]
+      `INSERT INTO friendships (id_lo, id_hi, hash) VALUES ($1, $2, $3)
+       ON CONFLICT (id_lo, id_hi) DO NOTHING`,
+      [lo, hi, friendshipHash(id1, id2)]
     );
   },
 
@@ -629,46 +728,152 @@ const DBImpl = {
    *  friendships that were stored only as a blind hash with no friend-set link;
    *  one row cannot drift from itself, so this is now exactly
    *  `createFriendship` and is kept only for its callers. */
-  async ensureFriendLink(pk1: string, pk2: string) {
-    await this.createFriendship(pk1, pk2);
+  async ensureFriendLink(id1: string, id2: string) {
+    await this.createFriendship(id1, id2);
   },
 
   /**
    * Checks if friendship exists based on blind hash
    */
-  async checkFriendship(pk1: string, pk2: string): Promise<boolean> {
+  async checkFriendship(id1: string, id2: string): Promise<boolean> {
     const row = await one(`SELECT 1 FROM friendships WHERE hash = $1`, [
-      friendshipHash(pk1, pk2),
+      friendshipHash(id1, id2),
     ]);
     return row !== null;
   },
 
-  getFriendshipHash(pk1: string, pk2: string): string {
-    return friendshipHash(pk1, pk2);
+  getFriendshipHash(id1: string, id2: string): string {
+    return friendshipHash(id1, id2);
+  },
+
+  // ============================================================
+  // 3b. PREKEYS (ephemeral half of the initial key agreement)
+  // ============================================================
+  //
+  // See migrations/003_prekeys.sql for why these exist at all. In short: without
+  // an ephemeral contribution, one leaked identity secret plus a recorded
+  // transcript decrypts a conversation's entire history, because every shared
+  // secret was a deterministic encapsulation to a long-term key.
+  //
+  // The server is untrusted here and does not need to be trusted. It can hand an
+  // initiator the wrong prekey, or none — the initiator ALSO encapsulates to the
+  // pinned identity key, so a substituted prekey yields the server nothing. What
+  // the server can do is withhold one-time keys to force the weaker medium-term
+  // fallback, which is a downgrade in the forward-secrecy window, not in
+  // confidentiality.
+
+  /** Replace an account's published bundle: one medium-term key, N one-time keys.
+   *  One transaction, because a client that uploads is replacing its whole set —
+   *  a partial write would leave peers claiming keys whose secrets were dropped. */
+  async putPrekeyBundle(
+    ownerId: string,
+    mediumPrekey: string,
+    oneTime: Array<{ id: number; prekey: string }>
+  ): Promise<void> {
+    await tx(async (c) => {
+      await c.query(
+        `INSERT INTO prekeys_medium (id, prekey, updated_at) VALUES ($1, $2, now())
+         ON CONFLICT (id) DO UPDATE SET prekey = EXCLUDED.prekey, updated_at = now()`,
+        [ownerId, mediumPrekey]
+      );
+      if (oneTime.length === 0) return;
+      // Additive, not a replace: replenishment tops up the pool without
+      // invalidating keys a peer may already have claimed but not yet used.
+      // DO NOTHING on a repeated key_id keeps a retried upload idempotent.
+      await c.query(
+        `INSERT INTO prekeys_onetime (id, key_id, prekey)
+         SELECT $1, * FROM unnest($2::int[], $3::text[])
+         ON CONFLICT (id, key_id) DO NOTHING`,
+        [ownerId, oneTime.map((k) => k.id), oneTime.map((k) => k.prekey)]
+      );
+    });
+  },
+
+  /**
+   * The bundle an initiator needs: the medium-term key ALWAYS, plus a one-time
+   * key when the pool has one.
+   *
+   * Both, not one or the other. The initial root mixes three secrets — identity,
+   * medium-term and (when available) one-time — and each does a different job:
+   * identity authenticates, medium-term gives a rotation-length forward-secrecy
+   * window, one-time ends that window the moment it is consumed. Serving only
+   * one would silently change which root the two sides derive.
+   *
+   * The one-time branch is `DELETE ... RETURNING`, so "claimed exactly once" is
+   * a property of the row rather than of a read-then-delete two initiators could
+   * interleave. Returns null only when the account has published nothing at all.
+   */
+  async claimPrekey(
+    ownerId: string
+  ): Promise<{ medium: string; oneTime: { id: number; prekey: string } | null } | null> {
+    const medium = await one<{ prekey: string }>(
+      `SELECT prekey FROM prekeys_medium WHERE id = $1`, [ownerId]
+    );
+    // No medium-term key means no bundle. The one-time pool is an addition to
+    // it, never a substitute — an initiator with only a one-time key could not
+    // derive the same root as the responder.
+    if (!medium?.prekey) return null;
+
+    const oneTime = await one<{ key_id: number; prekey: string }>(
+      `DELETE FROM prekeys_onetime
+        WHERE ctid = (
+          SELECT ctid FROM prekeys_onetime WHERE id = $1 ORDER BY key_id LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING key_id, prekey`,
+      [ownerId]
+    );
+
+    return {
+      medium: medium.prekey,
+      // `id` on the wire — it is the client's own index for the key, echoed
+      // back as the envelope's `otId`. The column is `key_id` because the
+      // account's identifier took the name `id` in 004.
+      oneTime: oneTime ? { id: oneTime.key_id, prekey: oneTime.prekey } : null,
+    };
+  },
+
+  /** How many one-time keys this account has left, so a client knows when to
+   *  replenish. */
+  async countOneTimePrekeys(ownerId: string): Promise<number> {
+    const row = await one<{ n: number }>(
+      `SELECT count(*)::int AS n FROM prekeys_onetime WHERE id = $1`, [ownerId]
+    );
+    return row?.n ?? 0;
+  },
+
+  /** The highest one-time id on file, so replenishment never reuses one. Null
+   *  when the pool is empty — the client starts from 0 again, which is safe
+   *  because the ids it would collide with have all been claimed and deleted. */
+  async maxOneTimePrekeyId(ownerId: string): Promise<number | null> {
+    const row = await one<{ key_id: number | null }>(
+      `SELECT max(key_id) AS key_id FROM prekeys_onetime WHERE id = $1`, [ownerId]
+    );
+    return row?.key_id ?? null;
   },
 
   // ============================================================
   // 4. PUSH TOKENS
   // ============================================================
 
-  async setPushToken(pk: string, platform: string, token: string) {
+  async setPushToken(id: string, platform: string, token: string) {
     // The client re-registers its APNs token on every app launch
     // (apps/apple/DissQus/AppState.swift), so this is one of the few writes that
     // scales with usage rather than with events. `IS DISTINCT FROM` makes the
     // unchanged case a no-op instead of a new row version to vacuum.
     await q(
-      `INSERT INTO push_tokens (pk, platform, token, updated_at) VALUES ($1, $2, $3, now())
-       ON CONFLICT (pk_digest(pk)) DO UPDATE SET
+      `INSERT INTO push_tokens (id, platform, token, updated_at) VALUES ($1, $2, $3, now())
+       ON CONFLICT (id) DO UPDATE SET
          platform = EXCLUDED.platform, token = EXCLUDED.token, updated_at = now()
        WHERE push_tokens.token IS DISTINCT FROM EXCLUDED.token
           OR push_tokens.platform IS DISTINCT FROM EXCLUDED.platform`,
-      [pk, platform, token]
+      [id, platform, token]
     );
   },
 
-  async getPushToken(pk: string): Promise<{ platform: string; token: string } | null> {
+  async getPushToken(id: string): Promise<{ platform: string; token: string } | null> {
     const row = await one<{ platform: string; token: string }>(
-      `SELECT platform, token FROM push_tokens WHERE pk = $1`, [pk]
+      `SELECT platform, token FROM push_tokens WHERE id = $1`, [id]
     );
     if (!row?.token) return null;
     return { platform: row.platform || "ios", token: row.token };
@@ -685,48 +890,82 @@ const DBImpl = {
   // forms and revoke it when it ends, and revocation ALSO acts on the live
   // connection through lib/emqx.ts rather than waiting for the cache.
   //
-  // The topic name is derivable by anyone who knows both public keys, so security
-  // rests ENTIRELY on this table — never on topic-name secrecy.
+  // The topic name is derivable by anyone who knows both identifiers, so
+  // security rests ENTIRELY on this table — never on topic-name secrecy.
+  //
+  // Every topic here names CLIENT IDS, not public keys. A presence topic was
+  // `u/{14474 hex}/presence`, so an ACL row carried a key in `pk` and another
+  // inside `topic`: ~29 kB to record one membership bit. It is ~140 bytes now,
+  // and — the part that actually failed — a topic short enough that
+  // `DELETE /clients/{id}/subscriptions/{topic}` fits in a URL, which is what
+  // makes unfriending stop a LIVE subscription instead of only the next one.
 
-  /** Conversation topic between two public keys. */
-  mqttTopicFor(pk1: string, pk2: string): string {
-    return `c/${friendshipHash(pk1, pk2)}`;
+  /** Conversation topic between two client ids. */
+  mqttTopicFor(id1: string, id2: string): string {
+    return `c/${friendshipHash(id1, id2)}`;
   },
 
-  /** A user's own presence + inbox topics. Presence: owner publishes (retained +
-   *  LWT), friends subscribe. Inbox: owner subscribes (offline wake target). */
-  presenceTopic(pk: string): string { return `u/${pk}/presence`; },
-  inboxTopic(pk: string): string { return `u/${pk}/inbox`; },
+  /** A client's own presence + inbox topics. Presence: owner publishes (retained
+   *  + LWT), friends subscribe. Inbox: owner subscribes (offline wake target). */
+  presenceTopic(id: string): string { return `u/${id}/presence`; },
+  inboxTopic(id: string): string { return `u/${id}/inbox`; },
+  /** Where the server tells this account its friend graph moved. Owner-only:
+   *  nobody else is ever granted anything on it, and the server publishes
+   *  through the admin API rather than as a client. */
+  graphTopic(id: string): string { return `u/${id}/graph`; },
 
-  /** Grant a pk the topics it owns: publish on its presence, all on its inbox.
-   *  Idempotent; call on user creation and (harmlessly) on each token mint. */
-  async grantSelfTopics(pk: string): Promise<void> {
+  /** Grant a client the topics it owns: publish on its presence, all on its
+   *  inbox. Idempotent; call on user creation and (harmlessly) on each token
+   *  mint. */
+  async grantSelfTopics(id: string): Promise<void> {
     await this.grant([
-      [pk, this.presenceTopic(pk), 'publish'],
-      [pk, this.inboxTopic(pk), 'all'],
+      [id, this.presenceTopic(id), 'publish'],
+      [id, this.inboxTopic(id), 'all'],
+      // SUBSCRIBE only. The account listens for "your graph changed"; the server
+      // is the only publisher, and it publishes through the admin API, which the
+      // authorizer does not consult. So no row grants anyone `publish` here —
+      // not even the owner, who has no reason to tell themselves anything.
+      [id, this.graphTopic(id), 'subscribe'],
     ]);
   },
 
   /** Grant both members everything they need for a friendship: pub/sub on the
-   *  shared conversation topic and subscribe on each other's presence.
-   *  Idempotent. (The topic's membership no longer needs recording separately —
-   *  `friendships.hash` already answers it; see getHashMembers.) */
-  async grantFriendTopic(pkA: string, pkB: string): Promise<void> {
-    const convo = `c/${friendshipHash(pkA, pkB)}`;
+   *  shared conversation topic, subscribe on each other's presence, and PUBLISH
+   *  on each other's inbox. Idempotent. (The topic's membership no longer needs
+   *  recording separately — `friendships.hash` already answers it; see
+   *  getHashMembers.)
+   *
+   *  The inbox grant is what makes first contact work while the peer is offline.
+   *  MQTT drops a publish to a topic nobody has subscribed to yet, so the old
+   *  key-agreement offer — sent on the conversation topic — vanished whenever the
+   *  peer had not connected since the friendship formed, and the client papered
+   *  over it with a 15s directory poll. The inbox is subscribed on every connect
+   *  with `cleanSession = false`, so the broker QUEUES for an offline peer
+   *  instead. The `init` frame goes there; everything after it stays on the
+   *  conversation topic.
+   *
+   *  This does not widen the trust boundary: a friend can already publish to the
+   *  shared conversation topic, and the inbox carries the same ciphertext. It is
+   *  scoped to friends — `grantSelfTopics` gives the owner 'all' on their own
+   *  inbox, and nobody else gets a row without a friendship. */
+  async grantFriendTopic(idA: string, idB: string): Promise<void> {
+    const convo = `c/${friendshipHash(idA, idB)}`;
     await this.grant([
-      [pkA, convo, 'all'],
-      [pkA, this.presenceTopic(pkB), 'subscribe'],
-      [pkB, convo, 'all'],
-      [pkB, this.presenceTopic(pkA), 'subscribe'],
+      [idA, convo, 'all'],
+      [idA, this.presenceTopic(idB), 'subscribe'],
+      [idA, this.inboxTopic(idB), 'publish'],
+      [idB, convo, 'all'],
+      [idB, this.presenceTopic(idA), 'subscribe'],
+      [idB, this.inboxTopic(idA), 'publish'],
     ]);
   },
 
-  /** Write a batch of (pk, topic, action) grants in one statement. */
+  /** Write a batch of (id, topic, action) grants in one statement. */
   async grant(rows: Array<[string, string, string]>): Promise<void> {
     await q(
-      `INSERT INTO mqtt_acl (pk, topic, action)
+      `INSERT INTO mqtt_acl (id, topic, action)
        SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
-       ON CONFLICT (pk_digest(pk), pk_digest(topic)) DO UPDATE SET action = EXCLUDED.action`,
+       ON CONFLICT (id, topic) DO UPDATE SET action = EXCLUDED.action`,
       [rows.map((r) => r[0]), rows.map((r) => r[1]), rows.map((r) => r[2])]
     );
   },
@@ -735,13 +974,21 @@ const DBImpl = {
    *  presence). Idempotent. Callers should ALSO kick any live subscription via
    *  the EMQX API — the row edit only affects the NEXT authorization check that
    *  misses the cache, not an already-open subscription. */
-  async revokeFriendTopic(pkA: string, pkB: string): Promise<void> {
-    const convo = `c/${friendshipHash(pkA, pkB)}`;
+  async revokeFriendTopic(idA: string, idB: string): Promise<void> {
+    const convo = `c/${friendshipHash(idA, idB)}`;
     await q(
       `DELETE FROM mqtt_acl
-        WHERE (pk = $1 AND topic = ANY($3::text[]))
-           OR (pk = $2 AND topic = ANY($4::text[]))`,
-      [pkA, pkB, [convo, this.presenceTopic(pkB)], [convo, this.presenceTopic(pkA)]]
+        WHERE (id = $1 AND topic = ANY($3::text[]))
+           OR (id = $2 AND topic = ANY($4::text[]))`,
+      [
+        idA,
+        idB,
+        // Mirror of grantFriendTopic — the inbox publish grant must come back out
+        // with the friendship, or an unfriended peer keeps a channel to wake this
+        // device with `init` frames it will no longer answer.
+        [convo, this.presenceTopic(idB), this.inboxTopic(idB)],
+        [convo, this.presenceTopic(idA), this.inboxTopic(idA)],
+      ]
     );
   },
 
@@ -749,34 +996,34 @@ const DBImpl = {
    *  revokes them - a paywall has to bite on the live session, not only on the
    *  next one - and resubscribing has to put them back. The friend list was
    *  never deleted, so it is the record of what to restore. */
-  async regrantAllFriendTopics(pk: string): Promise<number> {
-    const friends = await this.friendPks(pk);
-    for (const peer of friends) await this.grantFriendTopic(pk, peer);
+  async regrantAllFriendTopics(id: string): Promise<number> {
+    const friends = await this.friendIds(id);
+    for (const peer of friends) await this.grantFriendTopic(id, peer);
     return friends.length;
   },
 
-  /** Revoke every friend topic except `keepPk` (the helper bot, which the free
+  /** Revoke every friend topic except `keepId` (the helper bot, which the free
    *  tier keeps). Returns the peers revoked so the caller can ALSO drop their
    *  live subscriptions via the EMQX API. */
-  async revokeAllFriendTopics(pk: string, keepPk?: string): Promise<string[]> {
-    const friends = (await this.friendPks(pk)).filter((p) => p !== keepPk);
-    for (const peer of friends) await this.revokeFriendTopic(pk, peer);
+  async revokeAllFriendTopics(id: string, keepId?: string): Promise<string[]> {
+    const friends = (await this.friendIds(id)).filter((p) => p !== keepId);
+    for (const peer of friends) await this.revokeFriendTopic(id, peer);
     return friends;
   },
 
-  /** The two public keys that share a conversation hash (for push-bridge).
+  /** The two client ids that share a conversation hash (for push-bridge).
    *  Answered from the friendship itself — `hashmembers:{h}` was a third copy of
    *  a fact the edge already carried, and one more thing to keep in sync. */
   async getHashMembers(hash: string): Promise<string[]> {
-    const row = await one<{ pk_lo: string; pk_hi: string }>(
-      `SELECT pk_lo, pk_hi FROM friendships WHERE hash = $1`, [hash]
+    const row = await one<{ id_lo: string; id_hi: string }>(
+      `SELECT id_lo, id_hi FROM friendships WHERE hash = $1`, [hash]
     );
-    return row ? [row.pk_lo, row.pk_hi] : [];
+    return row ? [row.id_lo, row.id_hi] : [];
   },
 
-  /** All topics a pk may access (for repair/debugging). */
-  async getAclTopics(pk: string): Promise<string[]> {
-    const res = await q<{ topic: string }>(`SELECT topic FROM mqtt_acl WHERE pk = $1`, [pk]);
+  /** All topics a client may access (for repair/debugging). */
+  async getAclTopics(id: string): Promise<string[]> {
+    const res = await q<{ topic: string }>(`SELECT topic FROM mqtt_acl WHERE id = $1`, [id]);
     return res.rows.map((r) => r.topic);
   },
 
@@ -784,26 +1031,26 @@ const DBImpl = {
   // 6. MQTT AUTHENTICATION — opaque connect token (password)
   // ============================================================
   //
-  // No JWT. The auth server, after the HQC-KEM handshake proves pk ownership,
+  // No JWT. The auth server, after the HQC-KEM handshake proves key ownership,
   // mints a random 32-byte token, stores only its SHA-256, and returns the raw
-  // token to the client. The client presents it as the MQTT CONNECT password;
-  // EMQX's authn hook verifies it and is handed the token's `expire_at` so EMQX
-  // disconnects the client at expiry — expiration-based rotation.
-  // Grant = mintMqttToken; revoke = revokeMqttAuth.
+  // token to the client. The client presents it as the MQTT CONNECT password —
+  // with its client id as the username — and EMQX's authn hook verifies it and
+  // is handed the token's `expire_at` so EMQX disconnects the client at expiry
+  // (expiration-based rotation). Grant = mintMqttToken; revoke = revokeMqttAuth.
 
   /** Seconds a freshly-minted MQTT token stays valid before refresh is required. */
   MQTT_TOKEN_TTL_SECONDS,
 
   /** Mint (and store the hash of) a fresh opaque MQTT connect token for `pk`.
    *  Returns the RAW token — the only time it is ever available. */
-  async mintMqttToken(pk: string, ttlSeconds = MQTT_TOKEN_TTL_SECONDS): Promise<string> {
+  async mintMqttToken(id: string, ttlSeconds = MQTT_TOKEN_TTL_SECONDS): Promise<string> {
     const token = crypto.randomBytes(32).toString('hex');
     await q(
-      `INSERT INTO mqtt_tokens (pk, token_hash, expires_at)
+      `INSERT INTO mqtt_tokens (id, token_hash, expires_at)
        VALUES ($1, $2, now() + $3::interval)
-       ON CONFLICT (pk_digest(pk)) DO UPDATE SET
+       ON CONFLICT (id) DO UPDATE SET
          token_hash = EXCLUDED.token_hash, expires_at = EXCLUDED.expires_at`,
-      [pk, tokenHash(token), secs(ttlSeconds)]
+      [id, tokenHash(token), secs(ttlSeconds)]
     );
     return token;
   },
@@ -813,11 +1060,11 @@ const DBImpl = {
    *  Returns whether it is valid and, if so, its absolute `expireAt` (unix
    *  seconds) so the auth hook can tell EMQX when to force a re-auth. Revocation
    *  is immediate via revokeMqttAuth, and the expiry bounds a stale token. */
-  async verifyMqttToken(pk: string, token: string): Promise<{ ok: boolean; expireAt: number }> {
+  async verifyMqttToken(id: string, token: string): Promise<{ ok: boolean; expireAt: number }> {
     const row = await one<{ token_hash: string; expire_at: string }>(
       `SELECT token_hash, EXTRACT(epoch FROM expires_at)::bigint::text AS expire_at
-         FROM mqtt_tokens WHERE pk = $1 AND expires_at > now()`,
-      [pk]
+         FROM mqtt_tokens WHERE id = $1 AND expires_at > now()`,
+      [id]
     );
     if (!row) return { ok: false, expireAt: 0 };
     const a = Buffer.from(tokenHash(token));
@@ -826,12 +1073,12 @@ const DBImpl = {
     return { ok: true, expireAt: Number(row.expire_at) };
   },
 
-  /** Revoke a pk's current MQTT token immediately (account deletion / forced
-   *  logout). The next reconnect fails until a new token is minted; to drop an
-   *  already-open connection before its token expires, ALSO kick it via the EMQX
-   *  API (the "server can revoke" half of grant/revoke). */
-  async revokeMqttAuth(pk: string): Promise<void> {
-    await q(`DELETE FROM mqtt_tokens WHERE pk = $1`, [pk]);
+  /** Revoke a client's current MQTT token immediately (account deletion /
+   *  forced logout). The next reconnect fails until a new token is minted; to
+   *  drop an already-open connection before its token expires, ALSO kick it via
+   *  the EMQX API (the "server can revoke" half of grant/revoke). */
+  async revokeMqttAuth(id: string): Promise<void> {
+    await q(`DELETE FROM mqtt_tokens WHERE id = $1`, [id]);
   },
 
   /** Single-use nonce guard for a CONNECT. Returns true the FIRST time a nonce is
@@ -857,54 +1104,60 @@ const DBImpl = {
   // ============================================================
   //
   // The HQC-KEM handshake proves a client owns its public key: the auth server
-  // encapsulates to the pk and stores the expected proof; the client
-  // decapsulates, returns the proof, and the server compares + consumes it. On
-  // success it issues a multi-use REST session bearer (app-api auth + token
-  // refresh) alongside the MQTT connect token.
+  // encapsulates to the KEY and stores the expected proof under the client's ID;
+  // the client decapsulates, returns the proof, and the server compares +
+  // consumes it. On success it issues a multi-use REST session bearer (app-api
+  // auth + token refresh) alongside the MQTT connect token.
+  //
+  // Keyed by id rather than by the key it names, because a challenge row is
+  // pure bookkeeping — the encapsulation already happened, against a key the
+  // caller supplied, and nothing here needs to re-derive it. An id being
+  // derivable by anyone is irrelevant: what an attacker would have to produce
+  // is the PROOF, which requires the secret key.
 
   /** Store the expected KEM proof for an open challenge (hex). */
-  async startAuthChallenge(pk: string, proofHex: string, ttlSeconds = AUTH_CHALLENGE_TTL_SECONDS): Promise<void> {
+  async startAuthChallenge(id: string, proofHex: string, ttlSeconds = AUTH_CHALLENGE_TTL_SECONDS): Promise<void> {
     await q(
-      `INSERT INTO auth_challenges (pk, proof, expires_at)
+      `INSERT INTO auth_challenges (id, proof, expires_at)
        VALUES ($1, $2, now() + $3::interval)
-       ON CONFLICT (pk_digest(pk)) DO UPDATE SET proof = EXCLUDED.proof, expires_at = EXCLUDED.expires_at`,
-      [pk, proofHex, secs(ttlSeconds)]
+       ON CONFLICT (id) DO UPDATE SET proof = EXCLUDED.proof, expires_at = EXCLUDED.expires_at`,
+      [id, proofHex, secs(ttlSeconds)]
     );
   },
 
-  /** Atomically read AND delete the open challenge proof for `pk` (so it can't be
-   *  replayed). Returns the stored proof hex, or null if none. The caller does a
-   *  constant-time compare against the client's solution. */
-  async takeAuthChallenge(pk: string): Promise<string | null> {
+  /** Atomically read AND delete the open challenge proof for `id` (so it can't
+   *  be replayed). Returns the stored proof hex, or null if none. The caller
+   *  does a constant-time compare against the client's solution. */
+  async takeAuthChallenge(id: string): Promise<string | null> {
     const row = await one<{ proof: string }>(
-      `DELETE FROM auth_challenges WHERE pk = $1 AND expires_at > now() RETURNING proof`,
-      [pk]
+      `DELETE FROM auth_challenges WHERE id = $1 AND expires_at > now() RETURNING proof`,
+      [id]
     );
     return row?.proof ?? null;
   },
 
-  /** Mint a multi-use REST session bearer for `pk` at `scope`. Returns the raw
+  /** Mint a multi-use REST session bearer for `id` at `scope`. Returns the raw
    *  token — the only time it exists outside the caller. */
   async mintSessionToken(
-    pk: string,
+    id: string,
     scope: SessionScope = 'free',
     ttlSeconds = REST_SESSION_TTL_SECONDS
   ): Promise<string> {
     const token = crypto.randomBytes(32).toString('hex');
     // `iat` enforces the absolute cap; `expires_at` is the idle timeout. There
-    // is no separate per-pk index to maintain — revokeAllSessions is a WHERE
-    // clause, so the set of live bearers cannot drift from the bearers.
+    // is no separate per-identity index to maintain — revokeAllSessions is a
+    // WHERE clause, so the set of live bearers cannot drift from the bearers.
     await q(
-      `INSERT INTO sessions (token_hash, pk, scope, iat, expires_at)
+      `INSERT INTO sessions (token_hash, id, scope, iat, expires_at)
        VALUES ($1, $2, $3, now(), now() + $4::interval)`,
-      [tokenHash(token), pk, scope, secs(ttlSeconds)]
+      [tokenHash(token), id, scope, secs(ttlSeconds)]
     );
     return token;
   },
 
   /**
-   * Resolve a REST session bearer to its pk AND scope, sliding its idle timeout
-   * forward. Returns null when unknown, idle-expired, or past the absolute cap.
+   * Resolve a REST session bearer to its client id AND scope, sliding its idle
+   * timeout forward. Returns null when unknown, idle-expired, or past the cap.
    *
    * One statement, and usually a pure read: the slide only writes once the
    * session is within SESSION_SLIDE_AFTER_SECONDS of lapsing. Sliding on every
@@ -913,9 +1166,9 @@ const DBImpl = {
    */
   async resolveSessionToken(token: string): Promise<SessionInfo | null> {
     if (!token) return null;
-    const row = await one<{ pk: string; scope: SessionScope }>(
+    const row = await one<{ id: string; scope: SessionScope }>(
       `WITH found AS (
-         SELECT token_hash, pk, scope, iat
+         SELECT token_hash, id, scope, iat
            FROM sessions
           WHERE token_hash = $1 AND expires_at > now()
        ),
@@ -930,7 +1183,7 @@ const DBImpl = {
           WHERE token_hash IN (SELECT token_hash FROM found WHERE iat > now() - $2::interval)
             AND expires_at < now() + $4::interval
        )
-       SELECT pk, scope FROM found WHERE iat > now() - $2::interval`,
+       SELECT id, scope FROM found WHERE iat > now() - $2::interval`,
       [
         tokenHash(token),
         secs(REST_SESSION_MAX_AGE_SECONDS),
@@ -938,7 +1191,7 @@ const DBImpl = {
         secs(REST_SESSION_TTL_SECONDS - SESSION_SLIDE_AFTER_SECONDS),
       ]
     );
-    return row ? { pk: row.pk, scope: row.scope } : null;
+    return row ? { id: row.id, scope: row.scope } : null;
   },
 
   /** Revoke a REST session bearer (logout / account deletion). */
@@ -951,8 +1204,8 @@ const DBImpl = {
    *  subscription take effect now instead of whenever the last bearer happens
    *  to lapse - the same reason revocation reaches into EMQX rather than
    *  trusting a token lifetime (see lib/emqx.ts). Returns how many were ended. */
-  async revokeAllSessions(pk: string): Promise<number> {
-    const res = await q(`DELETE FROM sessions WHERE pk = $1`, [pk]);
+  async revokeAllSessions(id: string): Promise<number> {
+    const res = await q(`DELETE FROM sessions WHERE id = $1`, [id]);
     return res.rowCount ?? 0;
   },
 
@@ -966,7 +1219,7 @@ const DBImpl = {
     const row = await one<{ n: number }>(
       `INSERT INTO rate_counters (key, n, window_ends_at)
        VALUES ($1, 1, now() + $2::interval)
-       ON CONFLICT (pk_digest(key)) DO UPDATE SET
+       ON CONFLICT (key) DO UPDATE SET
          n = CASE WHEN rate_counters.window_ends_at <= now() THEN 1 ELSE rate_counters.n + 1 END,
          window_ends_at = CASE WHEN rate_counters.window_ends_at <= now()
                                THEN now() + $2::interval
@@ -1006,16 +1259,16 @@ const DBImpl = {
   /** Mint a session with a chosen issue time. Exists so a test can prove the
    *  absolute cap is enforced without waiting thirty days for it. */
   async mintSessionTokenAt(
-    pk: string,
+    id: string,
     ttlSeconds: number,
     issuedAtUnix: number,
     scope: SessionScope = 'free'
   ): Promise<string> {
     const token = crypto.randomBytes(32).toString('hex');
     await q(
-      `INSERT INTO sessions (token_hash, pk, scope, iat, expires_at)
+      `INSERT INTO sessions (token_hash, id, scope, iat, expires_at)
        VALUES ($1, $2, $3, to_timestamp($4), now() + $5::interval)`,
-      [tokenHash(token), pk, scope, issuedAtUnix, secs(ttlSeconds)]
+      [tokenHash(token), id, scope, issuedAtUnix, secs(ttlSeconds)]
     );
     return token;
   },
@@ -1026,7 +1279,7 @@ const DBImpl = {
 // Wrap every DB method so its wall-clock time is recorded (see lib/metrics.ts).
 // Only async methods (the ones that hit the database) are timed; sync helpers and
 // plain value members pass straight through. `this` is bound to the raw impl so a
-// method that calls a sibling (e.g. resolveToPk → getPkByUsername) records only
+// method that calls a sibling (e.g. resolveToId → getIdByUsername) records only
 // the top-level operation, not a double-counted nested one.
 function instrument<T extends object>(impl: T): T {
   return new Proxy(impl, {

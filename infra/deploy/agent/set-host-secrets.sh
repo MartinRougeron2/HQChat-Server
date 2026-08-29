@@ -9,6 +9,14 @@
 # enters GitHub, never passes through a runner, and is never in reach of anyone
 # with repo access.
 #
+# ⚠️ Values left behind in GitHub from that era are NOT read by anything — no
+# workflow references APNS_*, STRIPE_* or RESEND_* — but a real APNs .p8 or
+# Stripe key still sitting in a GitHub Environment is live production material
+# reachable by anyone with repo access, which is the exact exposure this model
+# removed. Revoke and delete them at the source rather than leaving them as
+# apparent configuration; they will mislead the next person who goes looking for
+# where a value comes from.
+#
 #   sudo infra/deploy/agent/set-host-secrets.sh prod
 #
 # Values are read from the environment and prompted for when unset, so nothing
@@ -38,6 +46,43 @@ rand_hex() { od -vAn -N"$1" -tx1 < /dev/urandom | tr -d ' \n'; }
 # db-migrate with EACCES. This is ownership, not a loosening: the mode is
 # unchanged, and no user other than root exists on these hosts.
 own() { chmod 600 "$1"; chown 1000:1000 "$1" 2>/dev/null || true; }
+
+# Multi-line secrets cannot come through `read`.
+#
+# `read -r -s -p` takes ONE line. For a Stripe key that is right; for a PEM it
+# is silently destructive — pasting Apple's .p8 at that prompt keeps
+# `-----BEGIN PRIVATE KEY-----` and throws the key away. The file that results
+# is a plausible size, has the right name, and produces
+# `error:1E08010C:DECODER routines::unsupported` from OpenSSL on every push,
+# hours later, with nothing pointing back here.
+#
+# So a PEM is taken as a PATH, not as a paste, and validated before it is
+# stored. Reading it from disk also means it never appears on a terminal.
+put_pem() { # put_pem <file> <env-var-holding-a-path-or-pem> <description>
+  local file="$1" var="$2" desc="$3" val="${!2:-}" path="$DIR/$1" src
+  if [[ -z "$val" && -s "$path" ]]; then echo "·  keep    $file"; return; fi
+  if [[ -z "$val" ]]; then
+    read -r -p "  $desc — PATH to the file (blank to skip): " val || true
+  fi
+  if [[ -z "$val" ]]; then : > "$path"; own "$path"; echo "⏭  empty   $file"; return; fi
+
+  if [[ -f "$val" ]]; then src="$val"
+  else
+    # A value rather than a path: accept it, but only if it looks like the whole
+    # key. This is where the truncated paste gets caught instead of stored.
+    src="$(mktemp)"; printf '%s' "$val" > "$src"
+  fi
+
+  if ! grep -q "BEGIN PRIVATE KEY" "$src" || ! grep -q "END PRIVATE KEY" "$src"; then
+    echo "❌ $file: not a complete PKCS#8 PEM (needs both BEGIN and END PRIVATE KEY)." >&2
+    echo "   Apple's .p8 is multi-line — give the PATH to it, do not paste it." >&2
+    [[ "$src" == "$val" ]] || rm -f "$src"
+    exit 1
+  fi
+  cp "$src" "$path"; own "$path"
+  [[ "$src" == "$val" ]] || rm -f "$src"
+  echo "🔐 wrote   $file ($(wc -l < "$path" | tr -d " ") lines)"
+}
 
 # put <file> <env-var> <description> [optional|generate]
 put() {
@@ -109,7 +154,7 @@ fi
 put stripe_secret_key     STRIPE_SECRET_KEY     "Stripe secret key"        optional
 put stripe_webhook_secret STRIPE_WEBHOOK_SECRET "Stripe webhook secret"    optional
 put resend_api_key        RESEND_API_KEY        "Resend API key"           optional
-put apns_key_p8           APNS_KEY_P8           "APNs .p8 key contents"    optional
+put_pem apns_key_p8       APNS_KEY_P8           "APNs signing key (.p8)"
 # Pepper for stored OTP hashes: without it a database dump yields every pending
 # claim code. Generated here if absent, and never rotated silently.
 put otp_pepper            OTP_PEPPER            "OTP pepper (32-byte hex)" generate
@@ -118,7 +163,48 @@ ENVFILE="/etc/hqcat/$STACK/server.env"
 if [[ ! -f "$ENVFILE" ]]; then
   printf '# Non-secret config for the %s stack. See infra/deploy/.env.example.\n' "$STACK" > "$ENVFILE"
   chmod 600 "$ENVFILE"
-  echo "📝 created $ENVFILE — fill in SERVER_NAME / PUBLIC_BASE_URL / ADMISSION_POLICY / APNS_* / STOREKIT_*"
+  echo "📝 created $ENVFILE — fill in SERVER_NAME / PUBLIC_BASE_URL / ADMISSION_POLICY / STOREKIT_*"
+fi
+
+# --- APNs: does anything actually supply the ids? ---------------------------
+#
+# The .p8 above is a secret and lives here. APNS_KEY_ID, APNS_TEAM_ID, the bundle
+# ids and APNS_ENV are NOT secrets, and GitHub owns them: the release workflow
+# bakes repository variables into the bundle (release.env) that the agent pulls,
+# and compose reads that BEFORE server.env so this host can still override.
+#
+# So this script does not prompt for them — it checks. A host that holds a key
+# and has no ids from either source sends nothing, silently, which is the state
+# that made push look broken for months.
+say_apns() {
+  local bundle="/opt/hqcat/$STACK/release.env" env="/etc/hqcat/$STACK/server.env"
+  local from missing=()
+  for var in APNS_KEY_ID APNS_TEAM_ID APNS_ENV; do
+    from=""
+    [[ -f "$bundle" ]] && grep -q "^$var=." "$bundle" && from="bundle"
+    grep -q "^$var=." "$env" 2>/dev/null && from="server.env (overriding)"
+    if [[ -n "$from" ]]; then echo "·  $var ← $from"; else missing+=("$var"); fi
+  done
+  from=""
+  for var in APNS_TOPIC_IOS APNS_TOPIC_MACOS; do
+    [[ -f "$bundle" ]] && grep -q "^$var=." "$bundle" && from="bundle"
+    grep -q "^$var=." "$env" 2>/dev/null && from="server.env (overriding)"
+  done
+  if [[ -n "$from" ]]; then echo "·  APNS_TOPIC_* ← $from"; else missing+=("APNS_TOPIC_IOS"); fi
+
+  if (( ${#missing[@]} )); then
+    echo "⚠️  An APNs key is installed but ${missing[*]} is set nowhere."
+    echo "    push-bridge will wake nobody, and will say so on every connect."
+    echo "    These are NOT secrets — set them as repository variables in GitHub"
+    echo "    and they arrive with the next release; or put them in $env to"
+    echo "    override for this stack only. See infra/deploy/.env.example."
+    [[ -f "$bundle" ]] || echo "    (no bundle on this host yet — it has not rolled over.)"
+  fi
+}
+
+if [[ -s "$DIR/apns_key_p8" ]]; then
+  echo "── APNs ───────────────────────────────────────────────────────────"
+  say_apns
 fi
 
 cat <<EOF

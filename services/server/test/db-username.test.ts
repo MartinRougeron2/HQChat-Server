@@ -15,7 +15,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DB } from "../services/db/api";
 
-const PK = "a".repeat(64); // shape irrelevant — validation trips before any lookup
+const ID = "a".repeat(64); // shape irrelevant — validation trips before any lookup
 
 // Every one of these contains a character outside [A-Za-z0-9_] or violates the
 // length bound, so the charset/length guard rejects it before any query runs.
@@ -37,7 +37,7 @@ const REJECTED = [
 for (const name of REJECTED) {
   test(`setUsername rejects ${JSON.stringify(name)}`, async () => {
     await assert.rejects(
-      () => DB.setUsername(PK, name),
+      () => DB.setUsername(ID, name),
       /between 3 and 32|letters, numbers, and underscores/,
       `expected ${JSON.stringify(name)} to be rejected by the charset/length guard`
     );

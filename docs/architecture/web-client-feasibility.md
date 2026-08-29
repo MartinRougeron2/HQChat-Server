@@ -102,7 +102,7 @@ one, and it should be made on its own merits rather than as a side effect of
    and the server side largely exists, but it presupposes a return to
    subscriptions. Reopen it if and when the paid-app model stops working.
 3. **If a web presence is wanted sooner**, the cheapest useful step is extending
-   the existing Cloudflare Worker landing page (`apps/web/src/index.js`) — no new
+   the existing Cloudflare Worker site (`apps/site/src/index.js`) — no new
    infrastructure, no crypto, no new threat model.
 
 ## What would change this verdict

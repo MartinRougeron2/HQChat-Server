@@ -53,6 +53,15 @@ of those.
 
 ## The flow
 
+These routes are the **only** place a public key enters the system: the server
+has to encapsulate a challenge to it, which nothing else in the stack does.
+Everything downstream — the session, the ACL, the topics, the broker's client id,
+`/mqtt/authn`'s username — names the caller by its **client id**,
+`id = sha256(lowercase-hex(pk))`. `/auth/*/verify` is where the two are tied
+together, immediately after the KEM proof establishes that the caller holds the
+key, and `users.identity_pk` written there is the only durable copy of an
+account's key the server keeps (it is what `GET /peer/{id}/key` serves).
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -84,16 +93,18 @@ sequenceDiagram
     Note right of Auth: a subscription can lapse inside<br/>the 60s challenge window
 
     Note over Auth,PG: 4 — mint credentials at the door's scope
-    Auth->>PG: INSERT sessions (sha256(token), pk, iat, scope)
-    Auth->>PG: INSERT mqtt_tokens (pk, sha256(token))
-    Auth->>PG: grantSelfTopics(pk) · ensureBotFriendship(pk)
+    Auth->>Auth: id = sha256(hex(pk))
+    Auth->>PG: INSERT users (id, identity_pk) — the only copy of the key
+    Auth->>PG: INSERT sessions (sha256(token), id, iat, scope)
+    Auth->>PG: INSERT mqtt_tokens (id, sha256(token))
+    Auth->>PG: grantSelfTopics(id) · ensureBotFriendship(id)
     opt premium
-        Auth->>PG: regrantAllFriendTopics(pk)
+        Auth->>PG: regrantAllFriendTopics(id)
     end
     Auth-->>App: { scope, sessionToken, mqttToken, mqttExpiresAt }
 
     Note over App,EMQX: 5 — connect
-    App->>EMQX: CONNECT clientId=pk, username=pk, password=mqttToken
+    App->>EMQX: CONNECT clientId=id, username=id, password=mqttToken
     EMQX->>Auth: POST /mqtt/authn { username, password, clientid }
     Auth->>PG: verify sha256(token) against mqtt_tokens
     Auth-->>EMQX: { result: "allow", expire_at }
@@ -138,7 +149,7 @@ sequenceDiagram
     Note right of Auth: identical whether or not that<br/>address bought anything
 
     App->>Auth: POST /claim/verify { email, code, pk }
-    Auth->>PG: INSERT subscription_claims (pk, H) — under the device cap
+    Auth->>PG: INSERT subscription_claims (id, H) — under the device cap
     App->>App: sign in again — the paid door now admits this key
 ```
 
@@ -199,7 +210,7 @@ continuous use cannot live forever.
 
 **Scope in the session needs revocation that acts.** A `premium` bearer would
 otherwise outlive a cancelled subscription by up to its 30-day cap, which is not
-a refund policy. `sessions:{pk}` indexes live bearers so the cancellation webhook
+a refund policy. `sessions.id` indexes live bearers so the cancellation webhook
 can end them, alongside `EMQX.kick` and the friend-topic revocation.
 
 **A lapse revokes topics but never deletes anything.** Friendships and message
@@ -238,7 +249,7 @@ top for the MQTT leg.
 | `/claim/start` returns 200 but no code arrives | either that address bought nothing, or mail is failing. The response cannot tell you which — check the server log, which can |
 | `/claim/verify` returns `NO_CODE` after wrong guesses | the code was burned at 5 attempts. Request a new one |
 | CONNACK returns code 5 (not authorised) | the MQTT token expired or was already consumed — refresh and reconnect |
-| `/auth/verify` returns 401 | the challenge expired (60 s) or the device holds the wrong key for that pk |
+| `/auth/verify` returns 401 | the challenge expired (60 s) or the device holds the wrong key for that identity |
 | `/auth/refresh` returns 401 | the session lapsed — a full handshake is needed, and the user sees a prompt |
 | `/auth/init` returns 404, on repeat, from a service | that caller predates the two-door split and was never moved. There is no un-doored init path; pick `/auth/free/*` or `/auth/paid/*` by the scope the caller needs |
 | A service authenticates fine, then 402s on every write | it authenticated through the free door but needs `premium`. The door, not the admission exemption, is what to change |

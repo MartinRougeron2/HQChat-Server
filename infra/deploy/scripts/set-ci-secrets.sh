@@ -20,7 +20,7 @@
 #   CLOUDFLARE_ZONE_NAME=...        # apex zone, e.g. example.com
 #   CLOUDFLARE_APP_HOST=...         # prod subdomain (default: chat)
 #   CLOUDFLARE_PREPROD_HOST=...     # pre-prod subdomain (default: preprod.chat)
-#   CLOUDFLARE_WORKER_ROUTE_HOST=.. # host the legal pages overlay (default: the zone)
+#   CLOUDFLARE_WORKER_ROUTE_HOST=.. # host the site overlays (default: the app host)
 #   CLOUDFLARE_ACCOUNT_ID=... \
 #   infra/deploy/scripts/set-ci-secrets.sh production
 #
@@ -58,7 +58,11 @@ CLOUDFLARE_ALERT_EMAIL="${CLOUDFLARE_ALERT_EMAIL:-}"
 need CLOUDFLARE_ZONE_NAME      "Cloudflare zone (apex domain)"
 CLOUDFLARE_APP_HOST="${CLOUDFLARE_APP_HOST:-chat}"
 CLOUDFLARE_PREPROD_HOST="${CLOUDFLARE_PREPROD_HOST:-preprod.chat}"
-CLOUDFLARE_WORKER_ROUTE_HOST="${CLOUDFLARE_WORKER_ROUTE_HOST:-$CLOUDFLARE_ZONE_NAME}"
+# Defaults to the APP host, not the apex. worker_paths now includes "/", and the
+# apex of a shared zone belongs to an unrelated site — defaulting there would
+# route that site's homepage to the hqchat Worker the first time someone ran
+# this without the variable set.
+CLOUDFLARE_WORKER_ROUTE_HOST="${CLOUDFLARE_WORKER_ROUTE_HOST:-$CLOUDFLARE_APP_HOST.$CLOUDFLARE_ZONE_NAME}"
 
 # Secrets
 for s in CLOUDFLARE_API_TOKEN CLOUDFLARE_API_TOKEN_USER ORIGIN_IPV4; do

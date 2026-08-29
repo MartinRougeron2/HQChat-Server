@@ -37,7 +37,14 @@ COPY . .
 # set-ci-secrets.sh, emqx-dashboard.sh, compute-spki-pins.sh, apply-nginx.sh)
 # are operator tools that belong on a laptop; harden-vm.sh is piped in over ssh
 # when needed rather than left lying on the box.
-COPY --from=deploy docker-compose.yml docker-compose.preprod.yml nginx.conf /deploy-bundle/
+# release.env carries the NON-SECRET config GitHub is the source of truth for
+# (the Apple bundle ids and key ids, today). The release workflow writes it
+# from repository variables just before this build, so the values reach a host
+# by being PULLED inside an immutable digest — GitHub still never touches a
+# server. It is listed in compose ahead of server.env, so the host overrides it.
+# It is explicitly not a place for secrets: anyone who can pull the image can
+# read it.
+COPY --from=deploy docker-compose.yml docker-compose.preprod.yml nginx.conf release.env /deploy-bundle/
 COPY --from=deploy emqx/ /deploy-bundle/emqx/
 COPY --from=deploy scripts/gen-runtime-secrets.sh scripts/hqcat-apply-nginx /deploy-bundle/scripts/
 COPY --from=deploy agent/ /deploy-bundle/agent/

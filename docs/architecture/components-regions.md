@@ -14,7 +14,7 @@ which is the decided direction when latency outside Europe starts costing users.
 flowchart TB
     subgraph edge["Cloudflare — global by construction"]
         CF[proxy · WAF · TLS termination]
-        WEB[apps/web worker<br/>marketing + legal]
+        WEB[apps/site worker<br/>marketing + legal]
     end
 
     iOS[iOS / macOS clients]
@@ -172,7 +172,7 @@ offline, and the user gets duplicate APNs wakes for one message.
 
 | Component | Single region | Multi region | Why |
 |---|---|---|---|
-| Cloudflare, `apps/web` | global | global | workers run at every PoP already |
+| Cloudflare, `apps/site` | global | global | workers run at every PoP already |
 | APNs | global | global | Apple's |
 | **auth** | on the VM | **one global instance** | connect-path only; replicating token state is not worth it |
 | **Postgres** | managed cluster, home region | **one writer + a regional read replica** | directory/friend reads local; nonces and claims must have one writer |

@@ -1,7 +1,7 @@
 # DissQus — MQTT + PQ Microservices Architecture
 
 Target architecture for splitting the current WS monolith
-([services/server/server.ts](../../services/server/legacy/server.ts)) into independently
+(the retired `/ws` monolith, deleted August 2026) into independently
 scalable services. Supersedes the single-relay model for the messaging/call path;
 the deployment/secrets model in [ARCHITECTURE.md](overview.md) still applies.
 
@@ -101,7 +101,7 @@ uses WebRTC against Cloudflare Realtime.
 
 - **Session layer** `ss_AS` (device↔server): authenticates the device, protects
   the connect token and control/metadata. From the connect-time KEM handshake.
-- **Content layer** `ss_AB` (device↔device): feeds the Tier-1/Tier-2 ratchet;
+- **Content layer**: feeds the KEM double ratchet ([e2ee-protocol.md](e2ee-protocol.md));
   encrypts all message content and derives call media keys. Neither the broker nor
   Cloudflare ever holds it.
 

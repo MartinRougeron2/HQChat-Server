@@ -17,11 +17,19 @@
  * changes any more, so invites are picked up by POLLING (`FRIEND_POLL_MS`)
  * rather than arriving as an event.
  *
- * The bot is a NORMAL MQTT user, not a service: it connects with its own public
- * key as client id and username and a short-lived token as password, and EMQX
+ * The bot is a NORMAL MQTT user, not a service: it connects with its own CLIENT
+ * ID as client id and username and a short-lived token as password, and EMQX
  * holds it to the same per-topic ACL as everyone else. It never touches the
  * `svc-internal` superuser credential — a bot that could read every
  * conversation would undo the point of the ACL.
+ *
+ * IDENTITY. The bot holds a keypair; everything that NAMES it is
+ * `peerId(pkHex)` — sha256 of the lowercase hex key, 64 characters. The key
+ * itself is used for exactly three things: decapsulating the auth challenge,
+ * answering an inbound `init`, and riding on the `init` frames the bot sends so
+ * a peer can verify it. Peers are named by their ids too, and their keys are
+ * fetched once (`GET /peer/{id}/key`) and VERIFIED against the id before being
+ * pinned — the server cannot substitute one, even for itself.
  *
  * Run on the VPS (it needs the Linux HQC lib). Env:
  *   AUTH_BASE_URL   default http://auth:8080
@@ -50,23 +58,23 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { HqcWrapper, HQC_CONSTANTS } from "../lib/hqc";
+import { hqcEncapsulate, hqcDecapsulate, aesEncrypt, aesDecrypt } from "./crypto";
 import {
-  hqcEncapsulate,
-  hqcDecapsulate,
-  aesEncrypt,
-  aesDecrypt,
-  deriveSharedKey,
-} from "./crypto";
-import {
-  deriveEpoch,
-  messageKey,
-  chainNext,
-  ratchetTo,
-  ROTATE_AFTER_MESSAGES,
-  MAX_SKIPPED,
-} from "../lib/ratchet";
+  Kem,
+  SessionState,
+  InitHeader,
+  MessageHeader,
+  PrekeyBundle,
+  startAsInitiator,
+  startAsResponder,
+  seal,
+  open as openRatchet,
+} from "../lib/ratchet-session";
+import { EnvelopeV2, canonicalHeader, parseEnvelope } from "../lib/envelope";
 import { authProof } from "../lib/auth-proof";
+import { liveFriendIds, staleFriendIds } from "./friend-graph";
 import { friendshipHash } from "../lib/crypto-utils";
+import { keyMatchesId, peerId } from "../lib/identity";
 import { DB } from "../services/db/api";
 
 const AUTH_BASE = (process.env.AUTH_BASE_URL || "http://auth:8080").replace(/\/$/, "");
@@ -78,9 +86,6 @@ const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "support@example.com";
 /// How often to re-read the friend graph. There is no server push for it any
 /// more, and an invite that waits a few seconds is not worth a second protocol.
 const FRIEND_POLL_MS = Number(process.env.FRIEND_POLL_MS || 15_000);
-/// Don't re-offer our KEM ciphertext to an unresponsive peer on every single
-/// poll — once a minute is enough to heal a handshake that was lost in flight.
-const HANDSHAKE_RETRY_MS = 60_000;
 // Persist state (seed + per-friend keys) in a directory SEPARATE from the code.
 // In Docker the bot-state volume mounts at BOT_STATE_DIR — never over /app/bot
 // (the code dir), which would shadow bot.ts and pin the container to stale code
@@ -102,90 +107,205 @@ function loadSeed(): Buffer {
 const seed = loadSeed();
 const { pk, sk } = HqcWrapper.keypairFromSeed(seed);
 const pkHex = pk.toString("hex");
+/** What every other layer calls this bot: sha256(lowercase-hex(pk)), 64 chars. */
+const myId = peerId(pkHex);
 
-/** Public keys are 2KB of hex; logs get the ends only. */
+/** Ids are 64 characters and keys are 14474; logs get the ends only. */
 function short(hex: string): string {
   return hex.length <= 20 ? hex : `${hex.slice(0, 8)}…${hex.slice(-8)}`;
 }
 
+// ── The KEM the ratchet rides on ─────────────────────────────────────────────
+// A thin adapter so the state machine never imports HQC — which is what lets it
+// be tested against a stub on a machine with no native library.
+const kem: Kem = {
+  generateKeypair() {
+    const s = crypto.randomBytes(HQC_CONSTANTS.SEED_BYTES);
+    return HqcWrapper.keypairFromSeed(s);
+  },
+  encapsulate: (peerPk) => hqcEncapsulate(peerPk),
+  decapsulate: (secret, ct) => hqcDecapsulate(secret, ct),
+};
+
 // ── Per-friend state ─────────────────────────────────────────────────────────
-// Epoch ≥ 1 ratchet state (Tier 1 + Tier 2). All keys hex. `skipped` holds
-// message keys for out-of-order/offline receives, keyed by chain index.
-interface EpochState {
-  epoch: number;
-  sendCK: string;
-  sendIdx: number;
-  recvCK: string;
-  recvIdx: number;
-  mediaKey: string;
-  skipped: Record<string, string>;
-}
+//
+// One v2 double-ratchet session per peer. v1 kept a static channel key, its two
+// contributed secrets, the stored KEM ciphertext AND an epoch ratchet beside
+// them — because the handshake was a mutual exchange whose halves arrived
+// separately and whose product was a key every message then reused. All of that
+// collapses into `session`.
+//
+// Buffers do not survive JSON, so the session is stored with every Buffer as
+// base64 and revived on load (see `reviveSession` / `dehydrateSession`).
 interface FriendState {
-  pk: string; // hex public key
+  /** The peer's client id — how the graph, the topics and the ACL name them. */
+  id: string;
+  /**
+   * The peer's identity public key, hex — absent until it has been fetched and
+   * VERIFIED against `id`.
+   *
+   * Absent is a real state, not a bug: the directory ships ids, so a friend
+   * appears before their key does. Nothing that needs a key runs without one
+   * (`openSession` fetches it first), and a key that fails `keyMatchesId` is
+   * refused rather than stored, so this field is either missing or correct.
+   */
+  pk?: string;
   username?: string; // display only — logs and the greeting text
-  // Epoch 0 static channel key from the KEM handshake (§KM-1). `mySeed` is the
-  // shared secret WE contributed (our encapsulation's ss); `myCt` is the KEM
-  // ciphertext we sent for it (base64) — kept so a re-handshake re-sends the SAME
-  // encapsulation and both sides derive the same key. `peerSeed` is the ss we
-  // recovered from the peer's ciphertext.
-  mySeed?: string;   // hex — our contributed shared secret (ss)
-  myCt?: string;     // base64 — the KEM ciphertext we sent for mySeed
-  peerSeed?: string; // hex — the ss we decapsulated from the peer's ciphertext
-  sharedKey?: string; // hex AES-256 key
-  // Epoch ≥ 1 ratchet.
-  cur?: EpochState; // current epoch
-  prev?: EpochState; // one previous epoch, recv-only grace window
-  rot?: { epoch: number; mySeed?: string; myCt?: string; peerSeed?: string }; // in-flight rotation
-  sentInEpoch?: number; // messages sent since the last epoch install (count trigger)
+  /** The double-ratchet session, or absent when none is open yet. */
+  session?: SessionState;
   // Whether this user has had the welcome message. Persisted with the rest of
   // the friend state so a bot restart never re-greets someone.
   greeted?: boolean;
 }
-/// Keyed by the peer's PUBLIC KEY hex — the same identity the conversation
-/// topic, the EMQX ACL and the envelope's `sender` are keyed on. It used to be
-/// keyed by username, because the `/ws` server resolved names for us; MQTT has
-/// no such mediator, and a mutable display name must never be what decides
-/// which key decrypts a message.
+
+/// Keyed by the peer's CLIENT ID — the same identity the conversation topic, the
+/// EMQX ACL and the envelope's `sender` are keyed on. It was keyed by the public
+/// key, and before that by username (the `/ws` server resolved names for us;
+/// MQTT has no such mediator, and a mutable display name must never be what
+/// decides which key decrypts a message).
 type State = { friends: Record<string, FriendState> };
 
 let state: State = { friends: {} };
+
+// ── Session serialisation ────────────────────────────────────────────────────
+//
+// `SessionState` is full of Buffers and the bot persists to a JSON file, where a
+// Buffer round-trips as `{type:"Buffer",data:[…]}` — which still parses, still
+// typechecks, and produces a plain object that every crypto call then treats as
+// empty. That failure is silent and total: every message stops decrypting and
+// nothing says why. So the conversion is explicit in both directions.
+
+/** Every Buffer field in a session, by path. Nested ones are handled inline. */
+function dehydrateSession(s: SessionState): unknown {
+  return {
+    ...s,
+    root: s.root.toString("base64"),
+    rkPub: s.rkPub.toString("base64"),
+    rkSec: s.rkSec.toString("base64"),
+    peerRkPub: s.peerRkPub ? s.peerRkPub.toString("base64") : null,
+    send: s.send ? { ck: s.send.ck.toString("base64"), n: s.send.n } : null,
+    recv: s.recv ? { ck: s.recv.ck.toString("base64"), n: s.recv.n } : null,
+    skipped: s.skipped.map((k) => ({ chain: k.chain, n: k.n, key: k.key.toString("base64") })),
+    pendingInit: s.pendingInit
+      ? {
+          ctId: s.pendingInit.ctId.toString("base64"),
+          ctMt: s.pendingInit.ctMt.toString("base64"),
+          ctOt: s.pendingInit.ctOt ? s.pendingInit.ctOt.toString("base64") : null,
+          otId: s.pendingInit.otId,
+          rk: s.pendingInit.rk.toString("base64"),
+          cid: s.pendingInit.cid,
+        }
+      : undefined,
+  };
+}
+
+const b64 = (v: unknown): Buffer => Buffer.from(String(v ?? ""), "base64");
+
+/** Rebuild a session from the JSON form. Returns null if it is not one. */
+function reviveSession(raw: unknown): SessionState | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, any>;
+  if (typeof r.root !== "string" || typeof r.rkPub !== "string") return null;
+  try {
+    return {
+      root: b64(r.root),
+      rkPub: b64(r.rkPub),
+      rkSec: b64(r.rkSec),
+      peerRkPub: r.peerRkPub ? b64(r.peerRkPub) : null,
+      send: r.send ? { ck: b64(r.send.ck), n: Number(r.send.n) } : null,
+      recv: r.recv ? { ck: b64(r.recv.ck), n: Number(r.recv.n) } : null,
+      prevSendN: Number(r.prevSendN ?? 0),
+      skipped: Array.isArray(r.skipped)
+        ? r.skipped.map((k: any) => ({ chain: String(k.chain), n: Number(k.n), key: b64(k.key) }))
+        : [],
+      seenChains: Array.isArray(r.seenChains) ? r.seenChains.map(String) : [],
+      ...(r.pendingInit
+        ? {
+            pendingInit: {
+              ctId: b64(r.pendingInit.ctId),
+              ctMt: b64(r.pendingInit.ctMt),
+              ctOt: r.pendingInit.ctOt ? b64(r.pendingInit.ctOt) : null,
+              otId: r.pendingInit.otId ?? null,
+              rk: b64(r.pendingInit.rk),
+              cid: String(r.pendingInit.cid),
+            } as InitHeader,
+          }
+        : {}),
+      sentOnChain: Number(r.sentOnChain ?? 0),
+      chainStartedAt: Number(r.chainStartedAt ?? 0),
+    };
+  } catch {
+    return null;
+  }
+}
 
 function loadState() {
   if (!fs.existsSync(STATE_FILE)) return;
   let raw: any;
   try { raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return; }
 
-  // Migrate username-keyed state (every entry already carries its `pk`) to
-  // pk-keyed, keeping the old key as the display name. Entries with no usable
-  // pk are dropped: without one there is no topic to reach that peer on, so
-  // their keys are unusable regardless.
+  // Re-key the store to CLIENT IDS.
+  //
+  // Two earlier shapes exist in the wild: username-keyed (the `/ws` era) and
+  // public-key-keyed. Both carry the peer's `pk`, so both can be converted
+  // without asking the server — `peerId(pk)` is the new key, and the old public
+  // key is kept as `pk` because it is still needed to encapsulate.
+  //
+  // An entry with no usable key is DROPPED rather than guessed at: there is no
+  // way to derive an id from a username, so there is no topic to reach that peer
+  // on and no way to seal anything for them. They come back on the next sync.
   const friends: Record<string, FriendState> = {};
   let migrated = 0;
   let dropped = 0;
-  for (const [key, entry] of Object.entries((raw?.friends ?? {}) as Record<string, FriendState>)) {
+  for (const [key, entry] of Object.entries((raw?.friends ?? {}) as Record<string, any>)) {
     const peerPk = String(entry?.pk || "").toLowerCase();
-    if (!/^[0-9a-f]{16,}$/.test(peerPk)) { dropped++; continue; }
-    if (peerPk !== key) {
-      if (!entry.username) entry.username = key;
+    // A full HQC-256 public key, or nothing. The old check was `{16,}`, which
+    // accepted a truncated key and produced an id for a peer that does not exist.
+    const hasKey = peerPk.length === HQC_CONSTANTS.PUBLIC_KEY_BYTES * 2 && /^[0-9a-f]+$/.test(peerPk);
+    const storedId = String(entry?.id || "").toLowerCase();
+    const peerId_ = hasKey ? peerId(peerPk) : storedId;
+    if (!/^[0-9a-f]{64}$/.test(peerId_)) { dropped++; continue; }
+    if (peerId_ !== key) {
+      // The old key was a username or a public key; keep a username as the
+      // display name, since that is all it was ever good for.
+      if (!entry.username && !/^[0-9a-f]+$/.test(key)) entry.username = key;
       migrated++;
     }
-    entry.pk = peerPk;
-    friends[peerPk] = entry;
+    const next: FriendState = {
+      id: peerId_,
+      ...(hasKey ? { pk: peerPk } : {}),
+      ...(entry.username ? { username: String(entry.username) } : {}),
+      ...(entry.greeted ? { greeted: true } : {}),
+    };
+    // v1 state (a static `sharedKey`, seeds, an epoch ratchet) cannot open a v2
+    // frame, so it is dropped rather than migrated — the pair simply re-opens a
+    // session on the next message.
+    const revived = reviveSession(entry?.session);
+    if (revived) next.session = revived;
+    friends[peerId_] = next;
   }
   state = { friends };
   if (migrated || dropped) {
-    logger.startup(`🤖 [bot] state re-keyed by public key: ${migrated} migrated, ${dropped} unusable`);
+    logger.startup(`🤖 [bot] state re-keyed by client id: ${migrated} migrated, ${dropped} unusable`);
     saveState();
   }
 }
 function saveState() {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
+  const out = {
+    friends: Object.fromEntries(
+      Object.entries(state.friends).map(([k, f]) => [
+        k,
+        f.session ? { ...f, session: dehydrateSession(f.session) } : f,
+      ])
+    ),
+  };
+  fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2), { mode: 0o600 });
 }
 loadState();
 
-/** Log/greeting label for a peer — its username if we know one, else its key. */
-function label(peerPk: string): string {
-  return state.friends[peerPk]?.username || short(peerPk);
+/** Log/greeting label for a peer — its username if we know one, else its id. */
+function label(peerId_: string): string {
+  return state.friends[peerId_]?.username || short(peerId_);
 }
 
 // ── REST control plane (auth + directory + friend graph) ─────────────────────
@@ -272,7 +392,7 @@ async function handshake(): Promise<void> {
   }
   sessionToken = verify.body.sessionToken;
   mqttToken = String(verify.body.mqttToken || "");
-  logger.startup(`🤖 [bot] authenticated as ${short(pkHex)}`);
+  logger.startup(`🤖 [bot] authenticated as ${short(myId)}`);
 }
 
 /**
@@ -305,8 +425,8 @@ async function claimUsername(): Promise<void> {
  */
 async function syncGraph(): Promise<void> {
   const invites = await api("GET", "/friends/invites");
-  for (const invite of (invites?.invites ?? []) as Array<{ pk?: string; username?: string }>) {
-    const from = String(invite?.pk || "").toLowerCase();
+  for (const invite of (invites?.invites ?? []) as Array<{ id?: string; username?: string }>) {
+    const from = String(invite?.id || "").toLowerCase();
     if (!from) continue;
     logger.debug(`🤖 [bot] invite from @${invite?.username ?? short(from)} — accepting`);
     // Accepting is also what grants BOTH of us the conversation topic in the
@@ -315,37 +435,127 @@ async function syncGraph(): Promise<void> {
   }
 
   const list = await api("GET", "/friends");
-  for (const friend of (list?.friends ?? []) as Array<{ pk?: string; username?: string }>) {
-    const peerPk = String(friend?.pk || "").toLowerCase();
-    if (!/^[0-9a-f]{16,}$/.test(peerPk) || peerPk === pkHex) continue;
-    trackFriend(peerPk, String(friend?.username || ""));
+  const live = liveFriendIds(list, myId);
+  if (!live) {
+    // A 200 whose body is not a list is not an empty friend graph. Pruning on it
+    // would delete every session the bot holds.
+    logger.error(`🤖 [bot] /friends returned no list — skipping this sync rather than pruning`);
+    return;
   }
+
+  for (const friend of (list.friends ?? []) as Array<{ id?: string; username?: string }>) {
+    const peerId_ = String(friend?.id || "").toLowerCase();
+    if (!live.has(peerId_)) continue;
+    trackFriend(peerId_, String(friend?.username || ""));
+  }
+  pruneFriends(live);
+}
+
+/**
+ * Drop peers the server no longer lists.
+ *
+ * This is what kept the bot in a permanent reconnect loop. `syncGraph` only ever
+ * ADDED, so an unfriended peer stayed in `.bot-state.json` for good — while
+ * `revokeFriendTopic` deleted its row from `mqtt_acl`. Every reconnect the bot
+ * subscribed to a topic it was no longer entitled to, and with
+ * `authorization.deny_action = disconnect` the broker answered by closing the
+ * link. Connect, subscribe, 0x87, drop, repeat, for as long as that entry
+ * existed — which was forever, because nothing removed it.
+ *
+ * The damage was worse than one dead conversation: the denial arrives mid-batch,
+ * and `subscribeConversation` returns early once the link is gone, so every
+ * friend queued AFTER the stale one was silently skipped too. One removed
+ * contact took the whole bot offline.
+ */
+function pruneFriends(live: Set<string>) {
+  const stale = staleFriendIds(Object.keys(state.friends), live);
+  if (!stale.length) return;
+
+  for (const peerId_ of stale) {
+    // The session goes with it: it was derived for a friendship that no longer
+    // exists, and keeping it would let a re-friend resume a ratchet the peer has
+    // long since dropped.
+    const name = label(peerId_);
+    delete state.friends[peerId_];
+    // Best-effort — the grant is already gone, so this may be refused too. It is
+    // issued anyway so a peer removed WHILE we are connected stops being
+    // delivered without waiting for a reconnect.
+    if (client?.connected) client.unsubscribe(convoTopic(peerId_), () => {});
+    logger.warn(
+      `🤖 [bot] dropped @${name} — no longer in the friend graph ` +
+      `(its topic grant is revoked, and re-subscribing to it drops the link)`
+    );
+  }
+  saveState();
 }
 
 /** Ensure state + subscription + key agreement for one peer. Idempotent. */
-function trackFriend(peerPk: string, username: string) {
-  const known = state.friends[peerPk];
-  const f: FriendState = known ?? { pk: peerPk };
+function trackFriend(peerId_: string, username: string) {
+  const known = state.friends[peerId_];
+  const f: FriendState = known ?? { id: peerId_ };
   const renamed = !!username && username !== f.username;
   if (renamed) f.username = username;
-  state.friends[peerPk] = f;
+  state.friends[peerId_] = f;
   // The poll runs every few seconds; only touch the state file when it changed.
   if (!known || renamed) saveState();
-  if (!known) logger.debug(`🤖 [bot] friend: @${username || short(peerPk)}`);
-  subscribeConversation(peerPk);
-  // No channel yet (fresh friend, or a handshake lost while one side was down).
-  // Re-offering our ciphertext is safe — sendAesSeed reuses the stored one.
-  if (!f.sharedKey && !f.cur) maybeOfferSeed(peerPk);
+  if (!known) logger.debug(`🤖 [bot] friend: @${username || short(peerId_)}`);
+  subscribeConversation(peerId_);
+  // Nothing to do about a missing session here. v1 re-offered its KEM ciphertext
+  // on a timer, because an offer published into a topic with no subscriber was
+  // simply lost and the retry WAS the recovery. A session now opens on demand
+  // from published prekeys, and the `init` frame goes to the peer's inbox where
+  // the broker queues it — so there is nothing to retry and nothing to sweep.
+  greet(peerId_);
 }
 
-const lastSeedOffer = new Map<string, number>();
-/** Offer our KEM ciphertext, at most once per HANDSHAKE_RETRY_MS per peer. */
-function maybeOfferSeed(peerPk: string) {
-  if (!client?.connected) return; // nothing to publish onto yet; CONNACK retries
-  const now = Date.now();
-  if (now - (lastSeedOffer.get(peerPk) ?? 0) < HANDSHAKE_RETRY_MS) return;
-  lastSeedOffer.set(peerPk, now);
-  sendAesSeed(peerPk);
+/**
+ * The peer's identity public key, fetched once and VERIFIED against their id.
+ *
+ * The directory ships ids, so this is where a key enters the bot's world. The
+ * check is the whole point of the identifier being a digest: `GET /peer/{id}/key`
+ * is an unauthenticated route on a server the protocol does not trust, and a
+ * substituted key is refused rather than pinned — TOFU narrows to "trust the id
+ * the graph gave you", and everything after that is arithmetic.
+ *
+ * Returns null when the key is unavailable or does not match. A null is not an
+ * error to recover from here; the caller simply cannot open a session yet.
+ */
+async function peerKey(f: FriendState): Promise<string | null> {
+  if (f.pk) return f.pk;
+  let served: string;
+  try {
+    const body = await api("GET", `/peer/${f.id}/key`);
+    served = String(body?.publicKey || "").toLowerCase();
+  } catch (e: any) {
+    logger.error(`🤖 [bot] could not fetch @${label(f.id)}'s key: ${e.message}`);
+    return null;
+  }
+  if (!keyMatchesId(served, f.id)) {
+    // Loud, and refused. Either the server is lying or the directory and the
+    // key store disagree; both mean this key must not be encrypted to.
+    logger.error(
+      `🚨 [bot] the key served for @${label(f.id)} does NOT hash to their id ` +
+      `(${short(f.id)}) — refusing it. This is what the identifier being a ` +
+      `commitment exists to catch.`
+    );
+    return null;
+  }
+  f.pk = served;
+  saveState();
+  return served;
+}
+
+/**
+ * Adopt the key an `init` frame carried, if we did not already hold one.
+ *
+ * `parseEnvelope` has already refused any frame whose `senderPk` does not hash
+ * to its `sender`, so by the time this runs the key is known to be the one the
+ * id names. Taking it here is what makes first contact cost no round trip.
+ */
+function adoptSenderKey(f: FriendState, env: EnvelopeV2): void {
+  if (f.pk || !env.senderPk) return;
+  f.pk = env.senderPk.toLowerCase();
+  saveState();
 }
 
 // ── MQTT conversations ───────────────────────────────────────────────────────
@@ -363,43 +573,63 @@ const MAX_RELINK_MS = 30_000;
  *  (We can't just drop its listeners — mqtt.js keeps its own on the client.) */
 let linkGeneration = 0;
 
-function convoTopic(peerPk: string): string {
-  return `c/${friendshipHash(pkHex, peerPk)}`;
+function convoTopic(peerId_: string): string {
+  return `c/${friendshipHash(myId, peerId_)}`;
 }
-const PRESENCE_TOPIC = `u/${pkHex}/presence`;
+const PRESENCE_TOPIC = `u/${myId}/presence`;
 const PRESENCE_ONLINE = JSON.stringify({ s: "online" });
 const PRESENCE_OFFLINE = JSON.stringify({ s: "offline" });
 
 /**
- * What one conversation payload carries. This is the wire contract with the
- * apps' `ConversationEnvelope` (ConversationRouter.swift) and must stay
- * byte-compatible with it. `sender` is the PUBLIC KEY hex, not a username.
+ * Publish a frame to `peerPk`, on whichever topic can actually deliver it.
+ *
+ * An `init` goes to the peer's INBOX, everything else to the shared conversation
+ * topic. The distinction is delivery, not secrecy: MQTT drops a publish to a
+ * topic nobody has subscribed to, which is exactly what a brand-new friendship
+ * is. Every client subscribes to its own inbox on connect with a persistent
+ * session, so the broker queues it for an offline peer instead.
  */
-interface Envelope {
-  type: "message" | "aes" | "key_rotate";
-  sender: string;
-  payload: string;
-  messageId?: string;
-  epoch?: number;
-  idx?: number;
-  /** Set on an `aes` frame that ANSWERS an offer, so it is not answered back.
-   *  Absent on an offer, and on anything sent by a peer predating this field —
-   *  which reads as an offer, the safe default (it may be answered once). */
-  isReply?: boolean;
-}
-
-function publish(peerPk: string, envelope: Envelope) {
+function publish(peerId_: string, envelope: EnvelopeV2) {
   if (!client) return;
+  const topic = envelope.t === "init" ? inboxTopic(peerId_) : convoTopic(peerId_);
   // QoS 1 into the client's own outgoing store: a publish issued while the link
   // is down is delivered on the next connect rather than lost.
-  client.publish(convoTopic(peerPk), JSON.stringify(envelope), { qos: 1 });
+  client.publish(topic, JSON.stringify(envelope), { qos: 1 });
 }
 
-function subscribeConversation(peerPk: string) {
+/** A peer's inbox — where their `init` frames land, and ours are read from. */
+function inboxTopic(peerId_: string): string {
+  return `u/${peerId_}/inbox`;
+}
+
+/** Our own inbox — where peers put their `init` frames. Subscribed on every
+ *  connect, which is what lets the broker queue one while the bot is down. */
+function subscribeInbox() {
+  if (!client?.connected) return;
+  const op = `SUBSCRIBE ${inboxTopic(myId)} (own inbox)`;
+  opStart(op);
+  client.subscribe(inboxTopic(myId), { qos: 1 }, (err, granted) => {
+    opDone(op);
+    if (err) return logger.error(`🤖 [bot] subscribe inbox: ${err.message}`);
+    const refused = (granted ?? []).filter((g) => g.qos >= 128);
+    if (refused.length) {
+      logger.error(
+        `🤖 [bot] subscribe REFUSED for our OWN inbox ${inboxTopic(myId)} ` +
+        `(0x${refused[0]!.qos.toString(16)}) — grantSelfTopics has not run for this id, ` +
+        `or its row is missing from mqtt_acl`
+      );
+    }
+  });
+}
+
+function subscribeConversation(peerId_: string) {
   if (!client?.connected) return; // (re)subscribed wholesale on CONNACK
-  client.subscribe(convoTopic(peerPk), { qos: 1 }, (err, granted) => {
+  const op = `SUBSCRIBE ${convoTopic(peerId_)} (conversation with @${label(peerId_)})`;
+  opStart(op);
+  client.subscribe(convoTopic(peerId_), { qos: 1 }, (err, granted) => {
+    opDone(op);
     if (err) {
-      logger.error(`🤖 [bot] subscribe ${label(peerPk)}: ${err.message}`);
+      logger.error(`🤖 [bot] subscribe ${label(peerId_)}: ${err.message}`);
       return;
     }
     // A broker that REFUSES a subscription does not produce an error: MQTT
@@ -407,25 +637,91 @@ function subscribeConversation(peerPk: string) {
     // `granted` with `err` null. Checking only `err` meant an ACL denial looked
     // exactly like success — the bot would sit there, subscribed to nothing,
     // answering nobody, with a clean log.
-    const refused = (granted ?? []).some((g) => g.qos === 128);
-    if (refused) {
+    // Under MQTT 5 a denial is a reason code >= 0x80 here; 128 is the 3.1.1
+    // spelling of the same thing. With deny_action=disconnect the broker may
+    // drop the link INSTEAD of answering, which is why the `disconnect` handler
+    // above matters as much as this check does.
+    const refused = (granted ?? []).filter((g) => g.qos >= 128);
+    if (refused.length) {
       logger.error(
-        `🤖 [bot] subscribe REFUSED for ${label(peerPk)} on ${convoTopic(peerPk)} — ` +
-        `the EMQX ACL has no grant for this pair (mqtt_acl); nothing will be received`
+        `🤖 [bot] subscribe REFUSED for ${label(peerId_)} on ${convoTopic(peerId_)} ` +
+        `(0x${refused[0]!.qos.toString(16)}) — the EMQX ACL has no grant for this pair ` +
+        `(mqtt_acl); nothing will be received`
       );
     }
   });
 }
 
+/**
+ * MQTT 5 DISCONNECT reason codes worth naming, from the broker's side.
+ *
+ * Only the ones this deployment can actually produce. The first two are the
+ * whole reason this table exists: they are the two causes of a connect/drop
+ * loop, they are indistinguishable under 3.1.1, and the remedies are opposite —
+ * one is a missing ACL row, the other is a second process holding the same
+ * client id.
+ */
+const DISCONNECT_REASONS: Record<number, string> = {
+  0x87: "0x87 NOT AUTHORIZED — an ACL denial (deny_action=disconnect). " +
+        "Check mqtt_acl for this pk; note the authorizer caches for 15m",
+  0x8e: "0x8E SESSION TAKEN OVER — another connection used the same client id " +
+        "(a second bot process, or an old container still running)",
+  0x8d: "0x8D KEEPALIVE TIMEOUT — we stopped responding (a blocked event loop)",
+  0x89: "0x89 SERVER BUSY",
+  0x8b: "0x8B SERVER SHUTTING DOWN",
+  0x95: "0x95 PACKET TOO LARGE",
+  0x9a: "0x9A RETAIN NOT SUPPORTED",
+  0x82: "0x82 PROTOCOL ERROR",
+};
+
+/**
+ * MQTT operations issued but not yet acknowledged, in the order they went out.
+ *
+ * `deny_action = disconnect` kills the link on the FIRST denial, and the broker
+ * handles packets in order — so when a disconnect arrives, the head of this list
+ * is the operation that caused it. Everything behind it was simply in flight.
+ *
+ * This exists because the reason code says WHY but not WHAT: "0x87 not
+ * authorized" with five subscribes and a publish in flight names none of them,
+ * and the six candidates have six different remedies.
+ */
+let pendingOps: string[] = [];
+
+function opStart(op: string) {
+  pendingOps.push(op);
+}
+function opDone(op: string) {
+  const i = pendingOps.indexOf(op);
+  if (i !== -1) pendingOps.splice(i, 1);
+}
+
 function connectMqtt() {
   const gen = ++linkGeneration;
-  logger.debug(`🤖 [bot] connecting to ${EMQX_URL} as ${short(pkHex)}`);
+  logger.debug(`🤖 [bot] connecting to ${EMQX_URL} as ${short(myId)}`);
   const c = mqtt.connect(EMQX_URL, {
-    // The client id IS the public key: EMQX keys the topic ACL on it, and a
-    // duplicate id kicks the previous session (single-session enforcement).
-    clientId: pkHex,
-    username: pkHex,
+    // The client id IS our identity: EMQX keys the topic ACL on it
+    // (`WHERE id = ${clientid}`), and a duplicate id kicks the previous session
+    // (single-session enforcement). It used to be the whole 14474-character
+    // public key, which travelled in every CONNECT packet and made every
+    // per-client admin call — every kick — a ~14.5 kB URL the broker answered
+    // with 414.
+    clientId: myId,
+    username: myId,
     password: mqttToken,
+    // MQTT 5, where 3.1.1 would do — because 3.1.1 gives the broker NO way to
+    // say why it dropped us. It just closes the socket, and every cause arrives
+    // as the same "connection closed".
+    //
+    // That is not hypothetical here: `authorization.deny_action = disconnect`
+    // (infra/deploy/emqx/emqx.conf) means an ACL denial is DELIVERED as a
+    // disconnect, so a missing grant and a dead network look identical from this
+    // side. Under MQTT 5 the broker names it — 0x87 not authorized, 0x8E session
+    // taken over, 0x8D keepalive — which is the difference between reading a log
+    // and guessing at one.
+    //
+    // The apps still speak 3.1.1 (MQTTWireClient.swift). EMQX serves both at
+    // once; this is per-connection and changes nothing for them.
+    protocolVersion: 5,
     // Persistent session — this IS the offline queue. Messages published to our
     // conversations while the bot is restarting are held by the broker and
     // delivered on reconnect, which is what the `/ws` pending-queue used to do.
@@ -447,16 +743,34 @@ function connectMqtt() {
   c.on("connect", () => {
     relinkDelay = 2_000;
     logger.startup(`🤖 [bot] connected to EMQX at ${EMQX_URL}`);
-    c.publish(PRESENCE_TOPIC, PRESENCE_ONLINE, { qos: 1, retain: true });
-    for (const [peerPk, f] of Object.entries(state.friends)) {
-      subscribeConversation(peerPk);
-      // Anything that was still mid-handshake when the link died: the offers
-      // made while we were down went nowhere, so make them again now.
-      if (!f.sharedKey && !f.cur) maybeOfferSeed(peerPk);
-    }
+    pendingOps = [];
+    const presenceOp = `PUBLISH ${PRESENCE_TOPIC} (retain)`;
+    opStart(presenceOp);
+    c.publish(PRESENCE_TOPIC, PRESENCE_ONLINE, { qos: 1, retain: true }, () => opDone(presenceOp));
+    subscribeInbox();
+    for (const peerId_ of Object.keys(state.friends)) subscribeConversation(peerId_);
+    // Our own bundle is what lets anyone open a session with us, so it has to be
+    // in place before the first `init` could arrive rather than after.
+    void ensurePrekeysPublished();
   });
   c.on("message", (topic, payload) => { void onEnvelope(topic, payload); });
   c.on("error", (e) => logger.error(`🤖 [bot] mqtt: ${e.message}`));
+  // The broker's own account of why it is closing the link. Without this the
+  // `close` handler below logs "connection closed" for every cause there is.
+  c.on("disconnect", (packet: { reasonCode?: number; properties?: { reasonString?: string } }) => {
+    const code = packet?.reasonCode;
+    const named = code !== undefined ? (DISCONNECT_REASONS[code] ?? `unknown (0x${code.toString(16)})`) : "no reason given";
+    const detail = packet?.properties?.reasonString;
+    logger.error(`🤖 [bot] broker disconnected us: ${named}${detail ? ` — ${detail}` : ""}`);
+    if (pendingOps.length) {
+      // In order, and the broker stops at the first refusal — so the head is the
+      // operation that did it, not merely one that happened to be open.
+      logger.error(
+        `🤖 [bot]   ↳ culprit: ${pendingOps[0]}` +
+        (pendingOps.length > 1 ? `  (also in flight: ${pendingOps.slice(1).join(", ")})` : "")
+      );
+    }
+  });
   c.on("close", () => { if (gen === linkGeneration) relink("connection closed"); });
 }
 
@@ -491,282 +805,419 @@ function relink(why: string) {
 
 /** Inbound conversation payload. */
 async function onEnvelope(topic: string, raw: Buffer) {
-  let env: any;
-  try { env = JSON.parse(raw.toString("utf8")); } catch { return; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw.toString("utf8")); } catch { return; }
 
-  const sender = typeof env?.sender === "string" ? env.sender.toLowerCase() : "";
+  const env = parseEnvelope(parsed);
+  if (!env) return;  // not a well-formed v2 frame
+
+  // `parseEnvelope` has already established that `sender` is a well-formed
+  // client id and — for an `init` — that `senderPk` is the key it names.
+  const sender = env.sender;
   // MQTT delivers our own publishes back to us (we subscribe to the topic we
   // publish on). Nothing to do with them.
-  if (!sender || sender === pkHex) return;
+  if (sender === myId) return;
 
   const f = state.friends[sender];
   if (!f) return;
-  // The topic is derived from the two public keys, so a payload naming a
-  // `sender` who is not a member of THIS conversation is not addressable state.
-  if (topic !== convoTopic(sender)) return;
 
-  switch (env.type) {
-    case "aes": {
-      try {
-        // Decapsulate the peer's KEM ciphertext → the shared secret they contributed.
-        const peerSs = hqcDecapsulate(sk, Buffer.from(String(env.payload), "base64"));
-        const incoming = peerSs.toString("hex");
-        // Answer anything that is not itself an answer, and only while it still
-        // tells us something new. Both halves are load-bearing:
-        //
-        //   - answering an OFFER unconditionally is what heals a peer that lost
-        //     its state. The old rule here answered everything, and the app's
-        //     answered only when it held no seed of its own — so an app that had
-        //     one never replied, and a bot with a fresh state volume could never
-        //     derive the key. It dropped every message, silently, for good.
-        //   - never answering an ANSWER is what stops the two sides trading
-        //     frames forever once both of them answer offers.
-        const advanced = f.peerSeed !== incoming || !f.sharedKey;
-        f.peerSeed = incoming;
-        // sendAesSeed reuses our stored ciphertext (f.myCt), so a re-handshake
-        // resends the SAME encapsulation and both sides stay on one key.
-        if (env.isReply !== true && advanced) sendAesSeed(sender, /* isReply */ true);
-        if (f.mySeed && f.peerSeed) {
-          const key = deriveSharedKey(Buffer.from(f.mySeed, "hex"), Buffer.from(f.peerSeed, "hex"));
-          f.sharedKey = key.toString("hex");
-          logger.debug(`🔒 [bot] secure channel established with @${label(sender)}`);
-          greet(sender);
-        }
-        saveState();
-      } catch (e: any) {
-        logger.error(`🤖 [bot] AES handshake error with @${label(sender)}:`, e.message);
-      }
-      break;
-    }
+  // A frame must arrive where that sender is entitled to put it: an `init` on
+  // OUR inbox, anything else on the conversation topic derived from the two
+  // ids. Without this a friend could publish a `msg` naming a different sender
+  // into a topic they do share, and be read as that person.
+  const expected = env.t === "init" ? inboxTopic(myId) : convoTopic(sender);
+  if (topic !== expected) return;
 
-    case "message": {
-      const epoch = Number.isInteger(env.epoch) ? Number(env.epoch) : 0;
-      try {
-        // §KM-1 step 5: the per-message outer HQC layer is gone. The payload is
-        // the AES-GCM base64 directly, sealed under the ratchet key (epoch ≥ 1) or
-        // the epoch-0 static channel key.
-        const aesB64 = String(env.payload);
-        let text: string;
-        if (epoch >= 1) {
-          const mk = obtainRecvKey(f, epoch, Number(env.idx));
-          if (!mk) {
-            logger.error(`🤖 [bot] no ratchet key for @${label(sender)} (epoch ${epoch}, idx ${env.idx})`);
-            break;
-          }
-          text = aesDecrypt(aesB64, mk);
-          saveState();
-        } else {
-          if (!f.sharedKey) {
-            // The peer thinks we share a channel and we do not — our side of
-            // the key agreement is missing (lost state, or a handshake that
-            // never completed). This used to be a bare `break`: the message
-            // vanished with no log at any level, which is precisely why "the
-            // bot stopped answering" came with nothing to go on.
-            logger.error(
-              `🤖 [bot] message from @${label(sender)} with no shared key — ` +
-              `key agreement incomplete (mySeed=${!!f.mySeed}, peerSeed=${!!f.peerSeed}); re-offering`
-            );
-            // Ask for their half again. Throttled to once per HANDSHAKE_RETRY_MS,
-            // so a peer that cannot answer does not turn every message into a
-            // publish. A peer that CAN answer heals the channel from here.
-            maybeOfferSeed(sender);
-            break;
-          }
-          text = aesDecrypt(aesB64, Buffer.from(f.sharedKey, "hex"));
-        }
-        const answer = reply(text);
-        logger.debug(`💬 [bot] @${label(sender)}: ${text}  →  ${answer.split("\n")[0]}`);
-        sendMessage(sender, answer);
-      } catch (e: any) {
-        logger.error(`🤖 [bot] message decrypt error from @${label(sender)}:`, e.message);
-      }
-      break;
-    }
+  if (env.t === "init") return onInit(f, env);
+  return onMessage(f, env);
+}
 
-    case "key_rotate": {
-      // Tier-1 epoch re-handshake — a near-clone of the AES case, epoch-scoped.
-      if (!f.pk) break;
-      const epoch = Number(env.epoch);
-      if (!Number.isInteger(epoch) || epoch <= currentEpoch(f)) break; // stale/duplicate
-      try {
-        const peerSs = hqcDecapsulate(sk, Buffer.from(String(env.payload), "base64"));
-        if (!f.rot || f.rot.epoch !== epoch) f.rot = { epoch }; // peer-initiated
-        f.rot.peerSeed = peerSs.toString("hex");
-        // Contribute our own encapsulation for this epoch if we haven't yet
-        // (symmetric: each side sends exactly one, so simultaneous rotation needs
-        // no tie-break).
-        if (!f.rot.mySeed) {
-          const { ct, ss } = hqcEncapsulate(Buffer.from(f.pk, "hex"));
-          f.rot.mySeed = ss.toString("hex");
-          f.rot.myCt = ct.toString("base64");
-          publish(sender, { type: "key_rotate", sender: pkHex, payload: f.rot.myCt, epoch });
-        }
-        if (f.rot.mySeed && f.rot.peerSeed) {
-          installEpoch(sender, f, epoch, Buffer.from(f.rot.mySeed, "hex"), Buffer.from(f.rot.peerSeed, "hex"));
-        }
-        saveState();
-      } catch (e: any) {
-        logger.error(`🤖 [bot] key_rotate error with @${label(sender)}:`, e.message);
-      }
-      break;
-    }
+/** Open a session from an inbound `init`. */
+function onInit(f: FriendState, env: EnvelopeV2) {
+  // A session already running is NOT replaced. That is the difference between
+  // "my peer reinstalled" and "somebody replayed a frame to wipe the
+  // conversation", and nothing here can tell them apart.
+  if (f.session) {
+    logger.debug(`🤖 [bot] init from @${label(f.id)} ignored — session already open`);
+    return;
   }
-}
+  const header = initHeaderFrom(env);
+  if (!header) return;
 
-// ── Ratchet helpers (epoch ≥ 1) ──────────────────────────────────────────────
-function currentEpoch(f: FriendState): number {
-  return f.cur?.epoch ?? 0;
-}
+  const secrets = prekeySecrets();
+  if (!secrets) {
+    logger.error(`🤖 [bot] init from @${label(f.id)} dropped — no prekeys published yet`);
+    return;
+  }
 
-function epochStateFor(f: FriendState, epoch: number): EpochState | undefined {
-  if (f.cur?.epoch === epoch) return f.cur;
-  if (f.prev?.epoch === epoch) return f.prev;
-  return undefined;
-}
+  const session = startAsResponder(kem, secrets, header);
+  if (!session) {
+    // A one-time secret we no longer hold, or a ciphertext that is not ours.
+    // Both ordinary — a duplicate init, or one built on a consumed key.
+    logger.debug(`🤖 [bot] could not derive a session from @${label(f.id)}'s init`);
+    return;
+  }
 
-/** Install a freshly negotiated epoch; demote the current one to recv-only grace. */
-function installEpoch(peerPk: string, f: FriendState, epoch: number, mySeed: Buffer, peerSeed: Buffer) {
-  const ek = deriveEpoch(mySeed, peerSeed);
-  if (f.cur) f.prev = f.cur; // keep exactly one previous epoch (drops any older)
-  f.cur = {
-    epoch,
-    sendCK: ek.sendCK.toString("hex"),
-    sendIdx: 0,
-    recvCK: ek.recvCK.toString("hex"),
-    recvIdx: 0,
-    mediaKey: ek.mediaKey.toString("hex"),
-    skipped: {},
-  };
-  delete f.rot;
-  f.sentInEpoch = 0;
-  logger.debug(`🔄 [bot] installed epoch ${epoch} with @${label(peerPk)}`);
-}
+  // Open the message the init carried BEFORE burning the one-time key, so a
+  // frame that turns out to be undecryptable does not cost us the key.
+  const mk = openRatchet(kem, session, messageHeaderFrom(env));
+  if (!mk) return;
+  let text: string;
+  try {
+    text = aesDecrypt(env.payload, mk, canonicalHeader(env));
+  } catch {
+    logger.debug(`🤖 [bot] init from @${label(f.id)} did not decrypt`);
+    return;
+  }
 
-/** Start a Tier-1 rotation to the next epoch by sending our fresh seed. */
-function initiateRotation(peerPk: string) {
-  const f = state.friends[peerPk];
-  if (!f?.pk) return;
-  const nextEpoch = currentEpoch(f) + 1;
-  if (f.rot && f.rot.epoch >= nextEpoch) return; // one already in flight
-  const { ct, ss } = hqcEncapsulate(Buffer.from(f.pk, "hex"));
-  f.rot = { epoch: nextEpoch, mySeed: ss.toString("hex"), myCt: ct.toString("base64") };
-  publish(peerPk, { type: "key_rotate", sender: pkHex, payload: f.rot.myCt!, epoch: nextEpoch });
+  // The initiator's key rode on the frame, already verified against `sender` —
+  // so replying costs no fetch. This is the second of the two journeys the full
+  // key makes (the other is friend-add), and both are checked on arrival.
+  adoptSenderKey(f, env);
+  f.session = session;
+  if (env.otId !== undefined && env.otId !== null) consumeOneTimePrekey(env.otId);
   saveState();
-  logger.debug(`🔄 [bot] initiating rotation to epoch ${nextEpoch} with @${label(peerPk)}`);
+  logger.debug(`🤖 [bot] ✅ session open with @${label(f.id)}`);
+  void handleText(f, text);
 }
 
-/** Cap the skipped-key cache, evicting the lowest (oldest) indices first. */
-function boundSkipped(es: EpochState) {
-  const keys = Object.keys(es.skipped);
-  if (keys.length <= MAX_SKIPPED) return;
-  keys.map(Number).sort((a, b) => a - b).slice(0, keys.length - MAX_SKIPPED)
-    .forEach((k) => delete es.skipped[String(k)]);
-}
-
-/** Message key for a received (epoch, idx): cache hit, or ratchet forward. */
-function obtainRecvKey(f: FriendState, epoch: number, idx: number): Buffer | undefined {
-  const es = epochStateFor(f, epoch);
-  if (!es || !Number.isInteger(idx) || idx < 0) return undefined;
-  const cached = es.skipped[String(idx)];
-  if (cached) {
-    delete es.skipped[String(idx)];
-    return Buffer.from(cached, "hex");
+/** Decrypt and act on a text message. */
+function onMessage(f: FriendState, env: EnvelopeV2) {
+  if (!f.session) {
+    logger.debug(`🤖 [bot] no session with @${label(f.id)}`);
+    return;
   }
-  if (idx < es.recvIdx) return undefined; // already consumed and not cached
-  const step = ratchetTo(Buffer.from(es.recvCK, "hex"), es.recvIdx, idx);
-  for (const s of step.skipped) es.skipped[String(s.idx)] = s.key.toString("hex");
-  es.recvCK = step.ck.toString("hex");
-  es.recvIdx = step.nextIdx;
-  boundSkipped(es);
-  return step.messageKey;
+  const mk = openRatchet(kem, f.session, messageHeaderFrom(env));
+  if (!mk) {
+    // A replay, a straggler from a retired chain, or a gap too large to bridge.
+    logger.debug(`🤖 [bot] no key for @${label(f.id)} (cid ${env.cid.slice(0, 8)}…, n ${env.n})`);
+    return;
+  }
+  let text: string;
+  try {
+    text = aesDecrypt(env.payload, mk, canonicalHeader(env));
+  } catch {
+    // The key was right for this position but the frame did not authenticate:
+    // a tampered header, or a corrupt payload. The ratchet still advanced, which
+    // is correct — the sender did send this position.
+    logger.debug(`🤖 [bot] frame from @${label(f.id)} failed authentication`);
+    saveState();
+    return;
+  }
+  saveState();
+  void handleText(f, text);
 }
 
-function bumpAndMaybeRotate(peerPk: string, f: FriendState) {
-  f.sentInEpoch = (f.sentInEpoch ?? 0) + 1;
-  if (f.sentInEpoch >= ROTATE_AFTER_MESSAGES) initiateRotation(peerPk);
+// ── Header adapters ──────────────────────────────────────────────────────────
+// The wire carries base64; the ratchet works in bytes. Keeping the conversion
+// here means neither the state machine nor the envelope knows about the other.
+
+function messageHeaderFrom(e: EnvelopeV2): MessageHeader {
+  return {
+    cid: e.cid,
+    n: e.n,
+    pn: e.pn,
+    ...(e.rk ? { rk: Buffer.from(e.rk, "base64") } : {}),
+    ...(e.kemCt ? { kemCt: Buffer.from(e.kemCt, "base64") } : {}),
+  };
+}
+
+function initHeaderFrom(e: EnvelopeV2): InitHeader | null {
+  if (!e.ctId || !e.ctMt || !e.rk) return null;
+  const ctOt = e.ctOt ? Buffer.from(e.ctOt, "base64") : null;
+  return {
+    ctId: Buffer.from(e.ctId, "base64"),
+    ctMt: Buffer.from(e.ctMt, "base64"),
+    ctOt,
+    otId: ctOt ? (e.otId ?? null) : null,
+    rk: Buffer.from(e.rk, "base64"),
+    cid: e.cid,
+  };
+}
+
+// ── Prekeys ──────────────────────────────────────────────────────────────────
+//
+// The bot publishes a bundle like any other client — it is the responder in
+// nearly every conversation, so without one nobody could open a session with it.
+// Secrets live in the state file beside everything else.
+
+const PREKEY_POOL = 8;
+const PREKEY_REPLENISH_AT = 4;
+/** A medium-term key is reused by every handshake that misses the one-time
+ *  pool, so its lifetime IS the forward-secrecy window for those sessions. */
+const MEDIUM_TERM_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
+
+interface PrekeyStore {
+  mediumPk: string;  // base64
+  mediumSk: string;  // base64
+  oneTime: Record<string, { pk: string; sk: string }>;
+  nextId: number;
+  rotatedAt: number;
+}
+let prekeys: PrekeyStore | null = null;
+const PREKEY_FILE = path.join(STATE_DIR, ".bot-prekeys.json");
+
+function loadPrekeys() {
+  if (!fs.existsSync(PREKEY_FILE)) return;
+  try { prekeys = JSON.parse(fs.readFileSync(PREKEY_FILE, "utf8")); } catch { prekeys = null; }
+}
+function savePrekeys() {
+  if (!prekeys) return;
+  fs.writeFileSync(PREKEY_FILE, JSON.stringify(prekeys), { mode: 0o600 });
+}
+
+/** The secrets needed to answer an inbound `init`. */
+function prekeySecrets() {
+  if (!prekeys) return null;
+  return {
+    identitySk: sk,
+    mediumSk: Buffer.from(prekeys.mediumSk, "base64"),
+    oneTimeSk: (id: number) => {
+      const e = prekeys?.oneTime[String(id)];
+      return e ? Buffer.from(e.sk, "base64") : null;
+    },
+  };
+}
+
+/** Burn a one-time secret once it has opened a handshake. Separate from
+ *  `prekeySecrets` so a frame that failed to decapsulate does not cost a key. */
+function consumeOneTimePrekey(id: number) {
+  if (!prekeys) return;
+  if (delete prekeys.oneTime[String(id)]) savePrekeys();
+}
+
+/** Make sure a bundle is published, minting and uploading one as needed. */
+async function ensurePrekeysPublished(): Promise<void> {
+  try {
+    const rotate = !prekeys || Date.now() - prekeys.rotatedAt > MEDIUM_TERM_LIFETIME_MS;
+    let want = PREKEY_POOL;
+    if (!rotate) {
+      // Ask the SERVER how many are left, not our own store: ours still holds
+      // every secret we minted, including the ones already claimed.
+      const count = await api("GET", "/prekeys/count");
+      const remaining = Number(count?.remaining ?? 0);
+      if (remaining > PREKEY_REPLENISH_AT) return;
+      want = PREKEY_POOL - remaining;
+    }
+
+    if (rotate || !prekeys) {
+      const pair = kem.generateKeypair();
+      prekeys = {
+        mediumPk: pair.pk.toString("base64"),
+        mediumSk: pair.sk.toString("base64"),
+        oneTime: prekeys?.oneTime ?? {},
+        nextId: prekeys?.nextId ?? 0,
+        rotatedAt: Date.now(),
+      };
+    }
+
+    const minted: Array<{ id: number; prekey: string }> = [];
+    for (let i = 0; i < Math.max(0, Math.min(want, PREKEY_POOL)); i++) {
+      const pair = kem.generateKeypair();
+      const id = prekeys.nextId++;
+      prekeys.oneTime[String(id)] = {
+        pk: pair.pk.toString("base64"),
+        sk: pair.sk.toString("base64"),
+      };
+      minted.push({ id, prekey: pair.pk.toString("hex") });
+    }
+
+    // Persist BEFORE publishing. Holding secrets nobody can claim costs nothing;
+    // publishing keys we cannot open would make every claim against them an
+    // `init` we must refuse.
+    savePrekeys();
+    await api("POST", "/prekeys", {
+      medium: Buffer.from(prekeys.mediumPk, "base64").toString("hex"),
+      oneTime: minted,
+    });
+    logger.debug(`🤖 [bot] published ${minted.length} one-time prekey(s)`);
+  } catch (e: any) {
+    // Not fatal: a missing bundle costs first contact, not an open conversation.
+    logger.error(`🤖 [bot] could not publish prekeys: ${e.message}`);
+  }
 }
 
 // ── Crypto-aware senders ─────────────────────────────────────────────────────
-function sendAesSeed(peerPk: string, isReply = false) {
-  const f = state.friends[peerPk];
-  if (!f?.pk) return;
-  // Encapsulate ONCE and remember (ss, ct). Re-sends reuse the stored ciphertext
-  // so a re-handshake keeps both peers on the same shared secret.
-  if (!f.mySeed || !f.myCt) {
-    const { ct, ss } = hqcEncapsulate(Buffer.from(f.pk, "hex"));
-    f.mySeed = ss.toString("hex");
-    f.myCt = ct.toString("base64");
-    saveState();
-  }
-  publish(peerPk, { type: "aes", sender: pkHex, payload: f.myCt, ...(isReply ? { isReply: true } : {}) });
-}
+
+/** Greets in flight, and greets already reported as stuck. Deliberately NOT in
+ *  `state`: a restart should retry a greeting that never went out, and should
+ *  re-report one that still cannot. Only `greeted` — set once the frame is
+ *  actually published — is persisted. */
+const greeting = new Set<string>();
+const greetWarned = new Set<string>();
 
 /** The first thing a new user ever receives. The server auto-friends the bot to
  *  every account, so this lands moments after the first login — which used to
  *  leave the new user staring at an empty conversation with an account they
  *  hadn't chosen and no idea what it was for.
  *
- *  Sent exactly once per user (`greeted`, persisted), and only after the secure
- *  channel exists — there is no unencrypted path to send it on. */
-function greet(peerPk: string) {
-  const f = state.friends[peerPk];
-  if (!f || f.greeted) return;
-  f.greeted = true;
-  saveState();
+ *  Sent exactly once per user — `greeted` is persisted, but only after the frame
+ *  is actually published, so an attempt that could not send is retried rather
+ *  than lost. No longer waits for a channel: the message IS the handshake now. */
+function greet(peerId_: string) {
+  const f = state.friends[peerId_];
+  if (!f || f.greeted || greeting.has(peerId_)) return;
+  if (!client?.connected) return;  // retried on the next poll
+
+  // In flight, in memory. The flag that stops a double greet must NOT be the
+  // persisted one: `greeted` used to be set here, before the send, so that two
+  // polls could not both welcome the same user — but `sendMessage` fails for
+  // reasons that are ordinary and temporary (the peer has published no prekeys
+  // yet, the link dropped between this check and the publish), and a persisted
+  // flag turned every one of those into a welcome message that was never sent
+  // and never retried. That is what a brand-new account looked like after a
+  // data wipe: the bot friended, said nothing, and the conversation stayed
+  // "not encrypted" because the `init` frame the greeting carries never went.
+  greeting.add(peerId_);
   const name = f.username || "there";
-  // A beat, so the peer has certainly installed its side of the channel before
-  // the first ciphertext arrives (the AES frame precedes this one on the wire,
-  // but the client's handshake work is asynchronous).
-  setTimeout(() => {
-    sendMessage(
-      peerPk,
-      [
-        `welcome to dissqus, @${name}.`,
-        "",
-        "i'm helper — the account you start with, so your first conversation isn't an empty screen. this chat is end-to-end encrypted like every other one: the server relays it and can't read it.",
-        "",
-        "try /help for what i can do, or just say hello.",
-      ].join("\n")
-    );
-    logger.debug(`👋 [bot] greeted @${label(peerPk)}`);
-  }, 1500);
+  void (async () => {
+    try {
+      const sent = await sendMessage(
+        peerId_,
+        [
+          `welcome to dissqus, @${name}.`,
+          "",
+          "i'm helper — the account you start with, so your first conversation isn't an empty screen. this chat is end-to-end encrypted like every other one: the server relays it and can't read it.",
+          "",
+          "try /help for what i can do, or just say hello.",
+        ].join("\n")
+      );
+      if (!sent) {
+        // Visible ONCE per peer. Everything `sendMessage` and `openSession` say
+        // about why is logger.debug, which is off in production — so the whole
+        // failure was silent, on the one path whose result a user sees directly.
+        // Repeating it every FRIEND_POLL_MS would be noise, so subsequent
+        // attempts drop back to debug.
+        const first = !greetWarned.has(peerId_);
+        greetWarned.add(peerId_);
+        const line = `👋 [bot] could not greet @${label(peerId_)} yet — will retry every ${FRIEND_POLL_MS}ms ` +
+          `(usually: they have published no prekeys, which happens on their first directory sync)`;
+        if (first) logger.warn(line); else logger.debug(line);
+        return;
+      }
+      f.greeted = true;
+      greetWarned.delete(peerId_);
+      saveState();
+      logger.debug(`👋 [bot] greeted @${label(peerId_)}`);
+    } finally {
+      greeting.delete(peerId_);
+    }
+  })();
 }
 
-function sendMessage(peerPk: string, text: string) {
-  const f = state.friends[peerPk];
-  if (!f?.pk) return;
-  if (f.cur) {
-    // Epoch ≥ 1: seal with the per-message ratchet key, then advance the chain.
-    // §KM-1 step 5: no outer per-message HQC — the payload is the AES-GCM base64.
-    const mk = messageKey(Buffer.from(f.cur.sendCK, "hex"));
-    publish(peerPk, {
-      type: "message",
-      sender: pkHex,
-      payload: aesEncrypt(text, mk),
-      // nosemgrep: javascript.node-stdlib.cryptography.crypto-insecure-random.crypto-insecure-random
-      // A message identifier, not key material — and randomUUID is a CSPRNG already.
-      messageId: crypto.randomUUID(),
-      epoch: f.cur.epoch,
-      idx: f.cur.sendIdx,
-    });
-    f.cur.sendCK = chainNext(Buffer.from(f.cur.sendCK, "hex")).toString("hex");
-    f.cur.sendIdx++;
-    bumpAndMaybeRotate(peerPk, f);
-    saveState();
-    return;
+/** Reply to a decrypted message. */
+async function handleText(f: FriendState, text: string): Promise<void> {
+  await sendMessage(f.id, reply(text));
+}
+
+/**
+ * Seal and send one message, opening a session first if there is none.
+ *
+ * Opening on demand is what lets the bot greet somebody who has never been
+ * online at the same time as it: the frame carries the handshake, and the
+ * broker queues it on their inbox.
+ */
+async function sendMessage(peerId_: string, text: string): Promise<boolean> {
+  const f = state.friends[peerId_];
+  if (!f) return false;
+  // Checked BEFORE opening a session, not just before publishing. Opening one
+  // claims a one-time prekey from the peer — spending that on a message we
+  // cannot then send would burn their key for nothing and leave us holding a
+  // session they were never told about.
+  //
+  // The false returns are load-bearing: `greet` only records a user as welcomed
+  // when this says the frame went out.
+  if (!client?.connected) return false;
+
+  if (!f.session) {
+    const opened = await openSession(f);
+    if (!opened) return false;
   }
-  // Epoch 0: static channel key (also counts toward the first rotation).
-  if (!f.sharedKey) return;
-  publish(peerPk, {
-    type: "message",
-    sender: pkHex,
-    payload: aesEncrypt(text, Buffer.from(f.sharedKey, "hex")),
-    // nosemgrep: javascript.node-stdlib.cryptography.crypto-insecure-random.crypto-insecure-random
-    // A message identifier, not key material — and randomUUID is a CSPRNG already.
-    messageId: crypto.randomUUID(),
-  });
-  bumpAndMaybeRotate(peerPk, f);
-  saveState();
+
+  try {
+    const sealed = seal(kem, f.session!);
+    const envelope: EnvelopeV2 = {
+      v: 2,
+      t: sealed.initHeader ? "init" : "msg",
+      sender: myId,
+      msgId: crypto.randomUUID(),
+      cid: sealed.header.cid,
+      n: sealed.header.n,
+      pn: sealed.header.pn,
+      ...(sealed.initHeader
+        ? {
+            // `senderPk` rides on `init` alone: it is the frame the peer may
+            // receive before they have ever fetched our key, and they verify it
+            // against `sender` rather than trusting it. Repeating 14 kB on every
+            // message afterwards would undo most of what the id buys.
+            senderPk: pkHex,
+            rk: sealed.initHeader.rk.toString("base64"),
+            ctId: sealed.initHeader.ctId.toString("base64"),
+            ctMt: sealed.initHeader.ctMt.toString("base64"),
+            ...(sealed.initHeader.ctOt
+              ? { ctOt: sealed.initHeader.ctOt.toString("base64"), otId: sealed.initHeader.otId }
+              : {}),
+          }
+        : {
+            ...(sealed.header.rk ? { rk: sealed.header.rk.toString("base64") } : {}),
+            ...(sealed.header.kemCt ? { kemCt: sealed.header.kemCt.toString("base64") } : {}),
+          }),
+      payload: "",
+    };
+    // The canonical header IS the AAD, so the envelope has to be finished before
+    // its payload can be sealed against it.
+    envelope.payload = aesEncrypt(text, sealed.key, canonicalHeader(envelope));
+    publish(peerId_, envelope);
+    saveState();
+    return true;
+  } catch (e: any) {
+    logger.error(`🤖 [bot] could not seal a message for @${label(peerId_)}: ${e.message}`);
+    return false;
+  }
+}
+
+/** Claim a peer's prekeys and derive a session. */
+async function openSession(f: FriendState): Promise<boolean> {
+  try {
+    // The peer's identity key, fetched once and verified against their id. This
+    // has to happen BEFORE the claim: a claimed one-time prekey is consumed, and
+    // spending one on a peer whose key we cannot establish would burn it for
+    // nothing.
+    const identityPkHex = await peerKey(f);
+    if (!identityPkHex) {
+      logger.debug(`🤖 [bot] no verified identity key for @${label(f.id)} — cannot open a session`);
+      return false;
+    }
+    const claimed = await api("POST", "/prekeys/claim", { peer: f.id });
+    if (!claimed?.medium) {
+      logger.debug(`🤖 [bot] @${label(f.id)} has published no prekeys yet`);
+      return false;
+    }
+    if (!claimed.oneTime) {
+      logger.debug(`🤖 [bot] @${label(f.id)} had no one-time prekey — ` +
+        `this session's forward secrecy runs to their next rotation`);
+    }
+    const bundle: PrekeyBundle = {
+      // The PINNED identity key, never anything the claim returned. That is what
+      // makes a substituted prekey worthless: the server cannot produce the
+      // identity shared secret, so it cannot derive the root however it answers.
+      // "Pinned" now means something stronger than "whatever we saw first" — the
+      // key was checked against the id the graph named (peerKey), so a server
+      // that serves the wrong one is caught rather than believed.
+      identityPk: Buffer.from(identityPkHex, "hex"),
+      mediumPk: Buffer.from(String(claimed.medium), "hex"),
+      oneTimePk: claimed.oneTime ? Buffer.from(String(claimed.oneTime.prekey), "hex") : null,
+      oneTimeId: claimed.oneTime ? Number(claimed.oneTime.id) : null,
+    };
+    const started = startAsInitiator(kem, bundle);
+    f.session = started.state;
+    saveState();
+    logger.debug(`🤖 [bot] ✅ session opened with @${label(f.id)}`);
+    return true;
+  } catch (e: any) {
+    logger.error(`🤖 [bot] could not open a session with @${label(f.id)}: ${e.message}`);
+    return false;
+  }
 }
 
 function gameReply(text: string): string {
@@ -803,15 +1254,18 @@ function reply(_text: string): string {
 }
 
 // ── Self-admission ────────────────────────────────────────────────────────────
-// Register our pk in the shared `admission_exempt` table BEFORE authenticating, so it's
-// in place by the time the auth server runs checkAdmission on our /auth/verify.
+// Register our id in the shared `admission_exempt` table BEFORE authenticating,
+// so it's in place by the time the auth server runs checkAdmission on our
+// /auth/verify. The table holds ids because that is what names a client
+// everywhere else; EXEMPT_PUBLIC_KEYS still holds KEYS, because that is what an
+// operator has in hand (lib/admission.ts converts).
 // The insert is idempotent; retry a few times so a database still coming up at boot
 // doesn't leave us un-exempt. Non-fatal: connect regardless (harmless under the
 // default open policy, and a later reconnect re-runs the handshake).
 async function registerExempt(attempts = 5): Promise<void> {
   for (let i = 1; i <= attempts; i++) {
     try {
-      await DB.addAdmissionExempt(pkHex);
+      await DB.addAdmissionExempt(myId);
       logger.debug("🤖 [bot] self-registered in admission exempt set");
       return;
     } catch (e: any) {

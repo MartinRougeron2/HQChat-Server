@@ -476,11 +476,30 @@ terraform output -json app_roles | jq -r '"APP_ROLE=\(.app)\nEMQX_ROLE=\(.emqx)"
 These never enter GitHub.
 
 ```bash
-for s in stripe_secret_key stripe_webhook_secret resend_api_key apns_key_p8; do
+for s in stripe_secret_key stripe_webhook_secret resend_api_key; do
   read -rsp "$s (blank to skip): " v; echo
   [ -n "$v" ] && printf '%s' "$v" | ssh root@<ip> "umask 077; cat > /etc/hqcat/prod/secrets/$s"
 done
 ```
+
+**The APNs key is not in that loop, and must not be.** `read` takes ONE LINE.
+Apple's `.p8` is a multi-line PEM, so pasting it at that prompt stores
+`-----BEGIN PRIVATE KEY-----` and throws the key away — leaving a file with the
+right name, a plausible size, and no key in it. The symptom arrives much later
+and points nowhere near here: `error:1E08010C:DECODER routines::unsupported`,
+per push, from inside the signer. That is not hypothetical; this loop is how it
+happened on prod.
+
+Copy the file:
+
+```bash
+scp AuthKey_XXXXXXXXXX.p8 root@<ip>:/etc/hqcat/prod/secrets/apns_key_p8
+ssh root@<ip> 'chmod 600 /etc/hqcat/prod/secrets/apns_key_p8 &&
+               chown 1000:1000 /etc/hqcat/prod/secrets/apns_key_p8'
+```
+
+`set-host-secrets.sh` takes a path for this one for the same reason, and refuses
+anything without both BEGIN and END markers.
 
 Skipping is fine — every compose secret already exists as an empty file, so an
 unused Stripe or APNs key will not stop the stack. The OTP pepper generates
@@ -503,6 +522,13 @@ ENV
 ```
 
 See [`.env.example`](../../infra/deploy/.env.example) for every key.
+
+Most non-secret config does not belong here at all: `APNS_KEY_ID`,
+`APNS_TEAM_ID`, `APNS_TOPIC_*`, `APNS_ENV` and `SENTRY_DSN` are GitHub
+**repository variables**, baked into the release bundle and pulled by the agent.
+Set them on the host only to override one stack — compose reads `server.env`
+after the bundle, so the host always wins. See
+[deploy.md § GitHub config](deploy.md#github-config).
 
 **GHCR pull credentials.** Your package is private by default, so the host needs
 a read-only token: **→ [github.com/settings/tokens](https://github.com/settings/tokens)**

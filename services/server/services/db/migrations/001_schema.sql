@@ -7,6 +7,26 @@ CREATE EXTENSION IF NOT EXISTS citext;
 -- ============================================================
 -- 0. WHY NO PUBLIC KEY IS EVER A BTREE KEY
 -- ============================================================
+-- ⚠️ SUPERSEDED BY 004_identity_by_hash.sql. Migrations are applied in filename
+-- order and never edited in place, so everything below still describes what THIS
+-- file created — but almost none of those tables exist in that shape any more.
+--
+-- The essay is worth reading anyway, because 004 is its conclusion. This file
+-- worked out that a public key cannot be a btree key and indexed every identity
+-- as `pk_digest(pk)` instead, while leaving the 14 kB string as the column, the
+-- value the application passes around, and the thing every topic name embeds.
+-- That held inside the database and nowhere else: `DELETE /clients/{clientid}`
+-- on the broker's admin API built a ~14.5 kB URL and was answered
+-- `414 URI Too Long` every single time, so revocation never dropped a live
+-- subscription; `/prekeys/claim` capped its `peer` parameter at 128 and refused
+-- both real clients; an mqtt_acl row carried a key in `pk` and another inside
+-- `topic`, ~29 kB to record one membership bit.
+--
+-- 004 makes `encode(pk_digest(pk),'hex')` — the value this file was already
+-- forced to index on — the identifier everywhere. `pk_digest` itself survives
+-- unchanged, and services/server/test/identity.test.ts asserts that it equals
+-- the TypeScript and Swift implementations of the same construction.
+
 -- An HQC-256 public key is 7237 bytes (lib/hqc.ts), and it travels as hex: a
 -- 14474-character string. A btree index entry may not exceed a third of a page,
 -- ~2704 bytes, so `pk text PRIMARY KEY` is not a slow schema -- it is a schema
@@ -72,8 +92,9 @@ CREATE TABLE IF NOT EXISTS friendships (
   pk_lo      text NOT NULL,
   pk_hi      text NOT NULL,
   -- sha256(pk_lo || pk_hi), written by the application. Deliberately NOT a
-  -- generated column: friendshipHash() has a Swift counterpart and a cross-impl
-  -- test vector, and it should keep exactly one definition.
+  -- generated column: friendshipHash() has a Swift counterpart and — as of
+  -- 004, and only as of 004 — an actual cross-implementation test vector
+  -- (test/helpers/identity-vectors.json). It should keep one definition.
   hash       text NOT NULL UNIQUE,
   created_at timestamptz NOT NULL DEFAULT now(),
   CHECK (pk_lo COLLATE "C" < pk_hi COLLATE "C")

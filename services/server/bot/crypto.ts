@@ -26,9 +26,17 @@ export function hqcDecapsulate(sk: Buffer, ct: Buffer): Buffer {
 
 // ── AES-256-GCM (matches Swift AESService: [IV 12][tag 16][ct], base64) ───────
 
-export function aesEncrypt(plaintext: string, key: Buffer): string {
+/**
+ * `aad` binds cleartext the ciphertext does not carry — the frame header, whose
+ * fields (epoch/idx today, the v2 ratchet header next) are read to CHOOSE the key
+ * and so cannot be authenticated by the payload that key opens. Both sides must
+ * pass byte-identical AAD or the tag check fails; the canonical serializer is the
+ * one place that is decided. Omit it and this is plain AES-GCM, as before.
+ */
+export function aesEncrypt(plaintext: string, key: Buffer, aad?: Buffer): string {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  if (aad) cipher.setAAD(aad);
   const ct = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
   return Buffer.concat([iv, tag, ct]).toString("base64");
@@ -42,7 +50,7 @@ export function aesEncrypt(plaintext: string, key: Buffer): string {
  *  2^-128. The sender is `aesEncrypt` above, which always writes 16. */
 const GCM_TAG_BYTES = 16;
 
-export function aesDecrypt(b64: string, key: Buffer): string {
+export function aesDecrypt(b64: string, key: Buffer, aad?: Buffer): string {
   const data = Buffer.from(b64, "base64");
   const iv = data.subarray(0, 12);
   const tag = data.subarray(12, 12 + GCM_TAG_BYTES);
@@ -53,6 +61,7 @@ export function aesDecrypt(b64: string, key: Buffer): string {
   const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv, {
     authTagLength: GCM_TAG_BYTES,
   });
+  if (aad) decipher.setAAD(aad);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
 }

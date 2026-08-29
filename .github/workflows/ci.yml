@@ -65,7 +65,7 @@ jobs:
               - '.github/workflows/release.yml'
             edge:
               - 'infra/cloudflare/**'
-              - 'apps/web/src/**'
+              - 'apps/site/**'
               - '.github/workflows/ci.yml'
 
   # ---------------------------------------------------------------------------
@@ -133,6 +133,15 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U hqcat -d hqcat" --health-interval 5s
           --health-timeout 3s --health-retries 10
+      # The conversation half of the suite runs through a real broker. Without
+      # one the tests would skip, and a green job that ran nothing is the failure
+      # mode this repo has already been bitten by once.
+      emqx:
+        image: emqx/emqx:5.8
+        ports: ["1883:1883", "8083:8083"]
+        options: >-
+          --health-cmd "emqx ctl status" --health-interval 5s
+          --health-timeout 5s --health-retries 20
     defaults:
       run:
         working-directory: services/server
@@ -140,7 +149,9 @@ jobs:
       ADMISSION_POLICY: open
       DATABASE_URL: postgresql://hqcat:hqcat@localhost:5432/hqcat
       PORT: "8080"
-      TEST_WS_URL: ws://localhost:8080/ws
+      TEST_AUTH_URL: http://localhost:8081
+      TEST_API_URL: http://localhost:8080
+      TEST_EMQX_URL: ws://localhost:8083/mqtt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -151,22 +162,31 @@ jobs:
       - run: npm ci
       - name: Migrate
         run: npm run migrate
-      - name: Start server
-        # `npm run legacy:server`, not `npx tsx server.ts`: the entrypoint moved
-        # to legacy/server.ts and this step had been starting nothing at all.
+      # The retired `/ws` monolith is gone, and with it the single process that
+      # used to serve everything. The e2e suite now drives what actually ships:
+      # the auth server, the app API, and EMQX.
+      - name: Start services
         run: |
-          npm run legacy:server > /tmp/server.log 2>&1 &
-          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          PORT=8080 npm run api  > /tmp/api.log  2>&1 &
+          PORT=8081 npm run auth > /tmp/auth.log 2>&1 &
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:8080/health >/dev/null; then echo "server up"; break; fi
+            if curl -fsS http://localhost:8080/health >/dev/null \
+               && curl -fsS http://localhost:8081/health >/dev/null; then
+              echo "services up"; break
+            fi
             sleep 1
           done
-          curl -fsS http://localhost:8080/info || (echo "server did not start"; cat /tmp/server.log; exit 1)
+          curl -fsS http://localhost:8080/health \
+            || (echo "api did not start"; cat /tmp/api.log; exit 1)
+          curl -fsS http://localhost:8081/health \
+            || (echo "auth did not start"; cat /tmp/auth.log; exit 1)
       - name: E2E tests
         run: npm run test:e2e
-      - name: Server logs (on failure)
+      - name: Service logs (on failure)
         if: failure()
-        run: cat /tmp/server.log
+        run: |
+          echo "── api ──"; cat /tmp/api.log
+          echo "── auth ──"; cat /tmp/auth.log
 
   # ---------------------------------------------------------------------------
   # Cloudflare edge: prove the Terraform is valid before it reaches the deploy
@@ -209,3 +229,14 @@ jobs:
         run: terraform init -input=false -backend=false
       - name: Validate
         run: terraform validate
+
+      # The Worker script Terraform ships is apps/site/src/index.js, and until
+      # now nothing checked it — CI validated the Terraform around it and never
+      # the code inside. These tests are why the site's CSP still names the
+      # Stripe origin: without it the subscribe button dies silently.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Site tests
+        working-directory: apps/site
+        run: node --test test/*.test.mjs

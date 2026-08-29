@@ -22,10 +22,11 @@ initObservability("api");
 import { healthMonitor } from "../lib/health-monitor";
 import { logger } from "../lib/logger";
 import * as http from "http";
-import { readJson, send, bearer, requireString, HttpError } from "../lib/http";
+import { readJson, send, bearer, requireString, requireHex, HttpError, MAX_BODY_BYTES } from "../lib/http";
 import { DB } from "../services/db/api";
 import { EMQX } from "../lib/emqx";
 import { friendshipHash } from "../lib/crypto-utils";
+import { isPeerId, PEER_ID_LENGTH } from "../lib/identity";
 import { StripeService, subscriptionIsEntitling, subscriptionPriceIds } from "../services/stripe/api";
 import { SubscriptionService } from "../services/subscription/api";
 import { handleSubscribe } from "../services/web/subscribe";
@@ -33,7 +34,68 @@ import { ADMISSION_POLICY } from "../lib/admission";
 
 const PORT = Number(process.env.PORT || 8080);
 
-/** Resolve the caller's pk + scope from its REST session bearer, or null. */
+/** HQC-256 public key size (lib/hqc.ts). Prekeys are HQC public keys too. */
+const HQC_PUBLIC_KEY_BYTES = 7237;
+
+/**
+ * One-time prekeys accepted per upload.
+ *
+ * A key travels as hex, so it costs 2 x 7237 = 14474 characters on the wire —
+ * the byte count is NOT the wire cost, which is the easy way to size this wrong.
+ * A bundle is the medium-term key plus N one-time keys, so the body is roughly
+ * (N + 1) x 14474 bytes: at N = 16 that is ~246 kB against a 256 kB
+ * MAX_BODY_BYTES, close enough that a couple of extra fields would start
+ * returning 413 in production and nowhere else.
+ *
+ * Eight keeps the body near 130 kB, half the cap. The pool is not limited to
+ * eight: putPrekeyBundle is additive (ON CONFLICT DO NOTHING), so a client that
+ * wants a deeper pool uploads more than one batch.
+ */
+const MAX_ONETIME_PER_UPLOAD = 8;
+
+/**
+ * Longest `peer` identifier a route will accept.
+ *
+ * One number again, for every route. It was two: the friend routes capped at
+ * 128 because you invite people by HANDLE, while `/prekeys/claim` had to fit a
+ * peer's IDENTITY — and an identity was a 14474-character public key, so the
+ * cap was raised to exactly that (#105, after 128 refused every real client
+ * with `peer must be 1–128 characters`).
+ *
+ * An identity is 64 characters now, which is comfortably inside the handle-sized
+ * bound, so the two forms stop needing different limits and the widest thing
+ * this route accepts stops being "a public key's worth of anything".
+ */
+const MAX_PEER_IDENTIFIER = 128;
+
+// Refuse to boot rather than 413 in production if either constant drifts into
+// the body cap. At startup, where an operator sees it — a type-level assertion
+// cannot express this (comparing two number literals yields `boolean`, and the
+// cast that would silence it would also stop it ever failing).
+//
+// The same reasoning applies to the peer bound: an identifier must fit, and the
+// only reason it does is that identities are digests now.
+{
+  if (MAX_PEER_IDENTIFIER < PEER_ID_LENGTH) {
+    throw new Error(
+      `MAX_PEER_IDENTIFIER (${MAX_PEER_IDENTIFIER}) is shorter than a client id ` +
+      `(${PEER_ID_LENGTH}) — every peer-addressed route would refuse every real caller`
+    );
+  }
+}
+{
+  const worstCaseBody = (MAX_ONETIME_PER_UPLOAD + 1) * HQC_PUBLIC_KEY_BYTES * 2;
+  if (worstCaseBody > MAX_BODY_BYTES / 2) {
+    throw new Error(
+      `prekey bundle upload can reach ${worstCaseBody}B against MAX_BODY_BYTES ${MAX_BODY_BYTES}B — ` +
+      `lower MAX_ONETIME_PER_UPLOAD (${MAX_ONETIME_PER_UPLOAD}) or raise the cap`
+    );
+  }
+}
+
+/** Resolve the caller's client id + scope from its REST session bearer, or
+ *  null. No route below needs the caller's KEY — the id is the name for
+ *  everything the control plane does. */
 async function authSession(req: http.IncomingMessage) {
   return DB.resolveSessionToken(bearer(req));
 }
@@ -47,16 +109,16 @@ async function authSession(req: http.IncomingMessage) {
  * untouched — this is a paywall closing, not an account being deleted, and
  * resubscribing regrants every topic on the next paid login.
  */
-async function endPremiumAccess(pk: string): Promise<void> {
-  const botPk = await DB.getPkByUsername(process.env.BOT_USERNAME || "helper");
-  const peers = await DB.revokeAllFriendTopics(pk, botPk || undefined);
+async function endPremiumAccess(id: string): Promise<void> {
+  const botId = await DB.getIdByUsername(process.env.BOT_USERNAME || "helper");
+  const peers = await DB.revokeAllFriendTopics(id, botId || undefined);
   for (const peer of peers) {
-    await EMQX.revokeTopic(pk, peer, `c/${friendshipHash(pk, peer)}`);
+    await EMQX.revokeTopic(id, peer, `c/${friendshipHash(id, peer)}`);
   }
-  await DB.revokeAllSessions(pk);
-  await DB.revokeMqttAuth(pk);
-  await EMQX.kick(pk);
-  logger.info(`🔒 [claim] premium access ended for ${pk.slice(0, 12)}… (${peers.length} conversations)`);
+  await DB.revokeAllSessions(id);
+  await DB.revokeMqttAuth(id);
+  await EMQX.kick(id);
+  logger.info(`🔒 [claim] premium access ended for ${id.slice(0, 12)}… (${peers.length} conversations)`);
 }
 
 /**
@@ -192,7 +254,7 @@ const server = http.createServer(async (req, res) => {
             // and has never been indexed, so index it before asking to flip its
             // state — otherwise there is nothing to flip.
             if (active) await adoptStripeCreatedSubscription(sub);
-            const pks = await SubscriptionService.setStateForCustomer(
+            const ids = await SubscriptionService.setStateForCustomer(
               sub.customer,
               active ? "active" : "cancelled"
             );
@@ -200,7 +262,7 @@ const server = http.createServer(async (req, res) => {
             // bearer happens to lapse — a 30-day session cap is not a refund
             // policy. Regranting on the next paid login is what makes this safe
             // to do eagerly.
-            if (!active) for (const pk of pks) await endPremiumAccess(pk);
+            if (!active) for (const id of ids) await endPremiumAccess(id);
           }
 
           res.writeHead(200); res.end("ok");
@@ -223,13 +285,44 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && url.startsWith("/users")) {
       // Exact-username lookup only (?username=…) — no bulk enumeration (M3).
       const q = new URL(url, "http://x").searchParams.get("username") || "";
-      const pk = q ? await DB.getPkByUsername(q) : null;
-      return send(res, 200, { username: q, pk });
+      const id = q ? await DB.getIdByUsername(q) : null;
+      return send(res, 200, { username: q, id });
     }
+
+    // The public key an id names.
+    //
+    // The directory ships IDS — 64 characters per friend rather than 14474 —
+    // so a client that has just learned about someone, or that lost its local
+    // store, needs one place to fetch the key itself. This is that place.
+    //
+    // Unauthenticated, and that is deliberate: the response is a public key,
+    // the id that addresses it is derivable from that same key by anyone who
+    // holds it, and requiring a session would buy nothing an attacker does not
+    // already have. What makes it SAFE is not access control but the
+    // commitment — the caller checks `sha256(hex(key)) == id` before pinning
+    // anything, so this server cannot substitute a key even for itself.
+    //
+    // ⚠️ A client that skips that check has re-created the MITM this design
+    // exists to close. Both clients do it (lib/identity.keyMatchesId,
+    // PeerID.matches).
+    if (method === "GET" && url.startsWith("/peer/")) {
+      const m = url.match(/^\/peer\/([^/?]+)\/key$/);
+      if (!m) return send(res, 404, { error: "not found" });
+      const id = decodeURIComponent(m[1]!).toLowerCase();
+      // Shape-checked before it reaches the database: an id is a fixed-width
+      // hex string, and anything else is a caller error rather than a lookup.
+      if (!isPeerId(id)) {
+        throw new HttpError(400, "INVALID_FIELD", `id must be ${PEER_ID_LENGTH} lowercase hex characters`);
+      }
+      const identityPk = await DB.identityKey(id);
+      if (!identityPk) return send(res, 404, { error: "UNKNOWN_PEER" });
+      return send(res, 200, { id, publicKey: identityPk });
+    }
+
     if (method === "POST" && url === "/username") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
+      const id = session.id;
       const body = await readJson(req);
       const username = requireString(body, "username", { min: 3, max: 32 });
       // The client distinguishes "someone else owns that handle" from a
@@ -237,7 +330,7 @@ const server = http.createServer(async (req, res) => {
       // .isUsernameTaken), so this code has to survive the round trip as a code
       // — not collapse into a generic 500 with the rest.
       try {
-        await DB.setUsername(pk, username);
+        await DB.setUsername(id, username);
       } catch (e) {
         const msg = (e as Error).message;
         if (msg === "USERNAME_TAKEN") throw new HttpError(409, "USERNAME_TAKEN", "That username is taken");
@@ -250,77 +343,169 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && url === "/friends") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
-      return send(res, 200, { friends: await DB.getFriendsList(pk) });
+      const id = session.id;
+      return send(res, 200, { friends: await DB.getFriendsList(id) });
     }
     if (method === "GET" && url === "/friends/invites") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
-      return send(res, 200, { invites: await DB.getMyInvites(pk) });
+      const id = session.id;
+      return send(res, 200, { invites: await DB.getMyInvites(id) });
     }
     if (method === "POST" && url === "/friends/invite") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
+      const id = session.id;
       // The paywall, in full. A free session talks to the helper bot and
       // nothing else; growing the friend graph is what a subscription buys.
       if (session.scope !== "premium") return send(res, 402, { error: "PREMIUM_REQUIRED" });
-      const to = requireString(await readJson(req), "to", { max: 128 });
-      await DB.invite(pk, to);
+      const to = requireString(await readJson(req), "to", { max: MAX_PEER_IDENTIFIER });
+      await DB.invite(id, to);
+      // The recipient has no other way to learn an invite exists: nothing pushed
+      // graph changes, so an invite sat unseen until their next poll — which is
+      // why one needed a manual refresh to appear at all.
+      const toId = await DB.resolveToId(to);
+      if (toId) await EMQX.notifyGraphChanged([toId]);
       return send(res, 200, { ok: true });
     }
     if (method === "POST" && url === "/friends/accept") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
+      const id = session.id;
       if (session.scope !== "premium") return send(res, 402, { error: "PREMIUM_REQUIRED" });
-      const from = requireString(await readJson(req), "from", { max: 128 });
-      const fromPk = await DB.resolveToPk(from);
-      const ok = fromPk ? await DB.acceptInvite(fromPk, pk) : false;
+      const from = requireString(await readJson(req), "from", { max: MAX_PEER_IDENTIFIER });
+      const fromId = await DB.resolveToId(from);
+      const ok = fromId ? await DB.acceptInvite(fromId, id) : false;
       // Grant the conversation + presence topics to BOTH members.
-      if (ok && fromPk) await DB.grantFriendTopic(pk, fromPk);
+      if (ok && fromId) await DB.grantFriendTopic(id, fromId);
+      // AFTER the grant, and both sides.
+      //
+      // The inviter is the one that matters. They invited a HANDLE, so their
+      // contact row holds no client id until a directory sync fills it in — and
+      // the accepter now greets immediately, so that greeting reached the
+      // inviter BEFORE they knew who the sender was. The frame named an id their
+      // directory did not contain, and it was dropped. Nudging here closes the
+      // window instead of leaving it to a 60-second timer.
+      if (ok && fromId) await EMQX.notifyGraphChanged([fromId, id]);
       return send(res, ok ? 200 : 400, { ok });
     }
     if (method === "POST" && url === "/friends/cancel") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
-      const peer = requireString(await readJson(req), "peer", { max: 128 });
+      const id = session.id;
+      const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
       // Withdraw an invite we sent, or decline one addressed to us. Only one of
       // the two can match a real pending invite.
-      const withdrew = await DB.cancelInvite(pk, peer);
-      const declined = withdrew ? false : await DB.declineInvite(pk, peer);
+      const withdrew = await DB.cancelInvite(id, peer);
+      const declined = withdrew ? false : await DB.declineInvite(id, peer);
       const ok = withdrew || declined;
+      if (ok) {
+        const peerId = await DB.resolveToId(peer);
+        if (peerId) await EMQX.notifyGraphChanged([peerId, id]);
+      }
       return send(res, ok ? 200 : 400, { ok });
     }
     if (method === "POST" && url === "/friends/remove") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
-      const peer = requireString(await readJson(req), "peer", { max: 128 });
-      const peerPk = await DB.resolveToPk(peer);
-      const ok = await DB.removeFriend(pk, peer);
-      if (ok && peerPk) {
-        await DB.revokeFriendTopic(pk, peerPk);
+      const id = session.id;
+      const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
+      const peerId = await DB.resolveToId(peer);
+      const ok = await DB.removeFriend(id, peer);
+      if (ok && peerId) {
+        await DB.revokeFriendTopic(id, peerId);
         // The ACL edit blocks the NEXT authorization check; a subscription that
         // is already open keeps delivering until the client disconnects for its
         // own reasons (ASVS-1). Drop it now. Best effort by design — the
         // unfriend has already succeeded and must not fail on the broker.
-        await EMQX.revokeTopic(pk, peerPk, `c/${friendshipHash(pk, peerPk)}`);
+        //
+        // This is the line that has never once worked on this deployment. Both
+        // arguments used to be 14474-character public keys, so the admin URL it
+        // built was ~29 kB and EMQX answered 414 every single time — and because
+        // authorization is checked at SUBSCRIBE, the unfriended peer's open
+        // subscription kept delivering. At 64 characters the request fits.
+        await EMQX.revokeTopic(id, peerId, `c/${friendshipHash(id, peerId)}`);
+        // Both sides: the removed peer should stop showing a contact they can no
+        // longer reach, and the remover's other devices need the same news.
+        await EMQX.notifyGraphChanged([peerId, id]);
       }
       return send(res, ok ? 200 : 400, { ok });
+    }
+
+    // --- Prekeys ----------------------------------------------------------
+    // The ephemeral half of the initial key agreement (003_prekeys.sql). The
+    // server is untrusted here by design: it can withhold one-time keys to force
+    // the weaker medium-term fallback, but it cannot read anything, because the
+    // initiator also encapsulates to the peer's PINNED identity key and mixes
+    // both secrets into the root.
+    if (method === "POST" && url === "/prekeys") {
+      const session = await authSession(req);
+      if (!session) return send(res, 401, { error: "unauthenticated" });
+      const id = session.id;
+      const body = await readJson(req);
+      const medium = requireHex(body, "medium", HQC_PUBLIC_KEY_BYTES);
+
+      const raw = Array.isArray(body?.oneTime) ? body.oneTime : [];
+      if (raw.length > MAX_ONETIME_PER_UPLOAD) {
+        throw new HttpError(400, "TOO_MANY_PREKEYS",
+          `at most ${MAX_ONETIME_PER_UPLOAD} one-time prekeys per upload`);
+      }
+      const oneTime = raw.map((entry: unknown, i: number) => {
+        const item = entry as Record<string, unknown>;
+        const id = item?.id;
+        if (!Number.isInteger(id) || (id as number) < 0) {
+          throw new HttpError(400, "INVALID_FIELD", `oneTime[${i}].id must be a non-negative integer`);
+        }
+        return { id: id as number, prekey: requireHex(item, "prekey", HQC_PUBLIC_KEY_BYTES) };
+      });
+
+      await DB.putPrekeyBundle(id, medium, oneTime);
+      return send(res, 200, { ok: true, accepted: oneTime.length });
+    }
+
+    // Claim one prekey for a peer. POST rather than GET with the peer in the
+    // path — kept that way now that an id would fit in a URL, because the
+    // RESPONSE is key material and has no business in an access log or a proxy
+    // cache, and because a claim mutates (it consumes a one-time key).
+    if (method === "POST" && url === "/prekeys/claim") {
+      const session = await authSession(req);
+      if (!session) return send(res, 401, { error: "unauthenticated" });
+      const id = session.id;
+      const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
+      const peerId = await DB.resolveToId(peer);
+      // Friendship is the authorization. Without it, anyone with a session could
+      // drain a stranger's one-time pool — a cheap way to force every one of
+      // their future conversations onto the reusable medium-term key.
+      if (!peerId || !(await DB.areFriends(id, peerId))) {
+        return send(res, 403, { error: "NOT_FRIENDS" });
+      }
+      const claimed = await DB.claimPrekey(peerId);
+      if (!claimed) return send(res, 404, { error: "NO_PREKEYS" });
+      return send(res, 200, claimed);
+    }
+
+    // How many one-time keys this account has left, so the client knows when to
+    // replenish. Only ever about the caller's own pool.
+    if (method === "GET" && url === "/prekeys/count") {
+      const session = await authSession(req);
+      if (!session) return send(res, 401, { error: "unauthenticated" });
+      const id = session.id;
+      return send(res, 200, {
+        remaining: await DB.countOneTimePrekeys(id),
+        maxId: await DB.maxOneTimePrekeyId(id),
+        target: MAX_ONETIME_PER_UPLOAD,
+      });
     }
 
     // --- Push token -------------------------------------------------------
     if (method === "POST" && url === "/push/token") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
+      const id = session.id;
       const pushBody = await readJson(req);
       const platform = requireString({ platform: pushBody.platform ?? "ios" }, "platform", { max: 16 });
       const token = requireString(pushBody, "token", { min: 8, max: 512 });
-      await DB.setPushToken(pk, platform, token);
+      await DB.setPushToken(id, platform, token);
       return send(res, 200, { ok: true });
     }
 
@@ -328,14 +513,15 @@ const server = http.createServer(async (req, res) => {
     if (method === "POST" && url === "/account/delete") {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const pk = session.pk;
-      await DB.deleteUser(pk);
-      await DB.revokeMqttAuth(pk);
+      const id = session.id;
+      await DB.deleteUser(id);
+      await DB.revokeMqttAuth(id);
       await DB.revokeSessionToken(bearer(req));
       // Everything above stops the NEXT connect. This ends the current one —
       // otherwise a deleted account keeps a live session, and its queued backlog,
-      // for as long as the connection happens to last.
-      await EMQX.kick(pk);
+      // for as long as the connection happens to last. It also only started
+      // working when the client id stopped being a 14 kB URL path segment.
+      await EMQX.kick(id);
       return send(res, 200, { ok: true });
     }
 

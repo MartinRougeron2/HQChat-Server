@@ -9,11 +9,12 @@
     "broker-watch": "tsx ops/broker-watch.ts",
     "bot": "tsx bot/bot.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts legacy/secure-transport.test.ts",
-    "test:e2e": "node --import tsx --test legacy/e2e.test.ts legacy/account-delete.e2e.test.ts",
-    "legacy:server": "tsx legacy/server.ts",
-    "legacy:stress": "tsx legacy/stress.ts",
-    "migrate": "tsx services/db/migrate.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "test:e2e": "node --import tsx --test test/e2e/*.test.ts",
+    "migrate": "tsx services/db/migrate.ts",
+    "check-mqtt-acl": "tsx scripts/check-mqtt-acl.ts",
+    "check-push": "tsx scripts/check-push.ts",
+    "rebuild-mqtt-acl": "tsx scripts/rebuild-mqtt-acl.ts"
   },
   "repository": {
     "type": "git",

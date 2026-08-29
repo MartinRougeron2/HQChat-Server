@@ -79,6 +79,15 @@ sends thousands of messages.
 
 ## Key → table mapping
 
+⚠️ **The `pk` columns below are historical.** This section records the Redis →
+Postgres mapping as it was designed; `004_identity_by_hash.sql` later replaced
+every one of those identifiers with a 64-character client id
+(`id = sha256(lowercase-hex(pk))`), because a 14474-character key broke
+everything with a length limit — most consequentially the broker's admin API,
+where every kick came back `414 URI Too Long`. Read the column names below as
+`id`, `id_lo`/`id_hi`, `to_id`/`from_id`. See
+[e2ee-protocol.md](e2ee-protocol.md) §2 and the migration itself.
+
 ### Tier A (writer, replicated)
 
 | Redis today | Table |
@@ -90,6 +99,15 @@ sends thousands of messages.
 | `claim:{pk}`, `sub:{h}`, `subcus:{id}`, `sub:pks:{h}` | `subscriptions(email_hash PK, …)`, `subscription_customers(customer_id PK, email_hash)`, `subscription_claims(pk PK, email_hash, claimed_at)` |
 | `admission:exempt` | `admission_exempt(pk PK)` |
 | `mqtt_acl:{pk}` | `mqtt_acl(pk, topic, action, PK(pk,topic))` |
+
+> **The column is `id`, not `pk`.** This table is the plan as written, and it
+> predates the identifier change: an account is keyed by
+> `id = sha256(lowercase-hex(publicKey))` — 64 characters — not by the 14474-character
+> key itself. Read every `pk` above as `id`, and `friendships(pk_lo, pk_hi)` as
+> `friendships(id_lo, id_hi)`. The conversation `hash` is also **not** a generated
+> column in the end: it is written explicitly on insert, because `grantFriendTopic`
+> and the client both derive the same value from the ids and all three have to
+> agree. `migrations/004_identity_by_hash.sql` is the schema that actually shipped.
 
 `usernames:taken` becomes a `UNIQUE` index — which kills the check-then-set race
 in [`createUser`](../../services/server/services/db/api.ts) (currently `SISMEMBER`
@@ -135,9 +153,14 @@ check — strictly more correct than the Redis version.
    `revokeFriendTopic` and the subscription-lapse path. Revocation becomes
    immediate and stops depending on the authz cache TTL.
 2. Then raise `authorization.cache.ttl` from `1m`. At 15m the authz query rate
-   drops ~15×. Residual exposure is presence metadata only (`u/{pk}/presence` is
+   drops ~15×. Residual exposure is presence metadata only (`u/{id}/presence` is
    plaintext, not E2E) for the window — conversation content is protected by the
    keys regardless.
+
+   ⚠️ Step 1 was wired and step 2 was taken, but step 1 **did not work**: the
+   kick built a ~14.5 kB URL out of a public key and EMQX answered 414 every
+   time, silently, so the cache TTL was raised on the strength of a mitigation
+   that was not in place. Fixed by `004_identity_by_hash.sql` (finding SRV-3).
 3. Settle **LAT-4**: measure actual authz query rate, session-resolve rate and
    reconnect-storm behaviour on the compose stack. Every capacity number below is
    a derivation until this exists.
@@ -161,8 +184,10 @@ rate counters → OTP/challenges → sessions → push tokens → subscriptions 
 invites → friendships → directory. Each is one config flip, reversible.
 
 **Phase 5 — EMQX authz to Postgres.** Swap the `type = redis` source for
-`type = postgresql` with `SELECT action, topic FROM mqtt_acl WHERE pk =
-${clientid}` — same shape as the current `HGETALL`. Note the array-index env-var
+`type = postgresql` with `SELECT action, topic FROM mqtt_acl WHERE id =
+${clientid}` — same shape as the current `HGETALL`. (It shipped as `WHERE pk =`;
+`004_identity_by_hash.sql` renamed the column, and the two MUST move together —
+this query lives on the broker, not in the migration.) Note the array-index env-var
 trap documented at [emqx.conf:71](../../infra/deploy/emqx/emqx.conf) applies to
 the PG source too: configure it in the file, not via `EMQX_AUTHORIZATION__*`.
 

@@ -13,10 +13,29 @@
 # Releasing is therefore "move the channel tag", which the Promote workflow
 # does. Rolling back is moving it to an older digest — or automatic, below.
 #
-# Config: /etc/hqcat/agent.env (root, 0600). Secrets and non-secret config live
-# on THIS host under /etc/hqcat/<stack>/, never in GitHub — they no longer make
-# a round trip through a CI runner.
+# Config: /etc/hqcat/agent.env (root, 0600). Secrets live on THIS host under
+# /etc/hqcat/<stack>/secrets/ and never in GitHub; non-secret config comes from
+# GitHub repository variables, baked into the bundle's release.env, with
+# /etc/hqcat/<stack>/server.env overriding it per stack.
+#
+#   hqcat-agent              # roll over IF the channel digest moved
+#   hqcat-agent --reapply    # re-apply the CURRENT digest, digest unchanged
+#
+# --reapply exists because compose reads `env_file` when it CREATES a container,
+# not when it restarts one. Editing server.env therefore changes nothing until
+# the containers are recreated — and a container stuck in a restart loop keeps
+# the environment it was born with, forever, which reads exactly like the edit
+# having no effect. Doing it by hand means reconstructing SERVER_IMAGE and
+# BOT_IMAGE from /var/lib/hqcat/<stack>/, and getting that wrong silently falls
+# back to the compose default `dissqus-server:local`.
 set -euo pipefail
+
+REAPPLY=0
+case "${1:-}" in
+  --reapply) REAPPLY=1 ;;
+  "")        ;;
+  *)         echo "usage: hqcat-agent [--reapply]" >&2; exit 2 ;;
+esac
 
 CONF=/etc/hqcat/agent.env
 [[ -r "$CONF" ]] || { echo "missing $CONF (run install-agent.sh)" >&2; exit 1; }
@@ -66,11 +85,18 @@ digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${C
 current=""; current_bot=""
 [[ -f "$STATE_DIR/current" ]]     && current="$(cat "$STATE_DIR/current")"
 [[ -f "$STATE_DIR/current-bot" ]] && current_bot="$(cat "$STATE_DIR/current-bot")"
-if [[ "$digest" == "$current" ]]; then
+if [[ "$digest" == "$current" && "$REAPPLY" -eq 0 ]]; then
   log "up to date ($digest)"
   exit 0
 fi
-log "new release: $digest (was: ${current:-none})"
+if [[ "$digest" == "$current" ]]; then
+  # Same image, deliberately re-applied: a config change on this host. The
+  # bundle is re-extracted too, so the compose file and the env files are read
+  # afresh, and `--force-recreate` below is what actually re-reads them.
+  log "re-applying $digest (config change)"
+else
+  log "new release: $digest (was: ${current:-none})"
+fi
 
 docker pull -q "${BOT_IMAGE_REPO}:${CHANNEL}" >/dev/null || die "cannot pull ${BOT_IMAGE_REPO}:${CHANNEL}"
 bot_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${BOT_IMAGE_REPO}:${CHANNEL}")"
@@ -111,7 +137,14 @@ fi
 export SERVER_IMAGE="$digest" BOT_IMAGE="$bot_digest"
 log "compose up (server=$digest bot=$bot_digest)"
 compose config -q || die "rendered compose file is invalid"
-compose up -d --no-build
+# --force-recreate on a re-apply: `up -d` alone treats a container whose image
+# and compose entry are unchanged as already correct, and env_file content is
+# not part of that comparison. Without it a config-only rollout is a no-op.
+if [[ "$REAPPLY" -eq 1 ]]; then
+  compose up -d --no-build --force-recreate
+else
+  compose up -d --no-build
+fi
 
 # --- 5. Host nginx ------------------------------------------------------------
 # The agent already runs as root, so there is no sudoers wrapper in this path;

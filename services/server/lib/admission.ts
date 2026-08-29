@@ -14,6 +14,7 @@
 
 import { DB } from "../services/db/api";
 import { SubscriptionService } from "../services/subscription/api";
+import { peerId } from "./identity";
 import { logger } from "./logger";
 
 export const ADMISSION_POLICY = (process.env.ADMISSION_POLICY || "open").toLowerCase();
@@ -37,40 +38,54 @@ export type Admission =
   | { ok: false; reason: "denied" | "not_claimed" };
 
 /** Whether a public key is exempt from every gate (the helper bot). Exemption
- *  waives policy, never the proof of key possession. */
-async function isExempt(pkHex: string): Promise<boolean> {
+ *  waives policy, never the proof of key possession.
+ *
+ *  The ENV lists hold public keys, because that is what an operator has in front
+ *  of them and what every other document about this deployment refers to. The
+ *  DATABASE holds ids, because that is what names a client everywhere else. The
+ *  conversion happens here rather than at either end, so neither an operator nor
+ *  the schema has to know about the other's form. */
+async function isExempt(pkHex: string, id: string): Promise<boolean> {
   const configured = (process.env.EXEMPT_PUBLIC_KEYS || "")
     .split(",").map((s) => s.trim()).filter(Boolean);
-  if (configured.includes(pkHex)) return true;
+  if (configured.some((k) => peerId(k) === id)) return true;
 
-  // Self-registered exemptions (the helper bot writes its own pk on startup;
+  // Self-registered exemptions (the helper bot writes its own id on startup;
   // see bot/bot.ts). Survives the bot's identity changing without an operator
   // editing EXEMPT_PUBLIC_KEYS. Best-effort: a database blip here must not
   // hard-fail admission, so a failure falls through to the policy check.
   try {
-    return await DB.isAdmissionExempt(pkHex);
+    return await DB.isAdmissionExempt(id);
   } catch (e: any) {
     logger.error(`[admission] exempt-set lookup failed: ${e.message}`);
     return false;
   }
 }
 
+/**
+ * `pkHex` is the full public key, because this runs on the auth path — the one
+ * place a key is in hand. Everything it looks up is keyed by `peerId(pkHex)`.
+ */
 export async function checkAdmission(pkHex: string, door: Door): Promise<Admission> {
-  if (await isExempt(pkHex)) return { ok: true };
+  const id = peerId(pkHex);
+  if (await isExempt(pkHex, id)) return { ok: true };
 
   switch (ADMISSION_POLICY) {
     case "stripe":
       // The free door sells nothing and asks nothing. The paid door asks the
       // only question that matters, and it is one primary-key lookup.
       if (door === "free") return { ok: true };
-      return (await SubscriptionService.isClaimed(pkHex))
+      return (await SubscriptionService.isClaimed(id))
         ? { ok: true }
         : { ok: false, reason: "not_claimed" };
 
     case "allowlist":
       // A private server has no free tier to speak of: an unlisted key is not
-      // welcome through either door.
-      return ADMISSION_ALLOWLIST.includes(pkHex) ? { ok: true } : { ok: false, reason: "denied" };
+      // welcome through either door. Compared as ids so a list entry that
+      // differs only in case still matches.
+      return ADMISSION_ALLOWLIST.some((k) => peerId(k) === id)
+        ? { ok: true }
+        : { ok: false, reason: "denied" };
 
     case "open":
     default:

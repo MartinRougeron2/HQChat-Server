@@ -62,7 +62,7 @@ export function testAccountCodeMatches(code: string): boolean {
  * Best-effort, like every other send: a mail outage must not fail the link the
  * user is standing in front of.
  */
-export async function notifyTestAccountLink(pkHex: string, emailHash: string): Promise<void> {
+export async function notifyTestAccountLink(deviceId: string, emailHash: string): Promise<void> {
   if (!TEST_ACCOUNT_ALERT_TO) return;
   const sent = await sendMail({
     to: TEST_ACCOUNT_ALERT_TO,
@@ -71,7 +71,7 @@ export async function notifyTestAccountLink(pkHex: string, emailHash: string): P
       `device linked uses the test account\n\n` +
       `A device linked itself to ${TEST_ACCOUNT_EMAIL} and now holds a premium session ` +
       `without a subscription behind it.\n\n` +
-      `public key : ${pkHex}\n` +
+      `client id  : ${deviceId}\n` +
       `when       : ${new Date().toISOString()}\n\n` +
       `If this was not you or a reviewer: unsetting TEST_ACCOUNT_EMAIL on the auth service ` +
       `stops NEW links, but it does not revoke the ones already made — by then the claim is ` +
@@ -93,10 +93,10 @@ export async function notifyTestAccountLink(pkHex: string, emailHash: string): P
  * There is no device cap. "Linked to all devices" is the whole point, and a cap
  * would mean the fourth reviewer to pick the app up is the one who cannot open it.
  */
-export async function claimTestAccountDevice(emailHash: string, pkHex: string): Promise<void> {
+export async function claimTestAccountDevice(emailHash: string, deviceId: string): Promise<void> {
   await DB.setSubscription(emailHash, "active");
-  const alreadyOurs = (await DB.emailHashForClaim(pkHex)) === emailHash;
-  await DB.addClaimedDevice(emailHash, pkHex, Number.MAX_SAFE_INTEGER);
-  logger.info(`🔗 [claim] device ${pkHex.slice(0, 12)}… bound to the TEST account`);
-  if (!alreadyOurs) await notifyTestAccountLink(pkHex, emailHash);
+  const alreadyOurs = (await DB.emailHashForClaim(deviceId)) === emailHash;
+  await DB.addClaimedDevice(emailHash, deviceId, Number.MAX_SAFE_INTEGER);
+  logger.info(`🔗 [claim] device ${deviceId.slice(0, 12)}… bound to the TEST account`);
+  if (!alreadyOurs) await notifyTestAccountLink(deviceId, emailHash);
 }

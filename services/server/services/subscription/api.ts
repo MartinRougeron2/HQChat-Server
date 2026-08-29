@@ -2,9 +2,17 @@
 // keypair held on a device.
 //
 // The two never meet directly. Stripe knows an email address; the device knows
-// a public key; neither knows the other. An OTP sent to that address is the
-// only bridge, and crossing it binds the public key to the subscription. From
-// then on `/auth/paid/init` is a single primary-key lookup.
+// a keypair; neither knows the other. An OTP sent to that address is the only
+// bridge, and crossing it binds the device's IDENTITY — its client id,
+// sha256(hex(pk)) — to the subscription. From then on `/auth/paid/init` is a
+// single primary-key lookup.
+//
+// The id rather than the key, because a claim exists to be REVOKED: ending a
+// lapsed subscriber's access means editing `mqtt_acl` and kicking that client
+// off the broker, and both of those address an id. Storing the key meant the
+// kick built a ~14.5 kB URL, which EMQX answered with 414 every time. The
+// callers convert at the edge (auth/main.ts, lib/admission.ts), so a client
+// still identifies itself to `/claim/verify` by the public key it holds.
 //
 // The address itself is never stored. Everything here is keyed by
 //   H = sha256(lowercased, trimmed email)
@@ -207,7 +215,7 @@ export const SubscriptionService = {
    * the count passes the limit — so a wrong guess costs something whether or
    * not the caller waits for the answer.
    */
-  async verifyClaim(email: string, code: string, pkHex: string): Promise<VerifyResult> {
+  async verifyClaim(email: string, code: string, deviceId: string): Promise<VerifyResult> {
     if (!validEmail(email)) return { ok: false, reason: "invalid_email" };
     const H = emailHash(email);
 
@@ -216,7 +224,7 @@ export const SubscriptionService = {
       // Deliberately independent of startClaim: the code never changes and
       // never expires, so a tester who types it straight in is not left waiting
       // on an OTP row that no email was ever going to announce.
-      await claimTestAccountDevice(H, pkHex);
+      await claimTestAccountDevice(H, deviceId);
       return { ok: true };
     }
 
@@ -240,25 +248,25 @@ export const SubscriptionService = {
     const sub = await DB.getSubscription(H);
     if (!sub || sub.state !== "active") return { ok: false, reason: "not_active" };
 
-    const result = await DB.addClaimedDevice(H, pkHex, DEVICE_CAP);
+    const result = await DB.addClaimedDevice(H, deviceId, DEVICE_CAP);
     if (result === "cap") return { ok: false, reason: "cap_reached" };
 
     logger.info(`🔗 [claim] device bound to ${H.slice(0, 8)}…`);
     return { ok: true };
   },
 
-  /** Whether this public key is bound to a live subscription. The paid door's
+  /** Whether this identity is bound to a live subscription. The paid door's
    *  entire question, and deliberately two GETs — it runs before the KEM. */
-  async isClaimed(pkHex: string): Promise<boolean> {
-    const H = await DB.emailHashForClaim(pkHex);
+  async isClaimed(deviceId: string): Promise<boolean> {
+    const H = await DB.emailHashForClaim(deviceId);
     if (!H) return false;
     const sub = await DB.getSubscription(H);
     return sub?.state === "active";
   },
 
   /** Release every device on a subscription — the escape hatch for someone who
-   *  hit the cap with phones they no longer own. Returns the released public
-   *  keys so the caller can end their sessions. */
+   *  hit the cap with phones they no longer own. Returns the released client
+   *  ids so the caller can end their sessions. */
   async forgetDevices(email: string): Promise<string[]> {
     return await DB.forgetClaimedDevices(emailHash(email));
   },

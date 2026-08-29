@@ -44,7 +44,24 @@ the `:prod` tag; rolling back means moving it back.
 The Apple apps are deliberately NOT built here — see
 `apps/apple/verify.sh`.
 
-## 1. GitHub is the single source of truth for secrets
+## 1. GitHub owns non-secret config; the host owns secrets
+
+This heading used to read "GitHub is the single source of truth for secrets",
+which stopped being true when `sync-secrets-to-github.sh` was retired and was
+never updated. It described the opposite of what the section below says, and
+reading it alone is enough to conclude that CI pushes credentials onto a VM.
+
+The split now:
+
+| | Lives in | Reaches the host by |
+|---|---|---|
+| **Secrets** (Stripe, Resend, the APNs `.p8`, OTP pepper, database) | the host that uses them | put there once, by hand; never leaves |
+| **Non-secret config** (`APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC_*`, `APNS_ENV`, `SENTRY_DSN`) | GitHub repository **variables** | baked into `release.env` in the deploy bundle, which the agent PULLS |
+| **Per-stack overrides** | `/etc/hqcat/<stack>/server.env` | read after `release.env`, so it wins |
+
+Both halves keep the same property: **nothing in GitHub can reach a server.**
+Config arrives inside an immutable digest the host asked for, not over an inbound
+SSH connection from a runner.
 
 Nothing secret lives in the repo or the image. The only ever-committed secret
 file, `services/server/.env.prod`, only held the placeholder
@@ -61,8 +78,19 @@ Secrets live on **the host that uses them**, not in GitHub:
 | `/etc/hqcat/agent.env` (root, 0600) | the agent's **read-only** `read:packages` GHCR token |
 
 The agent symlinks the first two into the stack directory on each rollout;
-`lib/config.ts` reads the secret files via the `*_FILE` convention. Rotate by
-editing the file on the host and restarting the stack.
+`lib/config.ts` reads the secret files via the `*_FILE` convention.
+
+**Rotate by editing the file on the host, then `hqcat-agent --reapply`.** Not
+`docker compose restart`: compose reads `env_file` when it CREATES a container,
+so a restart reuses the environment the container was born with and the edit
+appears to do nothing. A container already in a restart loop keeps its original
+environment forever, which is the same symptom and even easier to misread. And
+not a bare `docker compose up -d` either — `SERVER_IMAGE` would be unset and
+fall back to the compose default `dissqus-server:local`.
+
+A plain `hqcat-agent` run is not enough on its own: it exits early when the
+channel digest has not moved, which is the normal case for a config-only change.
+`--reapply` re-extracts the bundle at the current digest and forces a recreate.
 
 This used to be a table of GitHub Environment secrets that a CI runner wrote
 onto the VM over SSH. Production Stripe/APNs/Resend material therefore passed
@@ -163,7 +191,7 @@ sudo hqcat-apply-nginx preprod    # only if you need to force it; the agent does
 
 **Today:** Cloudflare proxies the domain (DNS + TLS termination, Full-strict to
 the origin), and a single **Cloudflare Worker** serves the static marketing/legal
-site (apps/web/src/index.js). All app traffic
+site (apps/site/src/index.js). All app traffic
 (`/mqtt`, `/auth/*`, the REST control plane, `/subscribe`, `/stripe/webhook`)
 goes CF → nginx → the compose services.
 

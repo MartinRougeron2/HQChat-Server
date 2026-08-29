@@ -17,7 +17,7 @@ deploy (../../deploy/ARCHITECTURE.md).
 | File | Resources | Default |
 |------|-----------|---------|
 | `dns.tf` | `chat` (import) A → prod origin + `preprod.chat` (create) A → the **separate** pre-prod VM, both proxied | on |
-| `workers.tf` | `dissqus-home` Worker (from `apps/web/src/index.js`) + routes for `/privacy`,`/terms`,`/support` on the apex (overlays Vercel; **not** `/`) | on |
+| `workers.tf` | `dissqus-home` Worker (from `apps/site/src/index.js`) + exact routes for `/`,`/crypto`,`/privacy`,`/terms`,`/support` on the **app host**. Exact paths only — never `/*`, which would swallow the API | on |
 | `zone.tf` | Full-strict SSL, Always-HTTPS, TLS 1.2/1.3, HSTS, WebSockets | **off** (`manage_zone_settings`) — zone-wide |
 | `security.tf` | WAF scanner blocks (`manage_security_rules`) + per-IP rate limiting (`enable_rate_limiting`, Pro) — both host-scoped to `chat` | **off** — zone-wide entrypoints |
 | `health.tf` | Standalone Health Check on **origin `/health`** + email alert | **off** (`enable_health_check`, Pro) |
@@ -97,7 +97,8 @@ the deploy pipeline, so a release never leaves DNS/routes and the origin they
 point at out of step:
 
 - **`ci.yml` → `cloudflare-plan`** — on PRs touching `infra/cloudflare/**` or
-  `apps/web/src/**`. Runs `fmt`/`init -backend=false`/`validate`. Deliberately
+  `apps/site/**`. Runs `fmt`/`init -backend=false`/`validate`, plus the site's
+  own tests. Deliberately
   credential-free: the creds are Environment secrets, and attaching
   `environment: production` to a PR job would make every PR wait on the
   required-reviewer gate for a read-only operation (and would expose a

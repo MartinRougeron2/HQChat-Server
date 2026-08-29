@@ -17,6 +17,7 @@
 // splitting them was for.
 
 import * as fs from "fs";
+import { apnsGaps, apnsIntended, apnsSummary } from "./apns-config";
 
 // 1. dotenv (best-effort: in Docker the env comes from compose, not a file).
 try {
@@ -48,7 +49,7 @@ const isProd = process.env.NODE_ENV === "production";
 /** What the calling service actually uses. Checks for a capability nobody
  *  declared are skipped — an auth server with no Stripe key is correct, not
  *  broken. */
-export type ConfigNeed = "stripe" | "mail";
+export type ConfigNeed = "stripe" | "mail" | "apns";
 
 /** Exit with a combined message listing every missing/invalid setting, so a
  *  misconfigured box fails immediately at boot instead of at first request. */
@@ -85,11 +86,44 @@ export function assertConfig(needs: ConfigNeed[] = []): void {
     errors.push(`ADMISSION_POLICY="${policy}" is invalid (expected open | allowlist | stripe).`);
   }
 
-  // APNs: all-or-nothing. Partial config means push silently breaks.
-  const apnsKeys = ["APNS_KEY_ID", "APNS_TEAM_ID", "APNS_KEY_P8"];
-  const apnsSet = apnsKeys.filter((k) => process.env[k]?.trim());
-  if (apnsSet.length > 0 && apnsSet.length < apnsKeys.length) {
-    errors.push(`APNs is partially configured (${apnsSet.join(", ")}) — set all of ${apnsKeys.join(", ")} or none.`);
+  // APNs: all-or-nothing, and ONLY for the service that actually sends.
+  //
+  // This check used to run in every service, and that made a correctly
+  // configured host unbootable. `APNS_KEY_ID`/`APNS_TEAM_ID` belong in the
+  // shared `server.env` (they are not secrets); `APNS_KEY_P8` is a compose
+  // secret mounted into push-bridge ALONE. So auth and app-api saw two thirds of
+  // a config, called it partial, and exited — on a box where push was set up
+  // exactly as `.env.example` and `collect-apple-env.sh` say to set it up.
+  //
+  // The only way to keep the stack booting was to leave APNs unset, which is
+  // why a deployment can look healthy and have never sent a single push. The
+  // check was right; the SCOPE was wrong. Nothing that cannot send has an
+  // opinion about whether push is configured.
+  //
+  // It does NOT refuse to boot. Push is documented as optional and a stack with
+  // no APNs at all is allowed to run, so exiting on HALF a config while
+  // tolerating none of one is incoherent — and it is the worse outcome besides:
+  // a crash-looping push-bridge takes out the health endpoint and buries its own
+  // explanation in restart spam, on a box whose operator may need values from
+  // the Apple Developer portal before they can fix it. Waking nobody is what
+  // both states do; only one of them also drops the container.
+  //
+  // Saying so is the fix. `push/main.ts` escalates a half-config to logger.error
+  // (and therefore Sentry) at boot, repeats the verdict on every broker connect,
+  // and names the reason on the first wake it cannot perform.
+  if (needs.includes("apns")) {
+    const gaps = apnsGaps(process.env);
+    if (gaps.length && apnsIntended(process.env)) {
+      warnings.push(
+        `APNs is partially configured — missing ${gaps.join(", ")}. ` +
+        `Nothing will be woken until all of them are set. ` +
+        `The credentials are secrets; the ids and topics are not and belong in server.env.`
+      );
+    } else if (gaps.length) {
+      // No APNs at all is how CI and local dev run. Still said out loud: it is
+      // the single most likely answer to "why did my phone not buzz".
+      warnings.push(apnsSummary(process.env));
+    }
   }
 
   // The database is not optional for any service in this stack — it IS the

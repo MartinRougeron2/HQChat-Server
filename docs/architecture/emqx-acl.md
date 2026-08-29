@@ -3,31 +3,76 @@
 How the broker enforces per-conversation access, and the table it reads.
 Config: [emqx.conf](../../infra/deploy/emqx/emqx.conf). Overall design: ../EXTRACTION_PLAN.md.
 
+## Identifiers
+
+Everything below names clients by their **client id**:
+
+```
+id = sha256(lowercase-hex(publicKey))        // 64 hex characters
+```
+
+not by the public key, which is 14474. That change is the subject of
+`004_identity_by_hash.sql`; the short version for an operator is that a `pk`
+column and a `WHERE pk = ${clientid}` in this file's query became `id`, and that
+the two MUST move together — an authorizer naming a column that does not exist
+errors on every lookup, which with `deny_action = disconnect` is every client in
+a connect/drop loop, with nothing in the client's log to distinguish it from a
+missing grant.
+
+⚠️ The authorization cache below is **15 minutes**, so grants cached against the
+OLD clientids outlive the rollover. **Restart EMQX** when deploying this rather
+than waiting it out.
+
 ## Topics
 
-- Conversation between two public keys → `c/{friendshipHash(pkA,pkB)}`
-  (`friendshipHash` = `sha256(sorted(pkA,pkB))`, see `lib/crypto-utils.ts`).
-- The topic name is **derivable by anyone who knows both public keys**, so
-  access control rests ENTIRELY on the `mqtt_acl` table below — never on secrecy
-  of the topic name.
+- Conversation between two clients → `c/{friendshipHash(idA,idB)}`
+  (`friendshipHash` = `sha256(sorted(idA,idB))`, see `lib/crypto-utils.ts`).
+- Presence and inbox → `u/{id}/presence`, `u/{id}/inbox`.
+- Graph push → `u/{id}/graph`. **Subscribe-only, and the owner alone holds any
+  row on it.** The server publishes through the ADMIN API, which the authorizer
+  is never consulted for, so nothing grants `publish` here — not even the owner,
+  who has no reason to tell themselves anything.
+
+  It exists because the friend graph was the one piece of state the server owned
+  and the client could only learn by asking, on a 60-second poll. An invite
+  therefore sat unseen until the next tick, and — once accepting began greeting
+  immediately — an `init` from a freshly accepted contact could reach the
+  inviter *before* their directory contained the sender's client id at all. The
+  frame named nobody they knew and was dropped.
+
+  A nudge carries only the fact that something changed (`{"t":"graph"}`). The
+  client answers it by calling authenticated `/friends`, so this adds no way to
+  learn anything that endpoint would not already tell that caller, and a spoofed
+  nudge costs one directory fetch. Not retained: a client pulls the directory on
+  connect anyway, so retaining would make every reconnect do it twice.
+- The topic name is **derivable by anyone who knows both ids** — and an id is
+  derivable by anyone holding the corresponding public key — so access control
+  rests ENTIRELY on the `mqtt_acl` table below, never on secrecy of the topic
+  name.
+- A row is now ~140 bytes. It used to be ~29 kB: a 14474-character `pk` beside a
+  `topic` that embedded another key.
+- `grantSelfTopics` writes three rows per account (presence publish, inbox all,
+  graph subscribe); `grantFriendTopic` writes three more per friendship, per
+  side. `scripts/check-mqtt-acl.ts` derives the expected set the same way the
+  writers do, so it stays in step.
 
 ## Authentication (who may connect)
 
-- `clientid = pk` (the client sets this), `username = pk`, `password = token`.
+- `clientid = id` (the client sets this), `username = id`, `password = token`.
 - The token is an opaque 32-byte secret minted by the auth server after the
   HQC-KEM handshake; only its SHA-256 is stored, in `mqtt_tokens` (12h).
 - EMQX calls `POST http://auth:8080/mqtt/authn`; the auth server verifies the
   token (constant-time, reusable across reconnects) + optional per-CONNECT nonce
   and returns `{"result":"allow","expire_at":<unix>}`. **EMQX disconnects the
   client at `expire_at`** → the client refreshes (`/auth/refresh`) and reconnects
-  (expiration-based rotation). Revoke early with `DB.revokeMqttAuth(pk)` (+ kick).
+  (expiration-based rotation). Revoke early with `DB.revokeMqttAuth(id)` (+ kick).
 
 ## Authorization / RLS (which topics)
 
 - On a cache MISS, EMQX runs:
 
   ```sql
-  SELECT 'allow' AS permission, action, topic FROM mqtt_acl WHERE pk = ${clientid}
+  SELECT 'allow' AS permission, action, topic FROM mqtt_acl WHERE id = ${clientid}
   ```
 
   `permission`, `action` and `topic` are the three column names the PostgreSQL
@@ -46,22 +91,31 @@ Config: [emqx.conf](../../infra/deploy/emqx/emqx.conf). Overall design: ../EXTRA
 
 ## Revocation gotchas
 
-1. **Authorization cache** (`ttl = 15m`): a revoked pk may still pub for up to
-   the cache TTL. Do NOT lower it to get faster revocation — that trade was
+1. **Authorization cache** (`ttl = 15m`): a revoked client may still pub for up
+   to the cache TTL. Do NOT lower it to get faster revocation — that trade was
    already made the other way. Revocation acts instead of waiting: app-api drops
    the live subscription through the admin API (`lib/emqx.ts`) at the same moment
    it deletes the row, so the cache window only matters to a client that
    RECONNECTS inside it, and all such a client can reach is presence metadata.
 2. **Live subscriptions are not re-authorized.** Deleting the row blocks the NEXT
    pub/sub but an already-open SUBSCRIBE keeps flowing. On unfriend/delete you
-   must ALSO kick it via the EMQX API, e.g.:
+   must ALSO drop it via the EMQX API, e.g.:
    ```
    curl -u admin:$PW -X DELETE \
-     http://127.0.0.1:18083/api/v5/clients/$PK/subscriptions/c%2F$HASH
+     http://127.0.0.1:18083/api/v5/clients/$ID/subscriptions/c%2F$HASH
    ```
    or disconnect the client entirely. app-api already does both — see
    `EMQX.revokeTopic` on the unfriend path and `EMQX.kick` on account deletion
    and subscription lapse (`services/server/api/main.ts`).
+
+   ⚠️ **This did not work before `004_identity_by_hash.sql`, at all.** `$ID` was
+   a 14474-character public key, so the request line ran to about 14.5 kB and
+   EMQX answered `414 URI Too Long` — every time, for every kick this deployment
+   ever attempted. A failed admin call is best-effort and only logged, so nothing
+   surfaced: the only symptom was that unfriended peers kept receiving, which
+   reads as a protocol bug rather than a URL one. Gotcha 1's argument above was
+   therefore FALSE for the whole time it was written down. It is true now, and
+   `services/server/test/emqx-revocation.test.ts` keeps it true.
 
 ## Repairing the table
 
@@ -138,9 +192,9 @@ Worth knowing before you panic — or before you relax:
   or a hole, depending on which config is live: with this file's `no_match = deny`,
   every pub/sub is refused and clients are disconnected; on stock EMQX defaults
   (`no_match = allow`, no sources) any authenticated key can subscribe to any
-  conversation topic — the topic name is derivable from two public keys, so the
-  ACL is the ONLY thing standing between a stranger and a conversation's
-  ciphertext + metadata.
+  conversation topic — the topic name is derivable from two client ids, and an id
+  from a public key, so the ACL is the ONLY thing standing between a stranger and
+  a conversation's ciphertext + metadata.
 
 `broker-watch` (`services/server/ops/broker-watch.ts`) now polls the broker API
 and pages Sentry on the transition, so this can no longer be a silent state.

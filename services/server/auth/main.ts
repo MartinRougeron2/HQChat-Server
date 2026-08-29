@@ -13,6 +13,13 @@
 //   POST /auth/refresh (Bearer sessionToken)      -> { mqttToken, ttl } (rotation)
 //   POST /mqtt/authn  (EMQX hook)                 -> { result }      (one-time token)
 //
+// `pk` is the full public key, and these routes are the ONLY place it enters the
+// system: the server has to encapsulate to it, which nothing else in the stack
+// does. Everything downstream — the session, the ACL, the topics, the broker's
+// client id, `/mqtt/authn`'s username — names the caller by `peerId(pk)`
+// instead. `/auth/*/verify` is where the two are tied together (DB.ensureUser),
+// immediately after the KEM proof establishes that the caller holds the key.
+//
 // TWO DOORS, not one endpoint with a flag. The free door sells nothing and asks
 // nothing; the paid door refuses an unclaimed key BEFORE spending a KEM
 // encapsulation on it. What separates them is what they mint: the session
@@ -36,6 +43,7 @@ import * as crypto from "crypto";
 // refresh/authn paths — anywhere the lib is absent, matching secure-transport.ts).
 import { authProof } from "../lib/auth-proof";
 import { checkAdmission, type Door } from "../lib/admission";
+import { peerId } from "../lib/identity";
 import { DB, type SessionScope } from "../services/db/api";
 import { SubscriptionService } from "../services/subscription/api";
 
@@ -77,17 +85,17 @@ const BOT_USERNAME = process.env.BOT_USERNAME || "helper";
  * handle yet, and a login must never fail because of that. The next login
  * retries.
  */
-async function ensureBotFriendship(pk: string): Promise<void> {
+async function ensureBotFriendship(id: string): Promise<void> {
   try {
-    const botPk = await DB.getPkByUsername(BOT_USERNAME);
-    if (!botPk || botPk === pk) return; // bot not registered yet, or this IS the bot
-    if (!(await DB.areFriends(pk, botPk))) await DB.createFriendship(pk, botPk);
+    const botId = await DB.getIdByUsername(BOT_USERNAME);
+    if (!botId || botId === id) return; // bot not registered yet, or this IS the bot
+    if (!(await DB.areFriends(id, botId))) await DB.createFriendship(id, botId);
     // The friend sets alone are invisible to MQTT — the ACL entry is what lets
     // either side use the shared topic, and it records the members push-bridge
     // resolves. Idempotent, so re-running it per login is harmless.
-    await DB.grantFriendTopic(pk, botPk);
+    await DB.grantFriendTopic(id, botId);
   } catch (e) {
-    logger.warn(`[auth] helper-bot auto-friend failed for ${pk.slice(0, 12)}…: ${(e as Error).message}`);
+    logger.warn(`[auth] helper-bot auto-friend failed for ${id.slice(0, 12)}…: ${(e as Error).message}`);
   }
 }
 
@@ -119,13 +127,19 @@ function refuse(res: http.ServerResponse, admission: { reason: "denied" | "not_c
  */
 async function handleInit(req: http.IncomingMessage, res: http.ServerResponse, door: Door): Promise<void> {
   const { pk } = await readJson(req);
-  const pkHex = String(pk || "");
-  if (!/^[0-9a-fA-F]+$/.test(pkHex)) return send(res, 400, { error: "bad public key" });
+  const pkHex = String(pk || "").toLowerCase();
+  if (!/^[0-9a-f]+$/.test(pkHex)) return send(res, 400, { error: "bad public key" });
+  // Everything below names this caller by its id. The key is kept only for the
+  // encapsulation and for the `users` row.
+  const id = peerId(pkHex);
 
   const ip = clientIp(req);
   const [ipHits, pkHits] = await Promise.all([
     DB.bumpCounter(`init:ip:${ip}`, 60),
-    DB.bumpCounter(`init:pk:${pkHex}`, 60),
+    // `init:pk:{id}`, not `init:pk:{key}`. The counter key used to carry a whole
+    // 14 kB public key into `rate_counters`, which is why that table needed the
+    // same digest-index treatment as the identity tables.
+    DB.bumpCounter(`init:pk:${id}`, 60),
   ]);
   if (ipHits > INIT_PER_IP_PER_MIN || pkHits > INIT_PER_PK_PER_MIN) {
     logger.warn(`[auth] ${door} init rate-limited (ip=${ipHits}/${INIT_PER_IP_PER_MIN}, pk=${pkHits}/${INIT_PER_PK_PER_MIN})`);
@@ -141,7 +155,7 @@ async function handleInit(req: http.IncomingMessage, res: http.ServerResponse, d
   }
 
   const { ct, ss } = HqcWrapper.encapsulate(Buffer.from(pkHex, "hex"));
-  await DB.startAuthChallenge(pkHex, authProof(ss).toString("hex"));
+  await DB.startAuthChallenge(id, authProof(ss).toString("hex"));
   return send(res, 200, { ct: ct.toString("base64") });
 }
 
@@ -160,44 +174,58 @@ async function handleInit(req: http.IncomingMessage, res: http.ServerResponse, d
  */
 async function handleVerify(req: http.IncomingMessage, res: http.ServerResponse, door: Door): Promise<void> {
   const { pk, solution } = await readJson(req);
-  const pkHex = String(pk || "");
+  const pkHex = String(pk || "").toLowerCase();
+  const id = peerId(pkHex);
   const solutionHex = Buffer.from(String(solution || ""), "base64").toString("hex");
 
   // Atomically consume the open challenge (single-use — no replay).
-  const expectedHex = await DB.takeAuthChallenge(pkHex);
+  const expectedHex = await DB.takeAuthChallenge(id);
   if (!expectedHex || !safeEqualStr(solutionHex, expectedHex)) {
     // A wrong proof is either a client bug or someone trying to sign in as a key
     // they do not hold. Either way it should be visible: logger.error reaches
     // Sentry, so a run of them raises an alert instead of vanishing.
-    const failures = await DB.bumpCounter(`verify:fail:${pkHex}`, 15 * 60);
+    const failures = await DB.bumpCounter(`verify:fail:${id}`, 15 * 60);
     if (failures === VERIFY_FAILURE_ALERT) {
       logger.error(`🚨 [auth] ${failures} failed key-possession proofs in 15m for one public key (ip=${clientIp(req)})`);
     }
     return send(res, 401, { error: "auth failed" });
   }
   // A success clears the run, so an alert means a genuine sustained burst.
-  await DB.clearCounter(`verify:fail:${pkHex}`);
+  await DB.clearCounter(`verify:fail:${id}`);
 
   const admission = await checkAdmission(pkHex, door);
   if (!admission.ok) return refuse(res, admission);
 
   const scope: SessionScope = door === "paid" ? "premium" : "free";
 
+  // Record the identity: the id, and the key that id names.
+  //
+  // This is the only place `users.identity_pk` is written, and it happens HERE
+  // rather than at /username because this is the moment the caller has proved
+  // it holds the secret key. It is also what makes `GET /peer/{id}/key`
+  // answerable at all: no table stored an account's identity key before this
+  // change, because `users.pk` was identity and key material at once.
+  await DB.ensureUser(id, pkHex);
+
   // Self topics (presence publish + inbox) and the helper bot are what the FREE
   // tier is: a new account already lands here, so the free door needs no ACL
   // work of its own — only the absence of friend grants.
-  await DB.grantSelfTopics(pkHex);
-  await ensureBotFriendship(pkHex);
+  await DB.grantSelfTopics(id);
+  await ensureBotFriendship(id);
   if (scope === "premium") {
     // Restore whatever a lapse revoked. Idempotent, so paying users pay no
     // attention to it; a resubscriber gets their conversations back on login.
-    await DB.regrantAllFriendTopics(pkHex);
+    await DB.regrantAllFriendTopics(id);
   }
 
-  const username = await DB.getUsername(pkHex);
-  const sessionToken = await DB.mintSessionToken(pkHex, scope);
-  const mqttToken = await DB.mintMqttToken(pkHex);
+  const username = await DB.getUsername(id);
+  const sessionToken = await DB.mintSessionToken(id, scope);
+  const mqttToken = await DB.mintMqttToken(id);
   return send(res, 200, {
+    // The client's own identity, both halves. `id` is what it must present as
+    // its MQTT client id and username; `pk` is echoed back so a client can
+    // confirm the server read the key it sent.
+    id,
     pk: pkHex,
     username: username || null,
     scope,
@@ -265,7 +293,10 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: "INVALID_FIELD", message: "pk must be hex" });
       }
 
-      const result = await SubscriptionService.verifyClaim(email, code, pkHex);
+      // The client identifies itself by the public key it holds; the claim is
+      // RECORDED under the id that key commits to, because revoking one means
+      // kicking a client off the broker and that addresses an id.
+      const result = await SubscriptionService.verifyClaim(email, code, peerId(pkHex));
       if (!result.ok) {
         // `bad_code` and `no_code` are distinguished because the user needs to
         // know whether to retype the code or ask for a new one. Neither says
@@ -283,7 +314,7 @@ const server = http.createServer(async (req, res) => {
     if (method === "POST" && url === "/auth/refresh") {
       const session = await DB.resolveSessionToken(bearer(req));
       if (!session) return send(res, 401, { error: "unauthenticated" });
-      const mqttToken = await DB.mintMqttToken(session.pk);
+      const mqttToken = await DB.mintMqttToken(session.id);
       return send(res, 200, {
         mqttToken,
         scope: session.scope,
@@ -295,11 +326,21 @@ const server = http.createServer(async (req, res) => {
     // --- 5. EMQX HTTP authentication hook ------------------------------------
     // EMQX posts { username, password, clientid, nonce? } on every CONNECT.
     // Internal services present the privileged credential → superuser. Everyone
-    // else: username=pk, password=token; we verify it and hand EMQX the token's
-    // `expire_at` so EMQX DISCONNECTS the client at expiry → the client refreshes
-    // and reconnects (expiration-based rotation, ~5m). Optional per-CONNECT nonce
-    // blocks exact-packet replay.
+    // else: username = the CLIENT ID (sha256 of the hex public key), password =
+    // the opaque token; we verify it and hand EMQX the token's `expire_at` so
+    // EMQX DISCONNECTS the client at expiry → the client refreshes and
+    // reconnects (expiration-based rotation). Optional per-CONNECT nonce blocks
+    // exact-packet replay.
     // EMQX expects HTTP 200 with { result: "allow"|"deny", is_superuser?, expire_at? }.
+    //
+    // The username used to be the whole 14474-character public key, which the
+    // broker also carried as the clientid on every CONNECT packet — and which
+    // the authorizer then compared against a 14 kB column. Both are 64
+    // characters now, and `authorization.sources[].query` in emqx.conf reads
+    // `WHERE id = ${clientid}` to match. The two MUST change together: an
+    // authorizer whose query names a column that no longer exists errors on
+    // every lookup, and with `deny_action = disconnect` that is every client in
+    // a connect/drop loop.
     if (method === "POST" && url === "/mqtt/authn") {
       const body = await readJson(req);
       const username = String(body.username || "");
@@ -315,16 +356,16 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { result: "allow", is_superuser: true });
       }
 
-      const pk = username;
-      if (!pk || !password) return send(res, 200, { result: "deny" });
+      const id = username.toLowerCase();
+      if (!id || !password) return send(res, 200, { result: "deny" });
 
       // Replay guard: a captured CONNECT can't be resent with the same nonce.
       if (nonce && !(await DB.useNonce(nonce))) {
-        logger.warn(`[auth] CONNECT nonce replay for pk=${pk.slice(0, 12)}…`);
+        logger.warn(`[auth] CONNECT nonce replay for id=${id.slice(0, 12)}…`);
         return send(res, 200, { result: "deny" });
       }
 
-      const { ok, expireAt } = await DB.verifyMqttToken(pk, password);
+      const { ok, expireAt } = await DB.verifyMqttToken(id, password);
       if (!ok) return send(res, 200, { result: "deny" });
       // expire_at (unix seconds) → EMQX force-disconnects at this time.
       return send(res, 200, { result: "allow", expire_at: expireAt });

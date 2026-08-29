@@ -79,3 +79,38 @@ test("aesDecrypt refuses a truncated GCM tag", async (t) => {
     (e: Error) => !/truncated GCM tag/.test(e.message),
     "a 16-byte forgery is refused by GCM itself");
 });
+
+// The AAD parameter exists so the v2 frame header can be bound to the payload it
+// selects the key for. Three properties matter, and all three are load-bearing:
+// it must round-trip, a changed header must break the tag, and omitting AAD must
+// stay byte-compatible with a sealer that never passed any.
+test("aesEncrypt/aesDecrypt bind additional authenticated data", async (t) => {
+  let botCrypto: typeof import("../bot/crypto");
+  try {
+    botCrypto = await import("../bot/crypto");
+  } catch {
+    return t.skip("HQC native lib unavailable on this platform");
+  }
+  const { aesEncrypt, aesDecrypt } = botCrypto;
+
+  const key = nodeCrypto.randomBytes(32);
+  const header = Buffer.from(JSON.stringify({ n: 7, pn: 0, t: "msg" }), "utf8");
+
+  const sealed = aesEncrypt("attack at dawn", key, header);
+  assert.equal(aesDecrypt(sealed, key, header), "attack at dawn", "AAD round-trips");
+
+  // A tampered header must not open, even though the ciphertext is untouched.
+  // This is the TM-1 case: today `epoch`/`idx` ride outside the AEAD.
+  const tampered = Buffer.from(JSON.stringify({ n: 8, pn: 0, t: "msg" }), "utf8");
+  assert.throws(() => aesDecrypt(sealed, key, tampered),
+    "a modified header fails the tag check");
+  assert.throws(() => aesDecrypt(sealed, key),
+    "dropping the header entirely fails too");
+
+  // And a sealer that passes no AAD is unchanged — the parameter is additive, so
+  // the epoch-0 path and every existing caller keep working untouched.
+  const plain = aesEncrypt("no aad here", key);
+  assert.equal(aesDecrypt(plain, key), "no aad here", "omitting AAD is the old behaviour");
+  assert.throws(() => aesDecrypt(plain, key, header),
+    "AAD cannot be added after the fact");
+});
