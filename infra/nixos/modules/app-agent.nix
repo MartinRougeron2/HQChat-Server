@@ -125,9 +125,7 @@ in
     "pg_local_password"
     "stripe_secret_key"
     "stripe_webhook_secret"
-    "resend_api_key"
     "apns_key_p8"
-    "otp_pepper"
   ]
   # `f` applies ownership only when it CREATES the file, and every secret on an
   # existing host was written root-owned by set-host-secrets.sh before this
@@ -141,36 +139,16 @@ in
     "pg_local_password"
     "stripe_secret_key"
     "stripe_webhook_secret"
-    "resend_api_key"
     "apns_key_p8"
-    "otp_pepper"
   ];
 
-  # The OTP pepper is the one secret that must never be empty: without it a
-  # database dump yields every pending subscription claim code. It also has no
-  # external source — unlike the Stripe/APNs keys and the database URL it is ours
-  # to generate — so the host makes its own rather than waiting for an operator
-  # to remember.
-  systemd.services.hqcat-otp-pepper = {
-    description = "Generate the OTP pepper if this host does not have one";
-    wantedBy = [ "multi-user.target" ];
-    before = [ "hqcat-agent.service" ];
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-    };
-    path = with pkgs; [
-      openssl
-      coreutils
-    ];
-    script = ''
-      set -euo pipefail
-      f=/etc/hqcat/${cfg.stack}/secrets/otp_pepper
-      if [ ! -s "$f" ]; then
-        echo "generating a new OTP pepper for the ${cfg.stack} stack"
-        ( umask 077; openssl rand -hex 32 > "$f" )
-        chmod 0600 "$f"
-      fi
-    '';
-  };
+  # `hqcat-otp-pepper.service` stood here. The OTP pepper was the one secret
+  # that could not be empty — without it a database dump yielded every pending
+  # subscription claim code — and the one with no external source, so the host
+  # generated its own rather than waiting for an operator. There are no claim
+  # codes any more, so there is nothing to pepper.
+  #
+  # An existing host keeps a stale /etc/hqcat/<stack>/secrets/otp_pepper file.
+  # It is inert (nothing mounts or reads it) and the tmpfiles rules above no
+  # longer manage it, so it can be deleted by hand whenever convenient.
 }

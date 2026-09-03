@@ -91,6 +91,112 @@ function fmt(args: unknown[]): string {
     .join(" ");
 }
 
+// --- Sentry flood control (quota protection) --------------------------------
+//
+// Every logger.error() used to become one Sentry EVENT, unconditionally. That
+// is what exhausted a month's quota in production: the bot's `openSession`
+// catch-all fired once per peer per FRIEND_POLL_MS (15s) for any user who had
+// not yet published prekeys — 240 events an hour, per user, for a condition
+// that is expected and self-resolving.
+//
+// The call sites are being fixed, but a call site is the wrong place for the
+// only defence: the next one is written by someone who has not read this
+// comment, on a path that only floods in production, under a condition nobody
+// reproduced locally. So the throttle lives HERE, where every current and
+// future error passes.
+//
+// Shape: first occurrence of a fingerprint goes straight through, then at most
+// one per THROTTLE_MS, and that one carries how many were suppressed. So a
+// genuine new failure is never delayed, a persistent one stays visible at a
+// readable cadence, and neither can spend the quota.
+//
+// NOTHING is throttled on the console — stderr is not metered and an operator
+// tailing logs should see every occurrence. This only gates the Sentry sink.
+// Resolved per call rather than at module load. Read once into a const, the
+// knob could not actually be turned: an operator raising it on a flooding host
+// would have had to restart the process to apply it, which is the worst moment
+// to need a restart. It is one env lookup on an already-expensive path.
+function throttleMs(): number {
+  const raw = Number(process.env.SENTRY_THROTTLE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 10 * 60 * 1000;
+}
+// Bounded so a process with unbounded distinct fingerprints cannot grow this
+// map forever; oldest-first eviction is fine because an evicted key simply gets
+// one more event through.
+const THROTTLE_MAX_KEYS = 500;
+
+interface Seen { until: number; suppressed: number }
+const seen = new Map<string, Seen>();
+
+// Injectable so the throttle's own tests are deterministic. They used to drive
+// it with a 1 ms window and a busy-wait, which passed locally and failed on a
+// loaded CI runner: 1 ms elapsed between two synchronous calls, the window
+// lapsed, and a "suppressed" event was sent. A test for time-based behaviour
+// should not itself depend on how fast the machine is.
+let clock: () => number = Date.now;
+/** Test seam. Pass nothing to restore the real clock. */
+export function setLoggerClock(fn?: () => number): void {
+  clock = fn ?? Date.now;
+}
+
+/**
+ * Collapse the volatile parts of a message so that the same FAILURE, about
+ * different peers or at different offsets, shares one budget.
+ *
+ * Without this, "could not open a session with @alice…" and "…with @bob…" are
+ * distinct fingerprints and 200 users still produce 200 events per cycle. The
+ * per-peer detail is not lost — it is on the event that does get through, and
+ * on every console line.
+ */
+export function fingerprint(message: string): string {
+  // Truncate FIRST. Every pattern below then runs over at most 200 characters,
+  // which bounds the work regardless of how long a log line gets.
+  //
+  // The handle pattern used to be `[^\s]*@[^\s]*`, which is quadratic: on a
+  // long run of non-space characters with no `@`, the engine consumes to the
+  // end and backtracks from every start position. A ReDoS on the ERROR path is
+  // a bad place to have one — that path is reached exactly when something is
+  // already going wrong, and often in a loop. Anchoring on the literal `@`
+  // makes it linear, and `@` is where the volatile part starts anyway.
+  return message
+    .slice(0, 200)
+    .replace(/\b[0-9a-f]{6,}\b/gi, "#")   // ids, hashes, key fragments
+    .replace(/\b\d+\b/g, "#")             // counts, ports, status codes
+    .replace(/@\S*/g, "@")                 // handles and addresses
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Whether this message may spend a Sentry event now, and what to append. */
+function admit(message: string): { send: boolean; note: string } {
+  const now = clock();
+  const key = fingerprint(message);
+  const prev = seen.get(key);
+
+  if (prev && now < prev.until) {
+    prev.suppressed++;
+    return { send: false, note: "" };
+  }
+
+  if (seen.size >= THROTTLE_MAX_KEYS && !prev) {
+    const oldest = seen.keys().next();
+    if (!oldest.done) seen.delete(oldest.value);
+  }
+  const window = throttleMs();
+  seen.set(key, { until: now + window, suppressed: 0 });
+
+  const n = prev?.suppressed ?? 0;
+  return {
+    send: true,
+    note: n > 0 ? ` [+${n} identical suppressed in the last ${Math.round(window / 60000)}m]` : "",
+  };
+}
+
+/** Test seam: forget every throttle window. */
+export function resetSentryThrottle(): void {
+  seen.clear();
+}
+
 export const logger = {
   /** High-volume per-message tracing. Off by default (LOG_LEVEL=debug to see). */
   debug(...args: unknown[]) {
@@ -110,15 +216,24 @@ export const logger = {
   /**
    * Real errors: always surfaced to stderr (unless LOG_LEVEL=silent) AND sent to
    * Sentry as an exception event. Pass an Error first for a proper stack.
+   *
+   * The Sentry half is throttled per fingerprint — see the note above. The
+   * console half never is.
+   *
+   * If what you are reporting is EXPECTED and self-resolving (a peer with no
+   * prekeys yet, a reconnect that will succeed), it is not an error: use warn
+   * for the first occurrence, or debug. The throttle bounds the damage; it does
+   * not make a non-error into one.
    */
   error(...args: unknown[]) {
     if (enabled("error")) console.error(...scrubArgs(args));
     const errArg = args.find((a) => a instanceof Error);
     const msg = fmt(args);
-    if (sink) {
-      if (errArg) sink.captureError(errArg, msg);
-      else sink.captureMessage(msg, "error");
-    }
+    if (!sink) return;
+    const { send, note } = admit(msg);
+    if (!send) return;
+    if (errArg) sink.captureError(errArg, msg + note);
+    else sink.captureMessage(msg + note, "error");
   },
   /** Startup/operational lines we always want visible even at LOG_LEVEL=info. */
   startup(...args: unknown[]) {

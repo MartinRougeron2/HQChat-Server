@@ -10,7 +10,7 @@
 # with repo access.
 #
 # ⚠️ Values left behind in GitHub from that era are NOT read by anything — no
-# workflow references APNS_*, STRIPE_* or RESEND_* — but a real APNs .p8 or
+# workflow references APNS_* or STRIPE_* — but a real APNs .p8 or
 # Stripe key still sitting in a GitHub Environment is live production material
 # reachable by anyone with repo access, which is the exact exposure this model
 # removed. Revoke and delete them at the source rather than leaving them as
@@ -153,17 +153,16 @@ fi
 # `docker compose up` fails — hence the empty placeholders.
 put stripe_secret_key     STRIPE_SECRET_KEY     "Stripe secret key"        optional
 put stripe_webhook_secret STRIPE_WEBHOOK_SECRET "Stripe webhook secret"    optional
-put resend_api_key        RESEND_API_KEY        "Resend API key"           optional
 put_pem apns_key_p8       APNS_KEY_P8           "APNs signing key (.p8)"
-# Pepper for stored OTP hashes: without it a database dump yields every pending
-# claim code. Generated here if absent, and never rotated silently.
-put otp_pepper            OTP_PEPPER            "OTP pepper (32-byte hex)" generate
+# `resend_api_key` and a generated `otp_pepper` were here too, for the emailed
+# subscription claim codes. Both went with the paywall — nothing in this stack
+# sends mail. An existing host keeps the two files; they are inert.
 
 ENVFILE="/etc/hqcat/$STACK/server.env"
 if [[ ! -f "$ENVFILE" ]]; then
   printf '# Non-secret config for the %s stack. See infra/deploy/.env.example.\n' "$STACK" > "$ENVFILE"
   chmod 600 "$ENVFILE"
-  echo "📝 created $ENVFILE — fill in SERVER_NAME / PUBLIC_BASE_URL / ADMISSION_POLICY / STOREKIT_*"
+  echo "📝 created $ENVFILE — fill in SERVER_NAME / PUBLIC_BASE_URL / ADMISSION_POLICY / DONATIONS_ENABLED"
 fi
 
 # --- APNs: does anything actually supply the ids? ---------------------------

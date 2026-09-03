@@ -67,9 +67,14 @@ variable "worker_route_host" {
 }
 
 variable "worker_paths" {
-  description = "Exact paths routed to the Worker. NEVER '/*' — this host also serves the API, and a glob would swallow /auth, /mqtt, /subscribe and /health."
+  description = "Exact paths routed to the Worker. NEVER '/*' — this host also serves the API, and a glob would swallow /auth, /mqtt, /donate/checkout and /health."
   type        = list(string)
-  default     = ["/", "/crypto", "/privacy", "/terms", "/support"]
+  # "/donate" is the marketing page and belongs to the Worker. Its SUB-paths
+  # deliberately are not listed: /donate/checkout, /donate/thanks and
+  # /donate/cancelled need Stripe and the database, so they must fall through to
+  # the origin — which they do, because these are exact matches, not prefixes.
+  # Adding "/donate/*" here would break checkout in exactly that way.
+  default     = ["/", "/crypto", "/privacy", "/terms", "/support", "/donate"]
 
   validation {
     # "/" is a single exact path and is fine. A wildcard is not: it would put the

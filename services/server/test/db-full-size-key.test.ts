@@ -182,22 +182,11 @@ test("the ephemeral tier is keyed by id too", async (t) => {
   await DB.deleteUser(a);
 });
 
-test("a subscription claim is recorded by id, so revocation can address it", async (t) => {
-  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
-  const a = peerId(bigPk());
-  const emailHash = crypto.randomBytes(32).toString("hex");
-
-  await DB.setSubscription(emailHash, "active");
-  assert.equal(await DB.addClaimedDevice(emailHash, a, 3), "ok");
-  // Re-claiming the same device is an upsert, not a second slot.
-  assert.equal(await DB.addClaimedDevice(emailHash, a, 3), "ok");
-  assert.deepEqual(await DB.claimedDevices(emailHash), [a]);
-
-  // The reason it is the id: ending a lapsed subscriber's access means kicking
-  // that client off the broker, and `DELETE /clients/{clientid}` is a URL.
-  assert.equal(a.length, 64);
-
-  await DB.forgetClaimedDevices(emailHash);
-});
+// A subscription claim used to be recorded here, pinning that it was keyed by
+// the 64-character id rather than the 14 kB public key — because revoking one
+// meant `DELETE /clients/{clientid}`, and EMQX answered 414 to the key. The
+// claim tables are dropped in migrations/005_donations.sql; the id-length
+// property they demonstrated is still pinned, on the path that still needs it,
+// by test/emqx-revocation.test.ts.
 
 test.after(closePg);

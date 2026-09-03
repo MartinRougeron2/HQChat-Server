@@ -178,22 +178,24 @@ jobs:
           # local overlay, which also supplies the postgres container to point
           # them at. CI only writes the remaining external ones.
           printf '%s' 'ci-apns-key-p8'   > infra/deploy/secrets/apns_key_p8
-          printf '%s' 'ci-resend-key'    > infra/deploy/secrets/resend_api_key
-          printf '%s' 'ci-otp-pepper'    > infra/deploy/secrets/otp_pepper
           # app-api mounts both of these unconditionally (docker-compose.yml
-          # owns /stripe/webhook and /subscribe), so compose refuses to create
-          # the container without the files -- `bind source path does not
-          # exist`. It never mattered while the release could not reach this
-          # step. The values are never used: ADMISSION_POLICY is `open` here.
+          # owns /stripe/webhook, /donate and /supporters), so compose refuses
+          # to create the container without the files -- `bind source path does
+          # not exist`. The values are never used: DONATIONS_ENABLED is unset
+          # here, so nothing ever constructs a Stripe client.
           printf '%s' 'sk_test_ci'       > infra/deploy/secrets/stripe_secret_key
           printf '%s' 'whsec_ci'         > infra/deploy/secrets/stripe_webhook_secret
-          # server.env cannot set ADMISSION_POLICY or MAIL_FROM: compose's
-          # `environment:` wins over `env_file:`, and both services pin
-          # ADMISSION_POLICY to `stripe` there. Writing `open` here looked like
-          # it disabled the paid door and did nothing at all -- auth then
-          # refused to boot on the MAIL_FROM that stripe mode requires. Testing
-          # them in stripe mode is the right thing anyway: it is the mode they
-          # run in, so it is the mode worth proving boots.
+          # `ci-resend-key` and `ci-otp-pepper` were written here too, for the
+          # emailed subscription claim. Both secrets are gone from the compose
+          # file along with the paywall.
+          #
+          # This used to have to run in `stripe` mode: compose pinned
+          # ADMISSION_POLICY: stripe under `environment:`, which wins over
+          # `env_file`, so writing `open` in server.env did nothing at all --
+          # and auth then refused to boot on the MAIL_FROM that stripe mode
+          # required. Neither pin exists now. Admission is left at its `open`
+          # default and donations are simply off, which is exactly a
+          # self-hosted stack and the cheapest thing to prove boots.
           #
           # APNS_KEY_ID/APNS_TEAM_ID were removed from here because two thirds
           # of a config tripped the all-or-nothing check and made auth and
@@ -202,15 +204,7 @@ jobs:
           # scoped to `assertConfig(["apns"])` now, so only push-bridge has an
           # opinion. They stay out of CI anyway, since APNs entirely absent is
           # a state config.ts considers correct and this smoke test has no key.
-          # MAIL_FROM belongs in server.env now: the compose file no longer
-          # declares it under `environment:`, so `env_file` is what supplies it
-          # -- the same path a real host uses.
-          # PUBLIC_BASE_URL too: the compose file no longer carries a default
-          # for it, because a default pinned one deployment's hostname into a
-          # file every deployment shares -- and silently won whenever a host set
-          # its own. app-api requires it under ADMISSION_POLICY=stripe, so a
-          # smoke test without it proves nothing about a host that has one.
-          printf 'SERVER_NAME=CI\nMAIL_FROM=ci@example.invalid\nPUBLIC_BASE_URL=https://ci.example.invalid\n' \
+          printf 'SERVER_NAME=CI\nPUBLIC_BASE_URL=https://ci.example.invalid\n' \
             > infra/deploy/server.env
 
           # Production reaches a managed cluster over a VPC, which a runner does

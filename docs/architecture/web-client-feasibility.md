@@ -78,29 +78,30 @@ This avoids §1–§3 entirely, because no HQC handshake and no identity key are
 involved. It is genuinely buildable:
 
 - `services/server/api/main.ts` is already a real REST API behind bearer session
-  auth, and `services/server/services/web/subscribe.ts` already server-renders
+  auth, and `services/server/services/web/donate.ts` already server-renders
   the Stripe "linking code" flow (paste `SHA-256(pkHex)` → Stripe Checkout).
 - An OTP would replace the paste-the-code step: the app shows a short code, the
   web page consumes it, the webhook flips the tier under the blinded pk.
 
-**But it solves a problem v2 does not have.** Both `/subscribe` and
-`/stripe/webhook` are gated on `ADMISSION_POLICY === "stripe"`
-(`api/main.ts:66,88`), and `infra/deploy/docker-compose.yml` hardcodes
-`ADMISSION_POLICY: open` with the Stripe secrets commented out. They are dead
-code in production today: v1 deliberately gatekeeps cost with a $0.99 paid iOS
-app instead of a subscription. Building a web payment flow means first
-re-deciding the monetization model — that is a product call, not an engineering
-one, and it should be made on its own merits rather than as a side effect of
-"can we do web?".
+**But it solves a problem that no longer exists.** This section described a web
+account/payment flow for a subscription that gated adding contacts. There is no
+subscription: the product is free for everyone and funded by donations, which
+grant nothing and are bound to no account. `/donate` and `/stripe/webhook` are
+live, but there is no entitlement for a web flow to deliver, and no tier for a
+webhook to flip.
+
+The historical note is still worth keeping: this section also once claimed v1
+"gatekeeps cost with a $0.99 paid iOS app", which was superseded twice — first
+by the website subscription, then by donations.
 
 ## 5. Recommendation
 
 1. **Drop full web messaging.** The key-storage problem (§2) has no answer that
    preserves the product's core claim. Revisit only if the threat model
    deliberately changes.
-2. **Keep the account/payment web path on the shelf.** It is ~1–2 weeks of work
-   and the server side largely exists, but it presupposes a return to
-   subscriptions. Reopen it if and when the paid-app model stops working.
+2. **Drop the account/payment web path.** It presupposed a subscription to
+   deliver, and there is not one. What the site actually needs — a donate page
+   and a supporters list — exists already and needed no account system.
 3. **If a web presence is wanted sooner**, the cheapest useful step is extending
    the existing Cloudflare Worker site (`apps/site/src/index.js`) — no new
    infrastructure, no crypto, no new threat model.
@@ -109,6 +110,6 @@ one, and it should be made on its own merits rather than as a side effect of
 
 - A browser API for non-extractable custom-KEM key material, or a WebAuthn-based
   key-wrapping scheme good enough to hold the identity secret.
-- A decision to reinstate subscriptions, which would make §4 load-bearing.
+- A decision to reinstate a paid tier, which would make §4 load-bearing again.
 - A move to a smaller HQC parameter set, which would shrink §1's costs but not
   §2's.

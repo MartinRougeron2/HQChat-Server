@@ -10,7 +10,7 @@
     "bot": "tsx bot/bot.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
-    "test:e2e": "node --import tsx --test test/e2e/*.test.ts",
+    "test:e2e": "node --import tsx --test --test-force-exit test/e2e/*.test.ts",
     "migrate": "tsx services/db/migrate.ts",
     "check-mqtt-acl": "tsx scripts/check-mqtt-acl.ts",
     "check-push": "tsx scripts/check-push.ts",

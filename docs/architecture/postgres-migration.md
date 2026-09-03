@@ -96,7 +96,7 @@ where every kick came back `414 URI Too Long`. Read the column names below as
 | `friends:{pk}`, `friendship:{h}`, `hashmembers:{h}` | `friendships(pk_lo, pk_hi, hash GENERATED, PK(pk_lo,pk_hi))` |
 | `invites:{pk}` | `invites(to_pk, from_pk, created_at, PK(to_pk,from_pk))` |
 | `push:{pk}` | `push_tokens(pk PK, platform, token, updated_at)` |
-| `claim:{pk}`, `sub:{h}`, `subcus:{id}`, `sub:pks:{h}` | `subscriptions(email_hash PK, …)`, `subscription_customers(customer_id PK, email_hash)`, `subscription_claims(pk PK, email_hash, claimed_at)` |
+| `claim:{pk}`, `sub:{h}`, `subcus:{id}`, `sub:pks:{h}` | `subscriptions(email_hash PK, …)`, `subscription_customers(customer_id PK, email_hash)`, `subscription_claims(pk PK, email_hash, claimed_at)` — **all four dropped in `005_donations.sql`**; the paywall they served was replaced by donations, which record nothing but an optional name |
 | `admission:exempt` | `admission_exempt(pk PK)` |
 | `mqtt_acl:{pk}` | `mqtt_acl(pk, topic, action, PK(pk,topic))` |
 

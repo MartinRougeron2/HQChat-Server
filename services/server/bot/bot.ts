@@ -188,13 +188,13 @@ function dehydrateSession(s: SessionState): unknown {
     skipped: s.skipped.map((k) => ({ chain: k.chain, n: k.n, key: k.key.toString("base64") })),
     pendingInit: s.pendingInit
       ? {
-          ctId: s.pendingInit.ctId.toString("base64"),
-          ctMt: s.pendingInit.ctMt.toString("base64"),
-          ctOt: s.pendingInit.ctOt ? s.pendingInit.ctOt.toString("base64") : null,
-          otId: s.pendingInit.otId,
-          rk: s.pendingInit.rk.toString("base64"),
-          cid: s.pendingInit.cid,
-        }
+        ctId: s.pendingInit.ctId.toString("base64"),
+        ctMt: s.pendingInit.ctMt.toString("base64"),
+        ctOt: s.pendingInit.ctOt ? s.pendingInit.ctOt.toString("base64") : null,
+        otId: s.pendingInit.otId,
+        rk: s.pendingInit.rk.toString("base64"),
+        cid: s.pendingInit.cid,
+      }
       : undefined,
   };
 }
@@ -221,15 +221,15 @@ function reviveSession(raw: unknown): SessionState | null {
       seenChains: Array.isArray(r.seenChains) ? r.seenChains.map(String) : [],
       ...(r.pendingInit
         ? {
-            pendingInit: {
-              ctId: b64(r.pendingInit.ctId),
-              ctMt: b64(r.pendingInit.ctMt),
-              ctOt: r.pendingInit.ctOt ? b64(r.pendingInit.ctOt) : null,
-              otId: r.pendingInit.otId ?? null,
-              rk: b64(r.pendingInit.rk),
-              cid: String(r.pendingInit.cid),
-            } as InitHeader,
-          }
+          pendingInit: {
+            ctId: b64(r.pendingInit.ctId),
+            ctMt: b64(r.pendingInit.ctMt),
+            ctOt: r.pendingInit.ctOt ? b64(r.pendingInit.ctOt) : null,
+            otId: r.pendingInit.otId ?? null,
+            rk: b64(r.pendingInit.rk),
+            cid: String(r.pendingInit.cid),
+          } as InitHeader,
+        }
         : {}),
       sentOnChain: Number(r.sentOnChain ?? 0),
       chainStartedAt: Number(r.chainStartedAt ?? 0),
@@ -317,7 +317,7 @@ let sessionToken = "";
 let mqttToken = "";
 
 /** A 401: the REST session itself is gone, so the KEM handshake must be redone. */
-class Unauthenticated extends Error {}
+class Unauthenticated extends Error { }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -339,15 +339,43 @@ async function httpJson(
 }
 
 /** Call app-api with our session bearer. Throws Unauthenticated on 401. */
+/**
+ * A non-2xx from the API, carrying the parts a caller needs to decide whether
+ * it is exceptional.
+ *
+ * It used to throw a bare Error whose message was the whole story, so every
+ * caller had to treat "this peer has published no prekeys yet" — which is
+ * ordinary, expected and self-resolving — exactly like a real fault. That is
+ * what turned `openSession` into a Sentry firehose: 404 NO_PREKEYS, once per
+ * peer per 15s poll, each one an event.
+ */
+class ApiError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function api(method: string, path: string, body?: unknown): Promise<any> {
   const opts: { method: string; body?: unknown; bearer?: string } = { method, bearer: sessionToken };
   if (body !== undefined) opts.body = body;
   const r = await httpJson(`${API_BASE}${path}`, opts);
   if (r.status === 401) throw new Unauthenticated(`${method} ${path} → 401`);
   if (r.status < 200 || r.status >= 300) {
-    throw new Error(`${method} ${path} → ${r.status} ${JSON.stringify(r.body)}`);
+    const code = typeof (r.body as any)?.error === "string" ? (r.body as any).error : "";
+    throw new ApiError(r.status, code, `${method} ${path} → ${r.status} ${JSON.stringify(r.body)}`);
   }
   return r.body ?? {};
+}
+
+/**
+ * Conditions the bot meets constantly and should never report as faults: a peer
+ * who has not published prekeys yet (they will, on their first directory sync),
+ * or one whose one-time keys are momentarily exhausted.
+ */
+function isExpectedPeerState(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 404 &&
+    (e.code === "NO_PREKEYS" || e.code === "NOT_FOUND");
 }
 
 /**
@@ -480,7 +508,7 @@ function pruneFriends(live: Set<string>) {
     // Best-effort — the grant is already gone, so this may be refused too. It is
     // issued anyway so a peer removed WHILE we are connected stops being
     // delivered without waiting for a reconnect.
-    if (client?.connected) client.unsubscribe(convoTopic(peerId_), () => {});
+    if (client?.connected) client.unsubscribe(convoTopic(peerId_), () => { });
     logger.warn(
       `🤖 [bot] dropped @${name} — no longer in the friend graph ` +
       `(its topic grant is revoked, and re-subscribing to it drops the link)`
@@ -663,9 +691,9 @@ function subscribeConversation(peerId_: string) {
  */
 const DISCONNECT_REASONS: Record<number, string> = {
   0x87: "0x87 NOT AUTHORIZED — an ACL denial (deny_action=disconnect). " +
-        "Check mqtt_acl for this pk; note the authorizer caches for 15m",
+    "Check mqtt_acl for this pk; note the authorizer caches for 15m",
   0x8e: "0x8E SESSION TAKEN OVER — another connection used the same client id " +
-        "(a second bot process, or an old container still running)",
+    "(a second bot process, or an old container still running)",
   0x8d: "0x8D KEEPALIVE TIMEOUT — we stopped responding (a blocked event loop)",
   0x89: "0x89 SERVER BUSY",
   0x8b: "0x8B SERVER SHUTTING DOWN",
@@ -725,7 +753,26 @@ function connectMqtt() {
     // Persistent session — this IS the offline queue. Messages published to our
     // conversations while the bot is restarting are held by the broker and
     // delivered on reconnect, which is what the `/ws` pending-queue used to do.
+    //
+    // `clean: false` ALONE does not do that on MQTT 5, and this connection is
+    // MQTT 5. In 3.1.1 a non-clean session persists until the broker decides
+    // otherwise; in 5 the lifetime is `sessionExpiryInterval`, and its default
+    // is ZERO — the session ends the instant the connection does, and every
+    // queued message with it. So the comment above described 3.1.1 behaviour on
+    // a 5 connection, and the offline queue it promised did not exist: the
+    // messages a restart was supposed to catch were being dropped by the
+    // broker, silently, which is exactly the shape of "the bot missed something
+    // while it was down".
+    //
+    // The apps are unaffected — they speak 3.1.1 (MQTTWireClient.swift), where
+    // `clean: false` means what this comment originally assumed.
     clean: false,
+    properties: {
+      // Long enough to cover a deploy, a crash loop or a broker restart; short
+      // enough that an abandoned identity does not hold queued messages
+      // forever. Session state is per client id, and there is one bot.
+      sessionExpiryInterval: Number(process.env.MQTT_SESSION_EXPIRY_SECONDS || 3600),
+    },
     // We reconnect by hand, because a reconnect needs a FRESH token: the library
     // would happily retry forever with the expired password that just got us
     // disconnected.
@@ -846,7 +893,11 @@ function onInit(f: FriendState, env: EnvelopeV2) {
 
   const secrets = prekeySecrets();
   if (!secrets) {
-    logger.error(`🤖 [bot] init from @${label(f.id)} dropped — no prekeys published yet`);
+    // OUR prekeys, not theirs — so this says the bot has not finished publishing
+    // its own, which is a startup-ordering window that closes on its own. warn,
+    // not error: the same peer re-sending an init would otherwise bill one
+    // Sentry event per attempt.
+    logger.warn(`🤖 [bot] init from @${label(f.id)} dropped — this bot has not published prekeys yet`);
     return;
   }
 
@@ -1146,22 +1197,22 @@ async function sendMessage(peerId_: string, text: string): Promise<boolean> {
       pn: sealed.header.pn,
       ...(sealed.initHeader
         ? {
-            // `senderPk` rides on `init` alone: it is the frame the peer may
-            // receive before they have ever fetched our key, and they verify it
-            // against `sender` rather than trusting it. Repeating 14 kB on every
-            // message afterwards would undo most of what the id buys.
-            senderPk: pkHex,
-            rk: sealed.initHeader.rk.toString("base64"),
-            ctId: sealed.initHeader.ctId.toString("base64"),
-            ctMt: sealed.initHeader.ctMt.toString("base64"),
-            ...(sealed.initHeader.ctOt
-              ? { ctOt: sealed.initHeader.ctOt.toString("base64"), otId: sealed.initHeader.otId }
-              : {}),
-          }
+          // `senderPk` rides on `init` alone: it is the frame the peer may
+          // receive before they have ever fetched our key, and they verify it
+          // against `sender` rather than trusting it. Repeating 14 kB on every
+          // message afterwards would undo most of what the id buys.
+          senderPk: pkHex,
+          rk: sealed.initHeader.rk.toString("base64"),
+          ctId: sealed.initHeader.ctId.toString("base64"),
+          ctMt: sealed.initHeader.ctMt.toString("base64"),
+          ...(sealed.initHeader.ctOt
+            ? { ctOt: sealed.initHeader.ctOt.toString("base64"), otId: sealed.initHeader.otId }
+            : {}),
+        }
         : {
-            ...(sealed.header.rk ? { rk: sealed.header.rk.toString("base64") } : {}),
-            ...(sealed.header.kemCt ? { kemCt: sealed.header.kemCt.toString("base64") } : {}),
-          }),
+          ...(sealed.header.rk ? { rk: sealed.header.rk.toString("base64") } : {}),
+          ...(sealed.header.kemCt ? { kemCt: sealed.header.kemCt.toString("base64") } : {}),
+        }),
       payload: "",
     };
     // The canonical header IS the AAD, so the envelope has to be finished before
@@ -1215,7 +1266,15 @@ async function openSession(f: FriendState): Promise<boolean> {
     logger.debug(`🤖 [bot] ✅ session opened with @${label(f.id)}`);
     return true;
   } catch (e: any) {
-    logger.error(`🤖 [bot] could not open a session with @${label(f.id)}: ${e.message}`);
+    // The peer simply has no prekeys yet. The graceful branch above was written
+    // for exactly this and never ran, because `api` threw before it could —
+    // which is how one expected condition became 240 Sentry events an hour per
+    // affected user, on a 15-second poll that never gives up.
+    if (isExpectedPeerState(e)) {
+      logger.debug(`🤖 [bot] @${label(f.id)} has published no prekeys yet — retrying on the next poll`);
+      return false;
+    }
+    logger.warn(`🤖 [bot] could not open a session with @${label(f.id)}: ${e.message}`);
     return false;
   }
 }

@@ -34,11 +34,13 @@ async function pair(t: { skip: (m: string) => void }) {
   // Friendship is what grants the conversation topic AND publish on each
   // other's inbox, so it has to land before either connects.
   const invited = await a.api("POST", "/friends/invite", { to: b.username });
-  if (invited.status === 402) {
-    // The friend graph is the paid feature; a free session cannot grow it.
-    t.skip("friend invites require a premium session on this deployment");
-    return null;
-  }
+  // There used to be a `if (invited.status === 402) t.skip(...)` here, for when
+  // the friend graph was a paid feature. It made this suite a no-op: the test
+  // client authenticates on a door that minted a `free` scope, every invite was
+  // refused, every conversation test skipped, and the job reported green having
+  // exercised nothing. Nothing answers 402 any more — the paywall is gone — and
+  // the client now uses the full door, so an invite that fails is a real
+  // failure and must be asserted rather than skipped.
   assert.equal(invited.status, 200, "invite accepted");
   assert.equal((await b.api("POST", "/friends/accept", { from: a.username })).status, 200);
 
@@ -126,14 +128,33 @@ test("e2e: out-of-order delivery still decrypts", async (t) => {
     await a.send(b, "opener");
     assert.equal((await b.next()).text, "opener");
 
+    // B answers, and that reply is load-bearing rather than tidy-looking.
+    //
+    // A carries its handshake header on EVERY frame until it hears back
+    // (`SessionState.pendingInit`), so without this reply all three frames
+    // below would still be `init` frames. A responder that already holds a
+    // session drops an inbound `init` outright — bot.ts `onInit`, the harness,
+    // and Swift's `InitCollision.ignoreReplay` all do, to stop a replayed frame
+    // wiping a conversation — so all three would vanish, and the failure would
+    // look identical to a reordering bug.
+    //
+    // What this test is actually about is out-of-order `msg` delivery and the
+    // ratchet's skipped-key handling, which only happens once the handshake is
+    // behind both sides.
+    await b.send(a, "ack");
+    assert.equal((await a.next()).text, "ack", "A must hear back before it stops re-sending its init");
+
     // Seal three, deliver them back to front. The broker preserves order, so the
     // reordering is done by hand — publishing them in reverse.
-    const frames = [] as string[];
     const envs = [];
     for (let i = 0; i < 3; i++) envs.push(await a.sealOnly(b, `ooo-${i}`));
-    for (const e of envs.reverse()) frames.push(JSON.stringify(e));
-    for (const raw of frames) {
-      await a.publishRaw(`c/${friendshipHash(a.id, b.id)}`, raw);
+    for (const e of envs) {
+      assert.equal(e.t, "msg", "the reply should have cleared A's pendingInit");
+    }
+    // Routed by frame type rather than hard-coded, so a frame that is not the
+    // type this test expects goes somewhere a responder will still look at it.
+    for (const e of envs.reverse()) {
+      await a.publishRaw(a.topicFor(e, b), JSON.stringify(e));
     }
 
     const seen = new Set<string>();
@@ -183,18 +204,25 @@ test("e2e: a tampered header does not decrypt", async (t) => {
   try {
     await a.send(b, "establish");
     assert.equal((await b.next()).text, "establish");
+    // B answers so A stops re-sending its handshake — see the note in the
+    // out-of-order test. Without it `sealOnly` still returns an `init`, which a
+    // responder holding a session discards before it ever reaches the decrypt
+    // path, and the frame is dropped for the wrong reason: no message, but
+    // nothing recorded as undecryptable either, which is what this asserts.
+    await b.send(a, "ack");
+    assert.equal((await a.next()).text, "ack");
 
     // The header selects the key, so it is read before the payload can
     // authenticate it. Binding it as AAD is what stops a rewritten field from
     // producing a wrong message rather than no message — the TM-1 case.
     const env = await a.sealOnly(b, "tamper me");
+    assert.equal(env.t, "msg", "the tamper case is about a message header, not a handshake");
     const tampered = { ...env, n: env.n + 1 };
-    await a.publishRaw(
-      `c/${friendshipHash(a.id, b.id)}`,
-      JSON.stringify(tampered)
-    );
+    await a.publishRaw(a.topicFor(tampered, b), JSON.stringify(tampered));
 
     await new Promise((r) => setTimeout(r, 1500));
+    // Still 1: B received "establish" and SENT "ack", so only the one real
+    // message ever reached B's inbox. The tampered frame must not add to it.
     assert.equal(b.inbox.length, 1, "the tampered frame produced no message");
     assert.ok(b.undecryptable.length >= 1, "…and was recorded as undecryptable");
   } finally {

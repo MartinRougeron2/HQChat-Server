@@ -6,10 +6,8 @@
 //
 //   POST /auth/free/init    { pk }                -> { ct }         (KEM challenge)
 //   POST /auth/free/verify  { pk, solution }      -> free session
-//   POST /auth/paid/init    { pk }                -> { ct } or 402   (claim gate)
+//   POST /auth/paid/init    { pk }                -> { ct } or 403   (admission gate)
 //   POST /auth/paid/verify  { pk, solution }      -> premium session
-//   POST /claim/start       { email }             -> { ok }          (mails a code)
-//   POST /claim/verify      { email, code, pk }   -> { ok }          (binds device)
 //   POST /auth/refresh (Bearer sessionToken)      -> { mqttToken, ttl } (rotation)
 //   POST /mqtt/authn  (EMQX hook)                 -> { result }      (one-time token)
 //
@@ -20,23 +18,26 @@
 // instead. `/auth/*/verify` is where the two are tied together (DB.ensureUser),
 // immediately after the KEM proof establishes that the caller holds the key.
 //
-// TWO DOORS, not one endpoint with a flag. The free door sells nothing and asks
-// nothing; the paid door refuses an unclaimed key BEFORE spending a KEM
-// encapsulation on it. What separates them is what they mint: the session
-// carries its scope, so no later request re-derives an entitlement.
+// TWO DOORS, not one endpoint with a flag. Nothing is sold at either — the
+// product is free and donation-funded — and on the default `open` policy both
+// admit anyone who proves key possession. What separates them is what they
+// MINT: the free door grants a bot-only session, the full door grants the whole
+// friend graph. The split survives the paywall because it is what lets a client
+// fall back instead of failing shut when a private (`allowlist`) server refuses
+// it. The full door's wire name is still "paid"; nothing behind it costs money.
 //
 // Transport confidentiality is TLS (WSS via nginx) — there is NO per-connection
 // AES session key here anymore (the SESSION_KEY step is deleted; TLS replaces it).
 // Runs the SAME image as the monolith via `command:` in the compose overlay.
 
 // Must be first: loads .env + resolves *_FILE secrets before anything reads env.
-import { assertConfig } from "../lib/config";
+import "../lib/config";
 import { initObservability } from "../lib/observability";
 initObservability("auth");
 import { healthMonitor } from "../lib/health-monitor";
 import { logger } from "../lib/logger";
 import * as http from "http";
-import { readJson, send, bearer, clientIp, requireString, requireHex, HttpError } from "../lib/http";
+import { readJson, send, bearer, clientIp, requireString, HttpError } from "../lib/http";
 import * as crypto from "crypto";
 // hqc is lazy-required inside /auth/init (it dlopen's the native x86 .so; keeping
 // it out of the import graph lets the auth server boot — and serve the token/
@@ -45,7 +46,6 @@ import { authProof } from "../lib/auth-proof";
 import { checkAdmission, type Door } from "../lib/admission";
 import { peerId } from "../lib/identity";
 import { DB, type SessionScope } from "../services/db/api";
-import { SubscriptionService } from "../services/subscription/api";
 
 const PORT = Number(process.env.PORT || 8080);
 
@@ -55,16 +55,18 @@ const PORT = Number(process.env.PORT || 8080);
 // open it is a cheap way to make the auth service the bottleneck for everyone.
 // nginx rate-limits the REST zone, but that is one bucket shared with every
 // other route; these are per-IP and per-key.
-const INIT_PER_IP_PER_MIN = Number(process.env.AUTH_INIT_IP_LIMIT || 30);
-const INIT_PER_PK_PER_MIN = Number(process.env.AUTH_INIT_PK_LIMIT || 10);
+//
+// Lowered when the paywall was removed. An unclaimed key used to be turned away
+// at the full door for the cost of one primary-key lookup, so the encapsulation
+// sat behind a subscription; now nothing stands in front of it but these two
+// counters. A real client runs one init per login, so the per-key ceiling is
+// generous at 6; the per-IP one has to stay loose enough for a NAT.
+const INIT_PER_IP_PER_MIN = Number(process.env.AUTH_INIT_IP_LIMIT || 20);
+const INIT_PER_PK_PER_MIN = Number(process.env.AUTH_INIT_PK_LIMIT || 6);
 // Repeated FAILED proofs against one public key are the signature of someone
 // trying to authenticate as a key they do not hold. Nothing counted them before,
 // so the attempt was invisible however long it went on.
 const VERIFY_FAILURE_ALERT = Number(process.env.AUTH_VERIFY_FAILURE_ALERT || 5);
-// A claim code is six digits. The per-code counter caps guesses at one address;
-// this caps a caller working through many addresses at once.
-const CLAIM_VERIFY_PER_IP = Number(process.env.CLAIM_VERIFY_IP_LIMIT || 20);
-
 // Internal service credential (push-bridge etc.): a privileged MQTT identity that
 // authn grants superuser so it can subscribe across conversations. The secret is
 // a compose secret resolved via INTERNAL_MQTT_SECRET_FILE.
@@ -108,12 +110,15 @@ function safeEqualStr(a: string, b: string): boolean {
 }
 
 /**
- * Refuse a door, in the shape the client can act on. 402 means "this key has no
- * live subscription" and the app falls back to the free door; 403 means the
- * server does not want this key at all and falling back would be pointless.
+ * Refuse a door, in the shape the client can act on.
+ *
+ * Only 403 is left. It used to also answer 402 "this key has no live
+ * subscription", which the app read as "fall back to the free door" — there is
+ * no subscription to lack now, so nothing produces it. The app still HANDLES
+ * 402 on the way to the free door, deliberately: that is what keeps a current
+ * build working against a server that has not been updated yet.
  */
-function refuse(res: http.ServerResponse, admission: { reason: "denied" | "not_claimed" }): void {
-  if (admission.reason === "not_claimed") return send(res, 402, { error: "NOT_CLAIMED" });
+function refuse(res: http.ServerResponse, admission: { reason: "denied" }): void {
   return send(res, 403, { error: "NOT_ADMITTED" });
 }
 
@@ -256,58 +261,7 @@ const server = http.createServer(async (req, res) => {
       return await handleVerify(req, res, url === "/auth/paid/verify" ? "paid" : "free");
     }
 
-    // --- 3. Claim a web subscription with an emailed code -------------------
-    // Unauthenticated on purpose: the caller has no session yet, and obtaining
-    // one is what this is for. The device is identified by the public key it
-    // sends, which the code is what entitles it to bind.
-    if (method === "POST" && url === "/claim/start") {
-      const body = await readJson(req);
-      const email = requireString(body, "email", { max: 254 });
-      const result = await SubscriptionService.startClaim(email, clientIp(req));
-      if (!result.ok) {
-        return result.reason === "rate_limited"
-          ? send(res, 429, { error: "RATE_LIMITED" })
-          : send(res, 400, { error: "INVALID_EMAIL" });
-      }
-      // Deliberately identical whether or not a code was actually sent.
-      // Answering "no subscription for that address" would turn this into a
-      // lookup service for anyone holding a list of email addresses.
-      return send(res, 200, { ok: true });
-    }
-
-    if (method === "POST" && url === "/claim/verify") {
-      const ip = clientIp(req);
-      // The per-code attempt counter bounds guessing against ONE address; this
-      // bounds a caller spraying guesses across many.
-      const hits = await DB.bumpCounter(`claim:verify:ip:${ip}`, 15 * 60);
-      if (hits > CLAIM_VERIFY_PER_IP) {
-        logger.warn(`[auth] /claim/verify rate-limited (ip hits=${hits})`);
-        return send(res, 429, { error: "RATE_LIMITED" });
-      }
-
-      const body = await readJson(req);
-      const email = requireString(body, "email", { max: 254 });
-      const code = requireString(body, "code", { min: 6, max: 6 });
-      const pkHex = requireString(body, "pk", { min: 64, max: 40_000 });
-      if (!/^[0-9a-fA-F]+$/.test(pkHex) || pkHex.length % 2 !== 0) {
-        return send(res, 400, { error: "INVALID_FIELD", message: "pk must be hex" });
-      }
-
-      // The client identifies itself by the public key it holds; the claim is
-      // RECORDED under the id that key commits to, because revoking one means
-      // kicking a client off the broker and that addresses an id.
-      const result = await SubscriptionService.verifyClaim(email, code, peerId(pkHex));
-      if (!result.ok) {
-        // `bad_code` and `no_code` are distinguished because the user needs to
-        // know whether to retype the code or ask for a new one. Neither says
-        // anything about whether that address has a subscription.
-        const status = result.reason === "cap_reached" ? 409 : 400;
-        return send(res, status, { error: result.reason.toUpperCase() });
-      }
-      return send(res, 200, { ok: true });
-    }
-
-    // --- 4. Rotate the MQTT token (proactive refresh / after expiry) ---------
+    // --- 3. Rotate the MQTT token (proactive refresh / after expiry) ---------
     // Authenticated by the REST session bearer, so a client refreshes without
     // redoing the KEM handshake. The scope rides along untouched: a refresh
     // rotates a credential, it does not re-decide an entitlement.
@@ -323,7 +277,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // --- 5. EMQX HTTP authentication hook ------------------------------------
+    // --- 4. EMQX HTTP authentication hook ------------------------------------
     // EMQX posts { username, password, clientid, nonce? } on every CONNECT.
     // Internal services present the privileged credential → superuser. Everyone
     // else: username = the CLIENT ID (sha256 of the hex public key), password =
@@ -381,14 +335,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Fail fast, before the port opens. This process owns /claim/*, so a missing
-// mail credential means nobody can finish linking a subscription — better
-// refused at boot than at the moment a paying customer tries. (The call sits
-// here rather than beside the import because imports are hoisted above it.)
-assertConfig(["mail"]);
-
+// This process no longer sends any mail: /claim/* went with the paywall, and the
+// claim code and the "your subscription is active" notice were the only two
+// things the server ever emailed. The `assertConfig(["mail"])` that stood here,
+// refusing boot without a mail credential, has nothing left to protect.
 server.listen(PORT, () => {
-  logger.startup(`🔐 auth server on :${PORT} — /auth/{free,paid}/*, /claim/*, EMQX hook /mqtt/authn`);
+  logger.startup(`🔐 auth server on :${PORT} — /auth/{free,paid}/*, EMQX hook /mqtt/authn`);
 });
 
 // Event-loop / memory / query-latency early warning → Sentry. This process gates

@@ -22,7 +22,7 @@ resource "cloudflare_workers_script" "site" {
 # Routes: each path is an EXACT Worker route overlaying whatever already answers
 # that host. `var.worker_route_host` is the app host (hqchat.<zone>), which also
 # serves the API — so the list must never contain "/*". A glob there would
-# swallow /auth, /mqtt, /subscribe, /stripe/webhook and /health and take the
+# swallow /auth, /mqtt, /donate/checkout, /stripe/webhook and /health and take the
 # product down. "/" on its own matches the root path only, which is what puts
 # the marketing site at the root without touching any API path.
 resource "cloudflare_workers_route" "legal" {
@@ -33,7 +33,7 @@ resource "cloudflare_workers_route" "legal" {
 }
 
 # ── Future migration (stateless endpoints → the edge) ────────────────────────
-# `/health`, `/mqtt`, `/stripe/webhook` and `/subscribe` stay on
+# `/health`, `/mqtt`, `/stripe/webhook`, `/donate/*` and `/supporters` stay on
 # the ORIGIN. Other stateless endpoints can move to a Worker by adding routes
 # like the one below (and the matching handler in the Worker). Keep /health off
 # the Worker so the health check (health.tf) measures the real origin.

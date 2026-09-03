@@ -18,7 +18,7 @@ preprod_host = "preprod.chat"          # → preprod.chat.example.com (TF create
 manage_worker      = true
 worker_name        = "dissqus-home"       # renaming forces script replacement — see workers.tf
 worker_route_host  = "chat.example.com"   # the APP host, not the apex
-worker_paths       = ["/", "/crypto", "/privacy", "/terms", "/support"]
+worker_paths       = ["/", "/crypto", "/privacy", "/terms", "/support", "/donate"]
 
 # --- ZONE-WIDE toggles — keep false on the shared zone (would affect Vercel/backend) ---
 manage_zone_settings  = false          # SSL strict / HSTS / TLS — zone-wide

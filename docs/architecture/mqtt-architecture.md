@@ -411,8 +411,8 @@ Layers, edge → origin:
      `HEAD`, `OPTIONS`; everything else blocked.
    - *(optional, off)* **Path allowlist** — positive-security model that blocks any
      path outside the known app surface (`/mqtt`, `/auth`, `/friends`,
-     `/username`, `/users`, `/push`, `/account`, `/stripe`, `/subscribe`,
-     `/health`). Enable once routes are frozen.
+     `/username`, `/users`, `/push`, `/account`, `/stripe`, `/donate`,
+     `/supporters`, `/health`). Enable once routes are frozen.
 3. **Rate limiting** (paid, host-scoped):
    - **`/auth/*` → 20/min/IP → managed challenge** — blunts KEM-handshake floods
      and credential stuffing (the sensitive surface).
@@ -423,7 +423,7 @@ Layers, edge → origin:
 4. **Managed rulesets** (Pro+): Cloudflare Managed Ruleset + OWASP Core Ruleset,
    scoped to the app host.
 5. **Bot control:** Bot Fight Mode (Free) / Super Bot Fight Mode (Pro); **Turnstile**
-   on the `/subscribe` page.
+   on the `/donate` page.
 6. **Origin lock-down (two independent controls):**
    - Droplet firewall accepts `443` **only from Cloudflare IP ranges**
      ([pops.tf](../../infra/multiregion/pops.tf) + the pinned CIDR list).

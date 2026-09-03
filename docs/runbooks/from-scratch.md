@@ -476,7 +476,7 @@ terraform output -json app_roles | jq -r '"APP_ROLE=\(.app)\nEMQX_ROLE=\(.emqx)"
 These never enter GitHub.
 
 ```bash
-for s in stripe_secret_key stripe_webhook_secret resend_api_key; do
+for s in stripe_secret_key stripe_webhook_secret; do
   read -rsp "$s (blank to skip): " v; echo
   [ -n "$v" ] && printf '%s' "$v" | ssh root@<ip> "umask 077; cat > /etc/hqcat/prod/secrets/$s"
 done
@@ -513,9 +513,12 @@ Non-secret config:
 
 ```bash
 ssh root@<ip> 'umask 077; cat > /etc/hqcat/prod/server.env' <<'ENV'
-SERVER_NAME=DissQus
+SERVER_NAME=hqchat
 PUBLIC_BASE_URL=https://chat.<your-domain>
-ADMISSION_POLICY=stripe
+ADMISSION_POLICY=open
+DONATIONS_ENABLED=1
+STRIPE_DONATION_PRICE_IDS=price_…,price_…,price_…
+STRIPE_DONATION_ONCE_PRICE_ID=price_…
 APP_ROLE=app_prod
 EMQX_ROLE=emqx_prod
 ENV

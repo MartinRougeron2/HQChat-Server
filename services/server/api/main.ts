@@ -16,7 +16,8 @@
 // entitlement was decided once, at the door.
 
 // Must be first: loads .env + resolves *_FILE secrets before anything reads env.
-import { assertConfig } from "../lib/config";
+import { assertConfig, DONATIONS_ENABLED } from "../lib/config";
+import { donationsDead, donationSummary, resolvePrices } from "../lib/donations-config";
 import { initObservability } from "../lib/observability";
 initObservability("api");
 import { healthMonitor } from "../lib/health-monitor";
@@ -27,9 +28,8 @@ import { DB } from "../services/db/api";
 import { EMQX } from "../lib/emqx";
 import { friendshipHash } from "../lib/crypto-utils";
 import { isPeerId, PEER_ID_LENGTH } from "../lib/identity";
-import { StripeService, subscriptionIsEntitling, subscriptionPriceIds } from "../services/stripe/api";
-import { SubscriptionService } from "../services/subscription/api";
-import { handleSubscribe } from "../services/web/subscribe";
+import { StripeService, displayNameFromSession } from "../services/stripe/api";
+import { handleDonate } from "../services/web/donate";
 import { ADMISSION_POLICY } from "../lib/admission";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -68,6 +68,19 @@ const MAX_ONETIME_PER_UPLOAD = 8;
  */
 const MAX_PEER_IDENTIFIER = 128;
 
+// --- QoS caps ---------------------------------------------------------------
+// These replace the paywall. The infrastructure bill is fixed monthly — droplets,
+// one managed Postgres — so users do not cost money; they cost capacity. What
+// actually threatens the deployment is a script, not a popular account, and
+// these are set where no real person will ever meet them.
+//
+// The friend cap also bounds a real fan-out: `endPremiumAccess`-style ACL walks
+// and `notifyGraphChanged` are O(friends), and `regrantAllFriendTopics` runs on
+// every full-door login.
+const FRIEND_CAP = Number(process.env.FRIEND_CAP || 150);
+// Per calendar-ish day, on the existing `rate_counters` table — no new storage.
+const INVITES_PER_DAY = Number(process.env.INVITES_PER_DAY || 20);
+
 // Refuse to boot rather than 413 in production if either constant drifts into
 // the body cap. At startup, where an operator sees it — a type-level assertion
 // cannot express this (comparing two number literals yields `boolean`, and the
@@ -98,84 +111,6 @@ const MAX_PEER_IDENTIFIER = 128;
  *  everything the control plane does. */
 async function authSession(req: http.IncomingMessage) {
   return DB.resolveSessionToken(bearer(req));
-}
-
-/**
- * End a lapsed subscriber's access, now.
- *
- * A row edit only binds the NEXT authorization check, so each step has a live
- * counterpart: revoke the ACL AND drop the open subscription, revoke the bearer
- * AND kick the connection. Friendships and message history are deliberately
- * untouched — this is a paywall closing, not an account being deleted, and
- * resubscribing regrants every topic on the next paid login.
- */
-async function endPremiumAccess(id: string): Promise<void> {
-  const botId = await DB.getIdByUsername(process.env.BOT_USERNAME || "helper");
-  const peers = await DB.revokeAllFriendTopics(id, botId || undefined);
-  for (const peer of peers) {
-    await EMQX.revokeTopic(id, peer, `c/${friendshipHash(id, peer)}`);
-  }
-  await DB.revokeAllSessions(id);
-  await DB.revokeMqttAuth(id);
-  await EMQX.kick(id);
-  logger.info(`🔒 [claim] premium access ended for ${id.slice(0, 12)}… (${peers.length} conversations)`);
-}
-
-/**
- * Record a subscription created directly in Stripe, from the dashboard.
- *
- * This is a PRIMARY way subscriptions are issued here, not a fallback: comps for
- * testers and friends are handed out by adding a subscription to a customer in
- * the Stripe portal, and never touch Checkout.
- *
- * Which means no `checkout.session.completed` fires — and that event is the only
- * other thing that maps a customer id to an email hash. Without this function
- * the `customer.subscription.created` below finds nothing indexed, logs "no
- * subscription indexed for customer …; ignoring active", and the recipient can
- * never claim: `/claim/start` answers 200 and quietly mails nothing, because
- * there is no active subscription for their address. Nothing anywhere errors.
- *
- * It carries the website's paid purchases too, on a deployment whose webhook
- * endpoint subscribes only the `customer.subscription.*` events: Checkout in
- * subscription mode always creates a Customer carrying the buyer's address, so
- * the lookup below finds the same email either way.
- *
- * Only for prices on `ENTITLING_PRICE_IDS`. Granting premium from any live
- * subscription object in the account would mean an unrelated product — or a
- * leftover test — silently entitled its holder. Stripe decides WHO is
- * subscribed; this file still decides WHAT counts as a subscription.
- *
- * A no-op once the customer is known, so the ordinary paid path (which indexed
- * itself at checkout) is untouched and re-delivered events cost one lookup.
- */
-async function adoptStripeCreatedSubscription(sub: any): Promise<void> {
-  const customerId = typeof sub?.customer === "string" ? sub.customer : sub?.customer?.id;
-  if (!customerId) return;
-  if (await DB.emailHashForCustomer(customerId)) return; // already indexed
-
-  if (!subscriptionIsEntitling(sub)) {
-    logger.warn(
-      `[claim] subscription for ${customerId} is on ${JSON.stringify(subscriptionPriceIds(sub))}, ` +
-      `which entitles nothing — ignoring. Add the price to STRIPE_COMP_PRICE_IDS if it should.`
-    );
-    return;
-  }
-
-  const email = await StripeService.customerEmail(customerId);
-  if (!email) {
-    // Loud: the operator did the work in Stripe and the recipient will meet a
-    // claim that answers 200 and mails nothing. A customer with no address on
-    // it is the one thing this path cannot work around.
-    logger.error(`❌ [claim] entitling subscription for ${customerId} has no email on the customer — cannot record it`);
-    return;
-  }
-
-  // recordPurchase also mails "your subscription is active, open the app and
-  // enter this address" — which is exactly what someone handed a comp plan
-  // needs, since they never saw a checkout success page telling them.
-  const emailHash = await SubscriptionService.recordPurchase(email, customerId);
-  await StripeService.tagCustomerEmailHash(customerId, emailHash);
-  logger.info(`🎟️  [claim] adopted a Stripe-created subscription for customer ${customerId}`);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -213,17 +148,20 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // --- Payments (Stripe) — raw body needed for signature verification ------
+    // --- Donations (Stripe) — raw body needed for signature verification ----
     //
-    // Two events matter, and they arrive in that order:
+    // ONE event matters, and it carries almost nothing we want:
     //
-    //   checkout.session.completed   the ONLY place a plaintext email address
-    //                                enters this server. It is hashed into the
-    //                                subscription record and discarded.
-    //   customer.subscription.*      renewals and cancellations, which carry a
-    //                                customer id and no address at all — hence
-    //                                the `subcus:` index written above.
-    if (ADMISSION_POLICY === "stripe" && method === "POST" && url === "/stripe/webhook") {
+    //   checkout.session.completed   a donation went through. The only field
+    //                                read is the optional display name for the
+    //                                supporters page. Not the email, not the
+    //                                customer id, not the amount.
+    //
+    // `customer.subscription.*` is deliberately NOT handled. A recurring
+    // donation that lapses removes no access, because it granted none — there is
+    // nothing to revoke, so subscribing to those events would only invite a
+    // handler that did something.
+    if (DONATIONS_ENABLED && method === "POST" && url === "/stripe/webhook") {
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c as Buffer));
       req.on("end", async () => {
@@ -234,35 +172,10 @@ const server = http.createServer(async (req, res) => {
           );
 
           if (event.type === "checkout.session.completed") {
-            const cs = event.data.object as any;
-            const email: string = cs?.customer_details?.email || cs?.customer_email || "";
-            const customerId: string = typeof cs?.customer === "string" ? cs.customer : cs?.customer?.id;
-            if (email && customerId) {
-              const emailHash = await SubscriptionService.recordPurchase(email, customerId);
-              // A second copy on the Stripe customer, so subscriptions can be
-              // rebuilt if the database is ever restored from before the purchase.
-              await StripeService.tagCustomerEmailHash(customerId, emailHash);
-            } else {
-              logger.error(`❌ [stripe-webhook] checkout.session.completed without an email or customer`);
-            }
-          }
-
-          if (event.type.startsWith("customer.subscription.")) {
-            const sub = event.data.object as any;
-            const active = sub.status === "active" || sub.status === "trialing";
-            // A comp subscription issued from the dashboard arrives here FIRST
-            // and has never been indexed, so index it before asking to flip its
-            // state — otherwise there is nothing to flip.
-            if (active) await adoptStripeCreatedSubscription(sub);
-            const ids = await SubscriptionService.setStateForCustomer(
-              sub.customer,
-              active ? "active" : "cancelled"
-            );
-            // Access has to end when the subscription does, not when the last
-            // bearer happens to lapse — a 30-day session cap is not a refund
-            // policy. Regranting on the next paid login is what makes this safe
-            // to do eagerly.
-            if (!active) for (const id of ids) await endPremiumAccess(id);
+            const name = displayNameFromSession(event.data.object);
+            // Blank is the expected answer: recognition is opt-in, and a
+            // donation with no name must leave no row at all.
+            if (name) await DB.recordSupporter(name);
           }
 
           res.writeHead(200); res.end("ok");
@@ -273,9 +186,9 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
-    if (ADMISSION_POLICY === "stripe" && url.startsWith("/subscribe")) {
-      handleSubscribe(req, res).catch((e) => {
-        logger.error("[subscribe] handler error", e);
+    if (DONATIONS_ENABLED && (url.startsWith("/donate") || url.startsWith("/supporters"))) {
+      handleDonate(req, res).catch((e: unknown) => {
+        logger.error("[donate] handler error", e);
         if (!res.headersSent) { res.writeHead(500); res.end("error"); }
       });
       return;
@@ -356,9 +269,22 @@ const server = http.createServer(async (req, res) => {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
       const id = session.id;
-      // The paywall, in full. A free session talks to the helper bot and
-      // nothing else; growing the friend graph is what a subscription buys.
-      if (session.scope !== "premium") return send(res, 402, { error: "PREMIUM_REQUIRED" });
+      // What used to be the paywall. A subscription bought the right to grow
+      // the friend graph at all; now everyone has it, and what stands here
+      // instead are ceilings — high enough that no real account meets them,
+      // low enough that a script cannot turn one signup into unbounded work.
+      //
+      // Deliberately NOT 402. The app reads 402 as "fall back to the free
+      // door" and re-authenticates; a user who hit a daily invite limit would
+      // silently lose their friend topics for the trouble.
+      if (await DB.countFriends(id) >= FRIEND_CAP) {
+        return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP });
+      }
+      const sent = await DB.bumpCounter(`invite:day:${id}`, 24 * 60 * 60);
+      if (sent > INVITES_PER_DAY) {
+        logger.warn(`[friends] invite rate-limited for ${id.slice(0, 12)}… (${sent}/${INVITES_PER_DAY} today)`);
+        return send(res, 429, { error: "RATE_LIMITED", limit: INVITES_PER_DAY });
+      }
       const to = requireString(await readJson(req), "to", { max: MAX_PEER_IDENTIFIER });
       await DB.invite(id, to);
       // The recipient has no other way to learn an invite exists: nothing pushed
@@ -372,9 +298,17 @@ const server = http.createServer(async (req, res) => {
       const session = await authSession(req);
       if (!session) return send(res, 401, { error: "unauthenticated" });
       const id = session.id;
-      if (session.scope !== "premium") return send(res, 402, { error: "PREMIUM_REQUIRED" });
+      if (await DB.countFriends(id) >= FRIEND_CAP) {
+        return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP });
+      }
       const from = requireString(await readJson(req), "from", { max: MAX_PEER_IDENTIFIER });
       const fromId = await DB.resolveToId(from);
+      // BOTH sides, because a friendship adds a contact to each. The inviter
+      // was under the cap when they sent it; accepting is what would push them
+      // over, and only this side can see that.
+      if (fromId && (await DB.countFriends(fromId)) >= FRIEND_CAP) {
+        return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP, peer: true });
+      }
       const ok = fromId ? await DB.acceptInvite(fromId, id) : false;
       // Grant the conversation + presence topics to BOTH members.
       if (ok && fromId) await DB.grantFriendTopic(id, fromId);
@@ -540,11 +474,28 @@ const server = http.createServer(async (req, res) => {
 });
 
 // Fail fast, before the port opens: this process owns /stripe/webhook and
-// /subscribe. (Beside the import it would be hoisted over; here it is not.)
+// /donate. (Beside the import it would be hoisted over; here it is not.)
 assertConfig(["stripe"]);
 
+// A donate button that cannot charge is worth a Sentry event, not just a line in
+// a boot log nobody reads after the first rollout. Same escalation push-bridge
+// makes for a half-configured APNs (push/main.ts): the process is fine, the
+// feature is dead, and the only person who can tell is looking somewhere else.
+//
+// It does NOT refuse to boot, deliberately. This process is the whole REST API —
+// directory, friends, push registration, account deletion — and taking all of it
+// down over a broken donate button would be a far worse outage than the one it
+// reports.
+const DONATION_PRICES = resolvePrices(process.env);
+if (DONATIONS_ENABLED && donationsDead(DONATION_PRICES)) {
+  logger.error(`[api] ${donationSummary(DONATION_PRICES)}`);
+}
+
 server.listen(PORT, () => {
-  logger.startup(`📇 app-api on :${PORT} — REST directory/friends/push/account/payments`);
+  logger.startup(
+    `📇 app-api on :${PORT} — REST directory/friends/push/account` +
+    (DONATIONS_ENABLED ? ` + ${donationSummary(DONATION_PRICES)}` : "")
+  );
 });
 
 // Event-loop / memory / query-latency early warning → Sentry. Same monitor the

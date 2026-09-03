@@ -73,7 +73,7 @@ Secrets live on **the host that uses them**, not in GitHub:
 | Location | Holds |
 |---|---|
 | `/etc/hqcat/<stack>/secrets/` (root, 0700) | `database_url`, `database_url_direct`, `pg_ca_cert`, `emqx_pg`, `stripe_secret_key`, `stripe_webhook_secret`, `resend_api_key`, `otp_pepper`, `apns_key_p8` — the compose `secrets:`. On prod the four database files come from `terraform output` in [`infra/database`](../../infra/database/README.md); on pre-prod `set-host-secrets.sh` generates them for that stack's own postgres container |
-| `/etc/hqcat/<stack>/server.env` (root, 0600) | non-secret config: `SERVER_NAME`, `PUBLIC_BASE_URL`, `ADMISSION_POLICY`, `APNS_*`, `STOREKIT_*` |
+| `/etc/hqcat/<stack>/server.env` (root, 0600) | non-secret config: `SERVER_NAME`, `PUBLIC_BASE_URL`, `ADMISSION_POLICY`, `STRIPE_DONATION_PRICE_IDS`, `STRIPE_DONATION_ONCE_PRICE_ID`, `APNS_*`, `STOREKIT_*`. The two donation price ids are easy to miss because `DONATIONS_ENABLED=1` is set in compose, not here — a host without them boots clean and refuses every donation |
 | `runtime-secrets` tmpfs, per stack | `internal_mqtt_secret`, `emqx_dashboard_password`, `metrics_token` — generated at launch by `secrets-init`, never on disk. Only credentials both ends of which are inside the stack; the database's are not |
 | `/etc/hqcat/agent.env` (root, 0600) | the agent's **read-only** `read:packages` GHCR token |
 
@@ -192,14 +192,15 @@ sudo hqcat-apply-nginx preprod    # only if you need to force it; the agent does
 **Today:** Cloudflare proxies the domain (DNS + TLS termination, Full-strict to
 the origin), and a single **Cloudflare Worker** serves the static marketing/legal
 site (apps/site/src/index.js). All app traffic
-(`/mqtt`, `/auth/*`, the REST control plane, `/subscribe`, `/stripe/webhook`)
+(`/mqtt`, `/auth/*`, the REST control plane, `/donate/*`, `/supporters`,
+`/stripe/webhook`)
 goes CF → nginx → the compose services.
 
 **Proposed, phased:**
 
 1. **Edge protection (now, config-only).** Turn on Cloudflare **WAF + Rate
    Limiting rules** in front of `/mqtt` and the HTTP API, and **Turnstile** on the
-   `/subscribe` page. This offloads H5-style abuse control to the edge before it
+   `/donate` page. This offloads H5-style abuse control to the edge before it
    reaches the VM, and lets you firewall the origin to CF IPs (already scripted).
 2. **Move stateless edges to Workers (next).** Serve `/info` and `/health` from a
    Worker (cache at edge, hide origin), and verify the **Stripe webhook

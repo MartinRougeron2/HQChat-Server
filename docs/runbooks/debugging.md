@@ -144,6 +144,36 @@ Filter by `component` — `auth`, `api`, `push-bridge`, `broker-watch`, `bot`,
 `server`. Every REST response carries `x-request-id`; the same id is on the log
 line and the Sentry event, so if the user can quote it you can go straight to it.
 
+### Sentry shows fewer events than the logs do — on purpose
+
+`logger.error()` bills a Sentry event; `logger.warn()` and `logger.info()` only
+leave a breadcrumb on whatever event comes next. Errors are **throttled per
+fingerprint**: the first occurrence goes straight through, then at most one per
+`SENTRY_THROTTLE_MS` (default 10 minutes), and that one is tagged
+`[+N identical suppressed]`.
+
+Fingerprints collapse ids, numbers and handles, so *the same failure about a
+thousand different users is one fingerprint*. That is the point — a month's
+quota once went on a single condition (the bot reporting "could not open a
+session" for every peer with no prekeys yet, on a 15-second poll).
+
+Consequences when you are debugging:
+
+- **`[+N identical suppressed]` is the number that matters**, not the event
+  count. Two events with `+700` between them is a sustained fault, not two
+  blips.
+- **The console is never throttled.** If Sentry looks quiet and you suspect it
+  should not be, read the container logs — `docker compose logs -f app-api` —
+  which carry every occurrence.
+- Raise `SENTRY_THROTTLE_MS` on a host that is flooding; it is read per call, so
+  no restart is needed. Setting it to `0` disables the throttle.
+
+**If you are adding a log line:** an expected, self-resolving condition is not
+an error. A peer who has not published prekeys yet, a reconnect that will
+succeed, a poll that will be retried — those are `warn` (first occurrence) or
+`debug`. The throttle bounds the damage of getting this wrong; it does not turn
+a non-error into one.
+
 ## Quick table
 
 | What you see | Where it is |

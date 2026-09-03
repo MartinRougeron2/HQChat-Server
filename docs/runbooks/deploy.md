@@ -81,22 +81,25 @@ Two classes of secret:
   they never touch the host disk or git. Only credentials both ends of which are
   inside this stack qualify; the database's do not, which is why they are
   external below.
-- **External secrets** (Stripe, Resend, the OTP pepper, APNs) live on the host
-  that uses them, under `/etc/hqcat/<stack>/secrets/` (root, 0700). They are
-  **not** in GitHub and not in the repo — the agent symlinks that directory into
-  the stack on every rollout.
+- **External secrets** (Stripe, APNs) live on the host that uses them, under
+  `/etc/hqcat/<stack>/secrets/` (root, 0700). They are **not** in GitHub and not
+  in the repo — the agent symlinks that directory into the stack on every
+  rollout. (`resend_api_key` and `otp_pepper` were here too, for the emailed
+  subscription claim; nothing in this stack sends mail since the paywall was
+  removed. Existing hosts keep both files; they are inert and can be deleted.)
 
-Use the helper rather than writing the files by hand; it sets the permissions,
-generates the OTP pepper if absent, and creates the empty placeholders that
-compose requires for secrets you do not use:
+Use the helper rather than writing the files by hand; it sets the permissions and
+creates the empty placeholders that compose requires for secrets you do not use:
 
 ```bash
 sudo infra/deploy/agent/set-host-secrets.sh prod     # prompts, nothing in shell history
 sudoedit /etc/hqcat/prod/server.env                  # non-secret config
 ```
 
-`server.env` wants: `SERVER_NAME`, `PUBLIC_BASE_URL`, `ADMISSION_POLICY`,
-`EXEMPT_PUBLIC_KEYS`, `MAIL_FROM`, and the `APNS_*` / `STOREKIT_*` values — see
+`server.env` wants: `SERVER_NAME`, `PUBLIC_BASE_URL`, `ADMISSION_POLICY` (`open`
+— `stripe` was removed with the paywall and a host still carrying it refuses to
+boot), `EXEMPT_PUBLIC_KEYS`, `DONATIONS_ENABLED` plus the two
+`STRIPE_DONATION_*` price ids, and the `APNS_*` values — see
 [.env.example](../../infra/deploy/.env.example). No secrets go in it.
 
 > Every compose secret must exist as a file or `docker compose up` fails, which
@@ -260,64 +263,145 @@ Cloudflare terminates the public TLS and proxies WebSockets automatically.
 > the app's 30s heartbeat. Keep the `set_real_ip_from` ranges in `nginx.conf`
 > fresh from <https://www.cloudflare.com/ips/>.
 
-## 5. Stripe webhook
+## 5. Stripe donations
+
+Donations fund the project. They grant nothing: every feature is free for every
+account, no entitlement is recorded, and no payment is ever looked up again.
+That is why this section is short — there is no claim flow, no device binding
+and no revocation path to operate.
+
+### Prices (in the Stripe dashboard, not in this repo)
+
+No amount appears in the server source: it only ever names a Price id, and
+Stripe decides what that costs. The **ids themselves are compiled in**
+([`lib/donations-config.ts`](../../services/server/lib/donations-config.ts)), so
+a host with an empty `server.env` charges correctly; the two variables are an
+override for a fork pointing at its own Stripe account. Current deployment —
+product `prod_VASN9Qoe1usGwM`:
+
+| Price | Amount | Compiled in as | Overridden by |
+|---|---|---|---|
+| `price_1UA7SiKdAg16VdMqEwh5d0di` | €2 / month | `DEFAULT_DONATION_PRICE_IDS[0]` | `STRIPE_DONATION_PRICE_IDS` (1st) |
+| `price_1UA7SiKdAg16VdMq6SgO0npz` | €5 / month | `DEFAULT_DONATION_PRICE_IDS[1]` | `STRIPE_DONATION_PRICE_IDS` (2nd) |
+| `price_1UA7SiKdAg16VdMqFzizTrQV` | €15 / month | `DEFAULT_DONATION_PRICE_IDS[2]` | `STRIPE_DONATION_PRICE_IDS` (3rd) |
+| `price_1UA7SiKdAg16VdMqlxdkR2Ib` | €10 one-time, **fixed** | `DEFAULT_DONATION_ONCE_PRICE_ID` | `STRIPE_DONATION_ONCE_PRICE_ID` |
+
+A Price id is not a secret — it names a public thing to buy and is safe in a
+client — and these four were already committed to this file. What the
+env-only arrangement bought was a donate page depending on two lines of host
+config invisible from the repo, and it is what took the buttons down.
+
+`STRIPE_DONATION_PRICE_IDS` is comma-separated and **low to high** — that is the
+order the donate page renders.
+
+> **Why they are compiled in.** Leaving either variable unset never "simply did
+> not offer" that option — it left a dead button on the page. The donate page
+> visitors reach is the static Cloudflare Worker, which renders all three tiers
+> and give-once unconditionally, because it cannot ask the server what is
+> priced. An unset variable therefore showed the amounts and then refused the
+> click.
+>
+> This is not hypothetical. Production ran with `DONATIONS_ENABLED=1` (set in
+> compose, so it is on by default) and NEITHER price id in `server.env` — every
+> button answered *"That option is not available. Go back and pick one of the
+> amounts shown."* to a donor looking straight at the amounts. An empty or
+> mangled override now falls back to the compiled-in Price rather than going
+> dark. **Verify anyway after a host-config change or a price change**, because
+> the one thing that can still break this is a Price archived in Stripe, which
+> no config check can see:
+>
+> ```bash
+> curl -s https://chat.example.com/donate/checkout | grep -c 'name="choice"'
+> ```
+>
+> That path is the origin's own offer page and it asks Stripe for real labels,
+> so it renders one button per *resolved* price — and because it asks, a label
+> reading `monthly` instead of an amount means Stripe would not return that
+> Price. Expect **4**. The boot log states the same verdict
+> (`donations ready (3 monthly tier(s) + one-time)`), and a total absence is
+> escalated to Sentry at startup.
+
+`env_file` values are read when a container is **created**, not when it is
+restarted, so editing `server.env` needs a recreate — `restart` re-runs the old
+environment and looks like it worked:
+
+```bash
+cd /opt/hqcat/prod && docker compose up -d --force-recreate app-api
+```
+
+> **No price id lives in the site.** The donate buttons post an INDEX —
+> `tier0`, `tier1`, … into `STRIPE_DONATION_PRICE_IDS` — and the server resolves
+> it, the same way the one-time button posts `once`. So this deployment's Stripe
+> account stays entirely in its own configuration, and a fork gets working
+> buttons pointed at *its* prices. A test fails if a `price_…` string reappears
+> in `apps/site/`.
+>
+> **What that makes load-bearing: the ORDER.** `apps/site/src/index.js` carries
+> the display labels (`TIERS`, `ONE_TIME`) and must stay the same length and the
+> same low-to-high order as `STRIPE_DONATION_PRICE_IDS`. Reorder one and not the
+> other and a button charges the wrong tier. Two tests guard it — one asserts a
+> button per configured price with contiguous indices, one asserts the labels
+> ascend.
+>
+> **The one drift nothing can catch:** whether a label matches what Stripe
+> actually charges. The site is a static Cloudflare Worker with no way to reach
+> Stripe at render time, so an amount changed in Stripe and not in the label
+> shows one number and charges another. (The origin-served fallback page in
+> `services/web/donate.ts` *does* ask Stripe, via `tierLabels()`, so it is
+> always right.)
+
+**The one-time price is a fixed €10, not a donor-chosen amount.** Whether the
+donor names the figure is a property of the Price: set `custom_unit_amount` on it
+in Stripe and Checkout asks. Both work through the same code path. If you switch
+it, update the site copy — several sentences on `/donate` name the €10.
+
+A price id arriving from the public form is validated against the configured list
+before it reaches Stripe, so a visitor cannot name a price of their own — the
+same property the old hard-wired single price had for free. A stale id on the
+site therefore fails safe: "that option is not available", not a wrong charge.
+
+### Webhook
 
 Stripe Dashboard → Developers → Webhooks → Add endpoint:
 
 - URL: `https://YOUR_DOMAIN/stripe/webhook`
-- Events: **`checkout.session.completed`** (this is the one that creates the
-  subscription record — without it a payment goes through and nothing is
-  claimable), plus `customer.subscription.created`, `.updated`, `.deleted`
+- Events: **`checkout.session.completed`, and nothing else.**
+
+Do **not** subscribe `customer.subscription.*`. A lapsed recurring donation
+removes no access, because it granted none; a handler for those events could
+only do harm, and there is none.
+
+The handler reads exactly one field off the completed session: the optional
+display name for the supporters page. Not the email, not the customer id, not
+the amount. That is what makes the site's strongest privacy claim true — **no
+email address reaches this server in any form, not even a hash** — so keep it
+that way.
 
 Put the signing secret in `infra/deploy/secrets/stripe_webhook_secret`, then
 `docker compose -f infra/deploy/docker-compose.yml up -d`. Test locally first:
 `stripe listen --forward-to localhost:8091/stripe/webhook` (app-api owns
-`/stripe/webhook` now).
+`/stripe/webhook`).
 
-### Complimentary subscriptions (testers, friends)
+### Cancellation and refunds
 
-An annual price charged nothing, listed in `STRIPE_COMP_PRICE_IDS`. It entitles
-premium exactly as the paid price does — nothing downstream asks which plan a key
-is on, only whether it is on a live subscription.
+There is no billing UI and no account area, by choice. Someone stops a recurring
+donation through the customer-portal link in Stripe's own emails — enable the
+portal in the dashboard so that link exists. Refunds are issued by hand from the
+dashboard; `/terms` says we are not obliged to give one and would rather return
+money than keep it from someone who regrets giving it.
 
-It is not on the website and cannot be: `createCheckout` is hard-wired to
-`STRIPE_PRICE_ID`, so a visitor cannot ask for a different price than the one the
-server builds. Being unlisted IS the access control, which is why the checkout
-price is pinned rather than taken from the request — see the test
-`the website never sells the comp price`.
+### Routing
 
-To grant one: Stripe Dashboard → Customers → the person → add a subscription on
-the comp price. The `customer.subscription.created` webhook records it, they
-receive the same "open the app and enter this address" email a paying customer
-gets, and they claim by code as usual. (A Payment Link on the comp price also
-works, via `checkout.session.completed`.)
+`/stripe/*`, `/donate/*` and `/supporters` are **app-api** (8091). Bare `/donate`
+is a **Cloudflare Worker** route — the marketing page — while its sub-paths fall
+through to the origin, because the Worker matches exact paths only. Adding
+`/donate/*` to `worker_paths` would send checkout to the marketing site and break
+it silently; `infra/cloudflare/variables.tf` rejects any `*` in that list for
+exactly this reason.
 
-**The customer must have an email address set.** It is what the entire claim flow
-is keyed on, and a customer without one cannot be recorded — that logs at
-`error`, because the recipient would otherwise meet a claim that answers 200 and
-mails nothing, with no trace anywhere. If you hit that: set the email on the
-customer, then Developers → Events → resend the `customer.subscription.created`.
-
-### Which webhook events you actually need
-
-The code handles four and ignores the rest:
-
-| Event | What it does |
-|---|---|
-| `customer.subscription.created` / `.updated` / `.deleted` | activates or ends access. **Also records a portal-issued subscription the first time it is seen** — this is the path comps take |
-| `checkout.session.completed` | records a purchase made through the website's own checkout |
-
-A deployment that issues subscriptions from the portal and also sells on the
-website can run on the three `customer.subscription.*` events alone: Checkout in
-subscription mode always creates a Customer carrying the buyer's address, so a
-paid purchase is recorded by the same path. Subscribing `checkout.session.completed`
-as well is still preferable for the paid route — it carries the address the buyer
-typed at checkout, and records the purchase without a round trip back to Stripe.
-
-Note the split: `/stripe/*` and `/subscribe` are **app-api** (8091), but
-`/claim/*` is **auth** (8090) — the claim happens before a session exists.
-`nginx.conf` states `/claim/` explicitly for that reason; a config that lets the
-catch-all take it 404s every claim while both services look perfectly healthy.
+(`/claim/*` used to be stated explicitly in `nginx.conf` because it was served by
+**auth** (8090) while every other non-`/auth` path went to app-api. The claim
+flow is gone, so the catch-all may have that path back.)
 
 ## 6. Point the apps at production
 
@@ -444,8 +528,9 @@ and its helper scripts stay current with no action from you.
 
 The app **secrets** that used to live in GitHub Environments are no longer read
 by anything — **delete them** once the hosts have their own copies:
-`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `RESEND_API_KEY`, `OTP_PEPPER`,
-`APNS_KEY_P8`, `BOT_SEED`, and all four `DEPLOY_*`. A live APNs `.p8` or Stripe
+`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `APNS_KEY_P8`, `BOT_SEED`, and all
+four `DEPLOY_*` (plus `RESEND_API_KEY` and `OTP_PEPPER`, which nothing reads at
+all any more). A live APNs `.p8` or Stripe
 key sitting in a GitHub Environment is production key material readable by anyone
 who can add a workflow — the exposure this model was built to remove.
 

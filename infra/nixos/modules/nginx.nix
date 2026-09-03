@@ -38,6 +38,7 @@ let
     "/push"
     "/account"
     "/stripe"
+    "/supporters"
   ];
   apiLocation = {
     proxyPass = apiUpstream;
@@ -64,7 +65,8 @@ in
       # the host with no web server at all.
 
       limit_req_zone $binary_remote_addr zone=api:10m   rate=20r/s;
-      limit_req_zone $binary_remote_addr zone=claim:10m rate=1r/s;
+      # `zone=claim` bounded the emailed subscription claim codes. Nothing in
+      # this stack sends mail since the paywall was removed, so it is gone.
 
       # Only POSTs count against the checkout limit; GETs get an empty key,
       # which nginx ignores.
@@ -108,15 +110,6 @@ in
           '';
         };
 
-        # Subscription claim codes — deliberately the tightest limit here.
-        "/claim/" = {
-          proxyPass = authUpstream;
-          extraConfig = ''
-            limit_req zone=claim burst=5 nodelay;
-            ${fwd}
-          '';
-        };
-
         "/auth/" = {
           proxyPass = authUpstream;
           extraConfig = ''
@@ -125,8 +118,9 @@ in
           '';
         };
 
-        # Stripe checkout creation: the api limit plus a per-POST cap.
-        "/subscribe" = {
+        # Stripe checkout creation: the api limit plus a per-POST cap. Only the
+        # SUB-paths reach here — bare /donate is a Cloudflare Worker route.
+        "/donate" = {
           proxyPass = apiUpstream;
           extraConfig = ''
             limit_req zone=api burst=40 nodelay;

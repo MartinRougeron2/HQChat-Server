@@ -4,7 +4,7 @@
 # needs for the Cloudflare Terraform step of the deploy pipeline
 # (the `cloudflare` job in .github/workflows/release.yml).
 #
-# App secrets (STRIPE_*, RESEND_API_KEY, OTP_PEPPER, APNS_*) do NOT belong in
+# App secrets (STRIPE_*, APNS_*) do NOT belong in
 # GitHub any more: deploys are pull-based, so they live on the host that uses
 # them (infra/deploy/agent/set-host-secrets.sh). This script covers only the
 # Cloudflare + R2 state side, which Terraform genuinely needs in CI.

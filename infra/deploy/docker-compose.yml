@@ -29,7 +29,7 @@
 #   mkdir -p deploy/secrets && chmod 700 deploy/secrets
 #   # REQUIRED — from `terraform output` in infra/database (see its README):
 #   #   deploy/secrets/{database_url,database_url_direct,pg_ca_cert,emqx_pg}
-#   # ONLY if you use them (ADMISSION_POLICY=stripe / APNs):
+#   # ONLY if you use them (DONATIONS_ENABLED=1 / APNs):
 #   printf '%s' 'sk_live_...'   > deploy/secrets/stripe_secret_key
 #   printf '%s' 'whsec_...'     > deploy/secrets/stripe_webhook_secret
 #   printf '%s' '<apns .p8>'    > deploy/secrets/apns_key_p8
@@ -51,19 +51,16 @@
 # reproducible, tamper-evident builds — see deploy/DEPLOY.md.
 
 services:
-# MAIL_FROM, SENTRY_DSN and PUBLIC_BASE_URL are NOT declared under any service's
-# `environment:`. They used to be, as `"${VAR:-}"`, with a comment saying the
-# value came from server.env — and it never did. Compose interpolates `${VAR}`
-# from the shell it is invoked in (or a .env beside this file), not from
-# `env_file`, and an entry in `environment:` OVERRIDES `env_file`. So writing
-# MAIL_FROM into /etc/hqcat/<stack>/server.env, which is where the runbook and
-# set-host-secrets.sh both put it, was silently replaced by an empty string:
-#
-#   ❌ Invalid configuration — refusing to start:
-#     - MAIL_FROM is required (ADMISSION_POLICY=stripe; the From address for
-#       claim codes).
-#
-# on a host where MAIL_FROM was set correctly. Leaving them out lets `env_file`
+# SENTRY_DSN, PUBLIC_BASE_URL and the donation settings are NOT declared under
+# any service's `environment:`. They used to be, as `"${VAR:-}"`, with a comment
+# saying the value came from server.env — and it never did. Compose interpolates
+# `${VAR}` from the shell it is invoked in (or a .env beside this file), not from
+# `env_file`, and an entry in `environment:` OVERRIDES `env_file`. So a value
+# written into /etc/hqcat/<stack>/server.env, which is where the runbook and
+# set-host-secrets.sh both put it, was silently replaced by an empty string, and
+# the service refused to boot on a host that was in fact configured correctly.
+# (The variable that demonstrated this was MAIL_FROM, which no longer exists —
+# the claim emails went with the paywall.) Leaving them out lets `env_file`
 # supply them, which is what every document about this stack already says.
 
   # One-shot: GENERATE the internal service credentials (internal MQTT identity,
@@ -348,12 +345,10 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       PGSSLROOTCERT: /run/secrets/pg_ca_cert
       INTERNAL_MQTT_SECRET_FILE: /runtime-secrets/internal_mqtt_secret
-      # The paid door consults the claim state, and /claim/* mails the codes
-      # that create it — so auth needs the mail credentials and the pepper.
-      # It never talks to Stripe: money is app-api's business.
-      ADMISSION_POLICY: stripe
-      RESEND_API_KEY_FILE: /run/secrets/resend_api_key
-      OTP_PEPPER_FILE: /run/secrets/otp_pepper
+      # auth needs no money configuration at all. It used to: the paid door
+      # consulted the claim state and /claim/* mailed the codes that created it,
+      # so this service held the Resend key and the OTP pepper. Both are gone
+      # with the paywall, and ADMISSION_POLICY falls back to its `open` default.
       SENTRY_ENVIRONMENT: production
       LOG_LEVEL: info
       # Crash early-warning (lib/health-monitor.ts): fire below this service's
@@ -363,8 +358,6 @@ services:
     secrets:
       - database_url
       - pg_ca_cert
-      - resend_api_key
-      - otp_pepper
     volumes:
       - runtime-secrets:/runtime-secrets:ro
     ports:
@@ -416,13 +409,12 @@ services:
       # subscription and account deletion kicks the session (lib/emqx.ts).
       EMQX_API_URL: http://emqx:18083
       EMQX_DASHBOARD_PASSWORD_FILE: /runtime-secrets/emqx_dashboard_password
-      # app-api owns /stripe/webhook and /subscribe, so it is the service that
-      # needs the Stripe and mail credentials.
-      ADMISSION_POLICY: stripe
+      # app-api owns /stripe/webhook, /donate and /supporters, so it is the one
+      # service that holds a Stripe credential. Donations are enabled here rather
+      # than via ADMISSION_POLICY: payment has no say in who is admitted.
+      DONATIONS_ENABLED: "1"
       STRIPE_SECRET_KEY_FILE: /run/secrets/stripe_secret_key
       STRIPE_WEBHOOK_SECRET_FILE: /run/secrets/stripe_webhook_secret
-      RESEND_API_KEY_FILE: /run/secrets/resend_api_key
-      OTP_PEPPER_FILE: /run/secrets/otp_pepper
       SENTRY_ENVIRONMENT: production
       LOG_LEVEL: info
       # Crash early-warning (lib/health-monitor.ts): fire below this service's
@@ -434,8 +426,6 @@ services:
       - pg_ca_cert
       - stripe_secret_key
       - stripe_webhook_secret
-      - resend_api_key
-      - otp_pepper
     volumes:
       - runtime-secrets:/runtime-secrets:ro
     ports:
@@ -599,18 +589,14 @@ secrets:
   # environment (see the emqx service above).
   emqx_pg:
     file: ./secrets/emqx_pg
-  # app-api holds these: it serves /stripe/webhook and /subscribe, and mails the
-  # claim codes that bind a subscription to a device key.
+  # app-api holds these: it serves /stripe/webhook, /donate and /supporters.
+  # `resend_api_key` and `otp_pepper` stood here too, for the emailed claim
+  # codes that bound a subscription to a device key. Both are gone: nothing in
+  # this stack sends mail any more.
   stripe_secret_key:
     file: ./secrets/stripe_secret_key
   stripe_webhook_secret:
     file: ./secrets/stripe_webhook_secret
-  resend_api_key:
-    file: ./secrets/resend_api_key
-  # Pepper for stored OTP hashes — without it a database dump yields every
-  # pending claim code. `openssl rand -hex 32 > ./secrets/otp_pepper`
-  otp_pepper:
-    file: ./secrets/otp_pepper
   apns_key_p8:
     file: ./secrets/apns_key_p8
   # Bearer token for /metrics (SRV-2). Only the retired /ws monolith served

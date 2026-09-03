@@ -115,7 +115,7 @@ roll back a host that has no earlier generation.
 left in `/tmp`:
 
 ```bash
-for s in stripe_secret_key stripe_webhook_secret resend_api_key apns_key_p8; do
+for s in stripe_secret_key stripe_webhook_secret apns_key_p8; do
   read -rsp "$s (blank to skip): " v; echo
   [ -n "$v" ] && printf '%s' "$v" \
     | ssh root@<ip> "umask 077; cat > /etc/hqcat/prod/secrets/$s"
@@ -124,9 +124,9 @@ done
 
 You do not have to supply all of them. NixOS creates every compose secret as an
 empty file (`f` tmpfiles rules never truncate a real one), so an unused
-Stripe/APNs key does not stop the stack — and `hqcat-otp-pepper.service`
-generates the OTP pepper on the host, since that one must never be empty and
-has no external source.
+Stripe/APNs key does not stop the stack. The Resend key and the OTP pepper used
+to be on this list; both went with the paywall, along with the only mail this
+stack ever sent.
 
 *GHCR pull credentials* (read-only `read:packages`; skip if the package is
 public):
@@ -140,9 +140,12 @@ printf 'GHCR_USER=…\nGHCR_TOKEN=…\n' \
 
 ```bash
 ssh root@<ip> 'umask 077; cat > /etc/hqcat/prod/server.env' <<'ENV'
-SERVER_NAME=DissQus
+SERVER_NAME=hqchat
 PUBLIC_BASE_URL=https://chat.example.com
-ADMISSION_POLICY=stripe
+ADMISSION_POLICY=open
+DONATIONS_ENABLED=1
+STRIPE_DONATION_PRICE_IDS=price_…,price_…,price_…
+STRIPE_DONATION_ONCE_PRICE_ID=price_…
 ENV
 ```
 

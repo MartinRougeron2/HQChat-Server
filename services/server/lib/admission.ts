@@ -2,18 +2,19 @@
 // this server, and at which door. Extracted from server.ts so every entrypoint
 // enforces identical rules with no drift.
 //
-//   open      — anyone who passes HQC auth (default; self-host friendly)
+//   open      — anyone who passes HQC auth (default; the official server)
 //   allowlist — only public keys in ADMISSION_ALLOWLIST (private/family servers)
-//   stripe    — the free door is open to all; the paid door requires a claimed,
-//               live subscription (the official server)
 //
-// This function used to answer "has this person paid?", and answered it by
-// calling Stripe on every login. It does not any more: payment is a claim in
-// the database, resolved by services/subscription, and what is left here is the
-// question the name always implied — is this key allowed on this server at all.
+// This function used to answer "has this person paid?" — first by calling Stripe
+// on every login, later by reading a subscription claim. It answers neither now.
+// The product is free and funded by donations, so there is no entitlement to
+// look up and the question is the one the name always implied: is this key
+// allowed on this server at all.
+//
+// `allowlist` is what remains of the gate, and it is the lever to reach for if
+// the open server is ever abused: it is a policy switch, not a rebuild.
 
 import { DB } from "../services/db/api";
-import { SubscriptionService } from "../services/subscription/api";
 import { peerId } from "./identity";
 import { logger } from "./logger";
 
@@ -23,19 +24,22 @@ export const ADMISSION_ALLOWLIST = (process.env.ADMISSION_ALLOWLIST || "")
 
 /**
  * Which door a client knocked on. The free door grants a bot-only session; the
- * paid door grants everything, and only to a key bound to a live subscription.
+ * full door grants everything.
  *
- * They are separate endpoints rather than one endpoint with a flag because the
- * paid door answers BEFORE the KEM handshake: an unclaimed key is turned away
- * for the cost of one primary-key lookup. That is only safe to do because the free door
- * exists — refusing at the paid door denies nobody access to the app, so it is
- * a gate rather than a subscriber-status oracle on the only way in.
+ * They stayed separate endpoints after the paywall was removed because the
+ * distinction still earns its keep: the free door is what a client falls back to
+ * when the full door refuses it, which is how the app keeps working against an
+ * `allowlist` deployment instead of failing shut.
+ *
+ * The wire name of the full door is still "paid" — the app, the bot and the
+ * deployed servers all speak it, and renaming a live path buys nothing but a
+ * migration. Nothing behind it costs money.
  */
 export type Door = "free" | "paid";
 
 export type Admission =
   | { ok: true }
-  | { ok: false; reason: "denied" | "not_claimed" };
+  | { ok: false; reason: "denied" };
 
 /** Whether a public key is exempt from every gate (the helper bot). Exemption
  *  waives policy, never the proof of key possession.
@@ -71,14 +75,6 @@ export async function checkAdmission(pkHex: string, door: Door): Promise<Admissi
   if (await isExempt(pkHex, id)) return { ok: true };
 
   switch (ADMISSION_POLICY) {
-    case "stripe":
-      // The free door sells nothing and asks nothing. The paid door asks the
-      // only question that matters, and it is one primary-key lookup.
-      if (door === "free") return { ok: true };
-      return (await SubscriptionService.isClaimed(id))
-        ? { ok: true }
-        : { ok: false, reason: "not_claimed" };
-
     case "allowlist":
       // A private server has no free tier to speak of: an unlisted key is not
       // welcome through either door. Compared as ids so a list entry that
@@ -89,8 +85,8 @@ export async function checkAdmission(pkHex: string, door: Door): Promise<Admissi
 
     case "open":
     default:
-      // Self-hosters get the whole product. There is nothing to pay for here,
-      // so the paid door is a pass rather than a gate.
+      // Everyone gets the whole product. There is nothing to pay for anywhere,
+      // so the full door is a pass rather than a gate.
       return { ok: true };
   }
 }

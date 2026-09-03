@@ -121,6 +121,12 @@ export class TestClient {
   private cursor = 0;
   /** Frames that arrived but could not be opened — the suite asserts on these. */
   readonly undecryptable: string[] = [];
+  /** Why frames were dropped, in order. Every `return` in `onFrame` records a
+   *  reason: without this a failure is only ever "no message within 8000ms",
+   *  which says nothing about whether the frame arrived, was addressed
+   *  elsewhere, or failed to open. That silence is why this suite was
+   *  undiagnosable the whole time it was skipping. */
+  readonly drops: string[] = [];
 
   private readonly c: Crypto;
 
@@ -135,8 +141,22 @@ export class TestClient {
 
   // ── REST ───────────────────────────────────────────────────────────────────
 
+  /**
+   * The FULL door (`/auth/paid/*`), not the free one.
+   *
+   * This mattered more than it looked. The free door mints a `free` scope,
+   * which grants self topics and the helper bot and NOTHING else — no friend
+   * topics, so two clients on it can never hold a conversation. While the
+   * paywall existed, `/friends/invite` answered 402 to a free session and
+   * `pair()` skipped on it, so the entire conversation suite quietly ran
+   * nothing and the job went green anyway. That is the failure mode this
+   * helper's own `brokerReachable` comment warns about, reached by a different
+   * road.
+   *
+   * The door's wire name is still "paid"; nothing behind it costs money.
+   */
   async register(username: string): Promise<void> {
-    const init = await http(AUTH_BASE, "POST", "/auth/free/init", { pk: this.pkHex });
+    const init = await http(AUTH_BASE, "POST", "/auth/paid/init", { pk: this.pkHex });
     if (init.status !== 200 || !init.body?.ct) {
       throw new NotAvailable(`auth/init returned ${init.status}`);
     }
@@ -144,7 +164,7 @@ export class TestClient {
     // with the "auth" label. It is NOT a decryption oracle — the server never
     // sees a plaintext we chose.
     const ss = this.c.hqcDecapsulate(this.sk, Buffer.from(String(init.body.ct), "base64"));
-    const verify = await http(AUTH_BASE, "POST", "/auth/free/verify", {
+    const verify = await http(AUTH_BASE, "POST", "/auth/paid/verify", {
       pk: this.pkHex,
       // BASE64, not the raw Buffer. `handleVerify` does
       // `Buffer.from(String(solution), "base64")`, and JSON.stringify turns a
@@ -207,9 +227,14 @@ export class TestClient {
         username: this.id,
         password: this.mqttToken,
         protocolVersion: 5,
-        // Persistent, exactly as the apps connect — this is what makes the
-        // broker queue an `init` for a client that is offline.
+        // Persistent — this is what makes the broker queue an `init` for a
+        // client that is offline. On MQTT 5 that needs BOTH halves: `clean:
+        // false` says "resume a session", and `sessionExpiryInterval` says how
+        // long one may outlive its connection. The default is 0, so without it
+        // the session dies with the socket and the queue is empty on reconnect.
+        // The bot had the same omission; see bot.ts.
         clean: false,
+        properties: { sessionExpiryInterval: 3600 },
         reconnectPeriod: 0,
         connectTimeout: timeoutMs,
       });
@@ -232,10 +257,24 @@ export class TestClient {
     this.client = undefined;
   }
 
+  /** Subscribe, and always settle — same disconnect hazard as `publishRaw`. */
   subscribeConversation(peerId_: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.client?.subscribe(`c/${friendshipHash(this.id, peerId_)}`, { qos: 1 }, (err) =>
-        err ? reject(err) : resolve()
+      const c = this.client;
+      if (!c) return reject(new NotAvailable("not connected"));
+      let settled = false;
+      const finish = (e?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        c.removeListener("close", onGone);
+        e ? reject(e) : resolve();
+      };
+      const onGone = () => finish(new NotAvailable("broker closed the connection during SUBSCRIBE"));
+      const timer = setTimeout(() => finish(new NotAvailable("SUBSCRIBE timed out")), 5000);
+      c.once("close", onGone);
+      c.subscribe(`c/${friendshipHash(this.id, peerId_)}`, { qos: 1 }, (err) =>
+        finish(err ?? undefined)
       );
     });
   }
@@ -262,12 +301,47 @@ export class TestClient {
   /** Attempt a publish and report whether the broker accepted it. Used to prove
    *  the ACL refuses a stranger — an unauthorized publish is dropped, and with
    *  MQTT 5 the broker returns a reason code for it. */
+  /**
+   * Publish, and ALWAYS settle.
+   *
+   * The obvious version — `publish(..., {qos: 1}, cb)` and nothing else — hangs
+   * forever on exactly the case this suite exists to test. The broker's
+   * `deny_action = disconnect` drops a client that publishes where it may not,
+   * and a QoS-1 publish in flight when that happens is never acknowledged and
+   * never failed: mqtt.js flushes only QoS-0 callbacks on close, keeps QoS-1
+   * for retransmission, and `reconnectPeriod: 0` means the retransmission never
+   * comes. The callback is simply never called.
+   *
+   * That is what stalled the ACL test for six minutes until the job timed out,
+   * with four green tests above it and no error anywhere — the run looked
+   * "finished but hung" rather than failed.
+   *
+   * So a close or an error settles it as a refusal, which is what a refusal
+   * looks like on this broker, and a timeout backstops both.
+   */
   publishRaw(topic: string, payload: string): Promise<{ accepted: boolean; reason?: number }> {
     return new Promise((resolve) => {
-      if (!this.client) return resolve({ accepted: false });
-      this.client.publish(topic, payload, { qos: 1 }, (err: any) => {
-        if (err) return resolve({ accepted: false, reason: err?.code });
-        resolve({ accepted: true });
+      const c = this.client;
+      if (!c) return resolve({ accepted: false });
+
+      let settled = false;
+      const finish = (r: { accepted: boolean; reason?: number }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        c.removeListener("close", onGone);
+        c.removeListener("error", onGone);
+        resolve(r);
+      };
+      const onGone = () => finish({ accepted: false });
+      // Generous: a permitted publish is acknowledged in milliseconds, so this
+      // only ever fires if both the ack and the disconnect fail to arrive.
+      const timer = setTimeout(() => finish({ accepted: false }), 5000);
+
+      c.once("close", onGone);
+      c.once("error", onGone);
+      c.publish(topic, payload, { qos: 1 }, (err: any) => {
+        finish(err ? { accepted: false, reason: err?.code } : { accepted: true });
       });
     });
   }
@@ -339,28 +413,47 @@ export class TestClient {
   }
 
   /** Seal and publish, on whichever topic can deliver the frame. */
-  async send(peer: TestClient, text: string): Promise<EnvelopeV2> {
-    const env = await this.sealOnly(peer, text);
-    const topic = env.t === "init"
+  /**
+   * Where a frame belongs, by its type.
+   *
+   * An `init` goes to the peer's INBOX: it is the frame they may receive before
+   * any conversation exists, and `onFrame` refuses one that arrives anywhere
+   * else. Everything after it goes to the shared conversation topic.
+   *
+   * Exposed because a test that publishes by hand — to reorder, delay or tamper
+   * — has to obey the same rule, and one that hand-rolled the topic instead
+   * sent three inits to `c/…` and watched all three be dropped as
+   * "arrived on the wrong topic".
+   */
+  topicFor(env: EnvelopeV2, peer: TestClient): string {
+    return env.t === "init"
       ? `u/${peer.id}/inbox`
       : `c/${friendshipHash(this.id, peer.id)}`;
-    await this.publishRaw(topic, JSON.stringify(env));
+  }
+
+  async send(peer: TestClient, text: string): Promise<EnvelopeV2> {
+    const env = await this.sealOnly(peer, text);
+    await this.publishRaw(this.topicFor(env, peer), JSON.stringify(env));
     return env;
   }
 
   private onFrame(topic: string, payload: Buffer) {
     let parsed: unknown;
-    try { parsed = JSON.parse(payload.toString("utf8")); } catch { return; }
+    try { parsed = JSON.parse(payload.toString("utf8")); }
+    catch { this.drops.push(`bad-json on ${topic}`); return; }
     // `parseEnvelope` has already refused any frame whose `sender` is not a
     // well-formed client id, and any `init` whose `senderPk` does not hash to it.
     const env = parseEnvelope(parsed);
-    if (!env) return;
-    if (env.sender === this.id) return;
+    if (!env) { this.drops.push(`parseEnvelope rejected a frame on ${topic}`); return; }
+    if (env.sender === this.id) { this.drops.push("own frame echoed back"); return; }
 
     const expected = env.t === "init"
       ? `u/${this.id}/inbox`
       : `c/${friendshipHash(this.id, env.sender)}`;
-    if (topic !== expected) return;
+    if (topic !== expected) {
+      this.drops.push(`t=${env.t} arrived on ${topic}, expected ${expected}`);
+      return;
+    }
 
     const header: MessageHeader = {
       cid: env.cid,
@@ -372,8 +465,12 @@ export class TestClient {
 
     let session = this.sessions.get(env.sender);
     if (env.t === "init") {
-      if (session) return; // never replace a live session from an inbound init
-      if (!env.ctId || !env.ctMt || !env.rk) return;
+      // never replace a live session from an inbound init
+      if (session) { this.drops.push("init for a peer we already have a session with"); return; }
+      if (!env.ctId || !env.ctMt || !env.rk) {
+        this.drops.push(`init missing ${!env.ctId ? "ctId" : !env.ctMt ? "ctMt" : "rk"}`);
+        return;
+      }
       const init: InitHeader = {
         ctId: Buffer.from(env.ctId, "base64"),
         ctMt: Buffer.from(env.ctMt, "base64"),
@@ -387,19 +484,32 @@ export class TestClient {
         mediumSk: this.prekeySecrets.mediumSk,
         oneTimeSk: (id) => this.prekeySecrets.oneTime.get(id) ?? null,
       }, init);
-      if (!opened) { this.undecryptable.push(env.msgId); return; }
+      if (!opened) {
+        this.undecryptable.push(env.msgId);
+        this.drops.push("startAsResponder returned null — the init did not open");
+        return;
+      }
       session = opened;
     }
-    if (!session) { this.undecryptable.push(env.msgId); return; }
+    if (!session) {
+      this.undecryptable.push(env.msgId);
+      this.drops.push(`msg from ${env.sender.slice(0, 8)}… with no session`);
+      return;
+    }
 
     const mk = openRatchet(this.c.kem, session, header);
-    if (!mk) { this.undecryptable.push(env.msgId); return; }
+    if (!mk) {
+      this.undecryptable.push(env.msgId);
+      this.drops.push(`openRatchet returned no message key (n=${env.n})`);
+      return;
+    }
     try {
       const text = this.c.aesDecrypt(env.payload, mk, canonicalHeader(env));
       this.sessions.set(env.sender, session);
       this.inbox.push({ from: env.sender, text });
-    } catch {
+    } catch (e) {
       this.undecryptable.push(env.msgId);
+      this.drops.push(`AES decrypt failed: ${(e as Error).message}`);
     }
   }
 
@@ -410,7 +520,13 @@ export class TestClient {
       if (this.cursor < this.inbox.length) return this.inbox[this.cursor++]!;
       await new Promise((r) => setTimeout(r, 50));
     }
-    throw new Error(`no message within ${timeoutMs}ms`);
+    // The whole point of `drops`. A bare timeout cannot distinguish "the
+    // broker never delivered it" from "it arrived and would not open", and
+    // those have entirely different causes.
+    const why = this.drops.length
+      ? ` — ${this.drops.length} frame(s) dropped: ${this.drops.join("; ")}`
+      : " — no frame reached this client at all";
+    throw new Error(`no message within ${timeoutMs}ms${why}`);
   }
 
   async close(): Promise<void> {

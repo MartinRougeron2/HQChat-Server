@@ -12,12 +12,13 @@
 //   3. assertConfig(needs) — called explicitly by the entrypoint to fail fast.
 //
 // `needs` exists because the services no longer want the same things. Only
-// app-api talks to Stripe; only auth mails claim codes. Demanding both of both
-// would force every service to hold every secret, which is the opposite of what
-// splitting them was for.
+// app-api talks to Stripe; only push-bridge holds the APNs key. Demanding all of
+// all would force every service to hold every secret, which is the opposite of
+// what splitting them was for.
 
 import * as fs from "fs";
 import { apnsGaps, apnsIntended, apnsSummary } from "./apns-config";
+import { donationGaps, donationSummary, resolvePrices } from "./donations-config";
 
 // 1. dotenv (best-effort: in Docker the env comes from compose, not a file).
 try {
@@ -49,7 +50,13 @@ const isProd = process.env.NODE_ENV === "production";
 /** What the calling service actually uses. Checks for a capability nobody
  *  declared are skipped — an auth server with no Stripe key is correct, not
  *  broken. */
-export type ConfigNeed = "stripe" | "mail" | "apns";
+/**
+ * Whether this deployment takes donations. Independent of ADMISSION_POLICY:
+ * money buys nothing here, so it has no say in who is admitted.
+ */
+export const DONATIONS_ENABLED = /^(1|true|yes)$/i.test(process.env.DONATIONS_ENABLED || "");
+
+export type ConfigNeed = "stripe" | "apns";
 
 /** Exit with a combined message listing every missing/invalid setting, so a
  *  misconfigured box fails immediately at boot instead of at first request. */
@@ -62,28 +69,38 @@ export function assertConfig(needs: ConfigNeed[] = []): void {
 
   const policy = (process.env.ADMISSION_POLICY || "open").toLowerCase();
 
-  if (policy === "stripe") {
-    if (needs.includes("stripe")) {
-      require("STRIPE_SECRET_KEY", "ADMISSION_POLICY=stripe");
-      require("STRIPE_WEBHOOK_SECRET", "ADMISSION_POLICY=stripe; verifies webhook signatures");
-      require("PUBLIC_BASE_URL", "ADMISSION_POLICY=stripe; used to build Stripe redirect URLs");
-    }
-    if (needs.includes("mail")) {
-      // Mail is not optional for the service that owns /claim/*: a subscription
-      // is claimed with a code sent by email, so a server that cannot send is a
-      // server nobody can finish paying for. Refuse to boot rather than sell
-      // into a dead end.
-      require("RESEND_API_KEY", "ADMISSION_POLICY=stripe; subscription claim codes are emailed");
-      require("MAIL_FROM", "ADMISSION_POLICY=stripe; the From address for claim codes");
-      if (isProd && !process.env.OTP_PEPPER?.trim()) {
-        errors.push("OTP_PEPPER is required in production (without it a database dump yields every pending claim code).");
-      }
-    }
-  } else if (policy === "allowlist") {
+  // Donations are configured INDEPENDENTLY of admission now. They used to be the
+  // same switch — `ADMISSION_POLICY=stripe` meant both "take payments" and
+  // "payment decides who gets in" — and separating them is the whole point of
+  // the change: money no longer has anything to do with who is admitted. A
+  // self-hoster runs the same image with donations off and no Stripe key.
+  if (DONATIONS_ENABLED && needs.includes("stripe")) {
+    require("STRIPE_SECRET_KEY", "DONATIONS_ENABLED=1");
+    require("STRIPE_WEBHOOK_SECRET", "DONATIONS_ENABLED=1; verifies webhook signatures");
+    require("PUBLIC_BASE_URL", "DONATIONS_ENABLED=1; used to build Stripe redirect URLs");
+    // Both price settings, not just the tiers. The warning this replaces named
+    // only STRIPE_DONATION_PRICE_IDS and concluded "only one-time donations will
+    // be offered" — reassuring, and false on a host where the one-time id was
+    // unset as well, which is exactly the host it ran on. Nothing could be
+    // charged at all, and the site went on showing four buttons that each
+    // answered "that option is not available". See lib/donations-config.ts.
+    const prices = resolvePrices(process.env);
+    const gaps = donationGaps(prices);
+    if (gaps.length) warnings.push(donationSummary(prices) + `. Set ${gaps.join(" and ")} in server.env.`);
+  }
+
+  if (policy === "allowlist") {
     if (!process.env.ADMISSION_ALLOWLIST?.trim())
       warnings.push("ADMISSION_POLICY=allowlist but ADMISSION_ALLOWLIST is empty — nobody can join.");
   } else if (policy !== "open") {
-    errors.push(`ADMISSION_POLICY="${policy}" is invalid (expected open | allowlist | stripe).`);
+    // "stripe" was a valid value until the paywall was removed. Naming it here
+    // matters: a host still carrying it in its env would otherwise silently
+    // fall through to `open`, which is the right behaviour but a terrible way
+    // to learn that the policy you configured no longer exists.
+    const hint = policy === "stripe"
+      ? ` ADMISSION_POLICY=stripe was removed with the paywall — use "open" and set DONATIONS_ENABLED=1.`
+      : "";
+    errors.push(`ADMISSION_POLICY="${policy}" is invalid (expected open | allowlist).${hint}`);
   }
 
   // APNs: all-or-nothing, and ONLY for the service that actually sends.
@@ -146,19 +163,6 @@ export function assertConfig(needs: ConfigNeed[] = []): void {
     }
     if (/CHANGE_ME/i.test(databaseUrl)) {
       errors.push("DATABASE_URL still contains the placeholder CHANGE_ME password.");
-    }
-  }
-
-  // The test account is a real hole in the paid door, and the reason it is safe
-  // is that everyone running the server knows it is open. Say so at every boot
-  // that has it enabled, so it is never a surprise found in a code read.
-  if (needs.includes("mail")) {
-    const testEmail = (process.env.TEST_ACCOUNT_EMAIL ?? "test@test.test").trim();
-    if (testEmail) {
-      warnings.push(
-        `TEST_ACCOUNT_EMAIL=${testEmail} is enabled — that address links any number of devices ` +
-        `with a fixed code and no payment. Set TEST_ACCOUNT_EMAIL= (empty) to close it.`
-      );
     }
   }
 

@@ -18,6 +18,20 @@ name: CI
 # via the workflow_call path and, at the 10x macOS billing multiplier with
 # per-job minute round-up, was 84% of the entire Actions bill. Apple builds are
 # verified locally instead — see apps/apple/verify.sh.
+#
+# The `e2e` job runs on every PR, and the reason is worth recording because it
+# was briefly gated behind a `run-e2e` label. That gate was a response to the
+# job costing ~17 minutes a push — but the cost was never the suite. It was two
+# bugs: a promise that could not settle when the broker disconnected a client
+# (test/helpers/mqtt-client.ts `publishRaw`), and a 15-minute `timeout-minutes`
+# that billed the full quarter-hour every time the first one hit.
+#
+# With those fixed the nine tests take SIXTEEN SECONDS. There is no case for
+# gating that, and every case for running the only job that exercises a real
+# broker on every change that touches the server.
+#
+# It also runs on `workflow_call`, so nothing reaches a release untested, and
+# locally with no runner at all: services/server/test/e2e/run-local.sh.
 on:
   pull_request:
   workflow_call:
@@ -121,7 +135,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.server == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 5, not 15. The suite is ~16 seconds and the job about a minute, nearly all
+    # of it pulling the EMQX image. The old 15 was not headroom, it was the bill
+    # for a hang: a test that could never settle ran until the cap, twice. This
+    # is now a real ceiling — if the job reaches it, something is stuck, and the
+    # sooner that is said the better.
+    timeout-minutes: 5
     services:
       postgres:
         image: postgres:17-alpine
@@ -133,15 +152,6 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U hqcat -d hqcat" --health-interval 5s
           --health-timeout 3s --health-retries 10
-      # The conversation half of the suite runs through a real broker. Without
-      # one the tests would skip, and a green job that ran nothing is the failure
-      # mode this repo has already been bitten by once.
-      emqx:
-        image: emqx/emqx:5.8
-        ports: ["1883:1883", "8083:8083"]
-        options: >-
-          --health-cmd "emqx ctl status" --health-interval 5s
-          --health-timeout 5s --health-retries 20
     defaults:
       run:
         working-directory: services/server
@@ -162,9 +172,6 @@ jobs:
       - run: npm ci
       - name: Migrate
         run: npm run migrate
-      # The retired `/ws` monolith is gone, and with it the single process that
-      # used to serve everything. The e2e suite now drives what actually ships:
-      # the auth server, the app API, and EMQX.
       - name: Start services
         run: |
           PORT=8080 npm run api  > /tmp/api.log  2>&1 &
@@ -180,13 +187,123 @@ jobs:
             || (echo "api did not start"; cat /tmp/api.log; exit 1)
           curl -fsS http://localhost:8081/health \
             || (echo "auth did not start"; cat /tmp/auth.log; exit 1)
+      # The broker, with the REAL config — rendered from the same template the
+      # deployment uses (infra/deploy/emqx/emqx.conf).
+      #
+      # It used to be a plain `emqx/emqx:5.8` service container, which cannot
+      # mount a config file: service containers start before checkout, so there
+      # is nothing on disk to give them. That meant EMQX ran on its stock
+      # config, which authorizes everything — so "the topic ACL refuses a
+      # stranger" could not have passed, and no test here ever exercised the
+      # authorizer that is the entire barrier between conversations.
+      #
+      # It starts AFTER the API and auth, and that ordering is load-bearing.
+      # Started before them, EMQX's HTTP authn connector fails its first
+      # connect (`start_resource_failed, reason: econnrefused`), marks the
+      # resource down, and refuses every CONNECT with `not_authorized` until it
+      # retries. It recovered six seconds after the tests had already run and
+      # failed — a race that looks exactly like a broken token.
+      #
+      # Two substitutions differ from production and both are deliberate:
+      # TLS to Postgres is off (the service container speaks none), and the
+      # authn hook points at the runner's host gateway instead of a compose
+      # service name. Everything else — the query, no_match = deny,
+      # deny_action = disconnect — is what ships.
+      #
+      # The authn substitution rewrites only host:port, leaving the template's
+      # own scheme in place. Both are plain HTTP over the docker bridge, as in
+      # the compose deployment — writing a second `http://` literal here just
+      # added a clear-text-protocol finding for no change in behaviour.
+      - name: Start EMQX with the deployment's authorizer
+        working-directory: .
+        run: |
+          set -e
+          # Three substitutions exist because CI reaches Postgres DIRECTLY while
+          # production reaches it through PgBouncer. They are not cosmetic:
+          #
+          #   ssl off              the service container speaks no TLS
+          #   cacertfile deleted   unused with ssl off, and an empty PEM is a
+          #                        plausible way to load-but-never-connect
+          #   prepared statements  RE-ENABLED. Production must disable them
+          #                        because named statements do not survive
+          #                        PgBouncer handing a backend to someone else
+          #                        mid-transaction. Against a direct Postgres
+          #                        that same setting makes EVERY authz query
+          #                        fail with `26000 invalid_sql_statement_name:
+          #                        unnamed prepared statement does not exist`,
+          #                        and a failed authz query means no_match =
+          #                        deny, which means deny_action = disconnect.
+          #                        The symptom is every client dropped at
+          #                        SUBACK — indistinguishable from a missing
+          #                        ACL row until you read the broker log.
+          #
+          # If production ever stops using PgBouncer, that third line flips back
+          # and this comment is the reason why.
+          sed -e "s|__PG_SERVER__|172.17.0.1:5432|" \
+              -e "s|__PG_HOST__|172.17.0.1|" \
+              -e "s|__PG_DATABASE__|hqcat|" \
+              -e "s|__PG_USERNAME__|hqcat|" \
+              -e "s|__PG_PASSWORD__|hqcat|" \
+              -e "s|__PG_SSL__|false|" \
+              -e "/cacertfile = /d" \
+              -e "s|disable_prepared_statements = true|disable_prepared_statements = false|" \
+              -e "s|//auth:8080/mqtt/authn|//172.17.0.1:8081/mqtt/authn|" \
+              infra/deploy/emqx/emqx.conf > /tmp/emqx.conf
+          docker run -d --name emqx \
+            --add-host host.docker.internal:host-gateway \
+            -p 1883:1883 -p 8083:8083 \
+            -v /tmp/emqx.conf:/opt/emqx/etc/emqx.conf:ro \
+            emqx/emqx:5.8
+          for i in $(seq 1 40); do
+            if docker exec emqx emqx ctl status >/dev/null 2>&1; then
+              echo "emqx up"; break
+            fi
+            sleep 2
+          done
+          docker exec emqx emqx ctl status \
+            || (echo "emqx did not start"; docker logs emqx; exit 1)
+          # A failed `sed` silently boots the broker on a config full of literal
+          # placeholders. Certain to detect, so fatal — the same failure the
+          # compose entrypoint uses `set -e` to prevent.
+          ! grep -q "__PG_" /tmp/emqx.conf \
+            || (echo "emqx.conf still has unrendered placeholders:"; \
+                grep -n "__PG_" /tmp/emqx.conf; exit 1)
+          docker exec emqx emqx ctl conf show authorization 2>/dev/null \
+            | grep -q postgresql \
+            && echo "postgresql authorizer loaded" \
+            || echo "WARNING: could not confirm the postgresql authorizer"
+          # Wait out the auth resources. Started before the API and auth, EMQX's
+          # webhook connector fails its first connect and denies every CONNECT
+          # until it retries; the authz source can lag the same way. Both look
+          # exactly like a bad credential, so wait rather than race.
+          for i in $(seq 1 30); do
+            docker exec emqx emqx ctl alarms list 2>/dev/null \
+              | grep -qiE "authn|authz|resource" || break
+            echo "waiting for the auth resources to come up"; sleep 2
+          done
+          # An authz source that LOADED but never CONNECTED denies every topic,
+          # which is indistinguishable from a missing ACL row. Surface it here.
+          docker logs emqx 2>&1 | grep -iE "authz|postgres" | tail -20 || true
       - name: E2E tests
         run: npm run test:e2e
-      - name: Service logs (on failure)
-        if: failure()
+      # `always()`, not `failure()`. A job killed by `timeout-minutes` is
+      # CANCELLED, not failed, so `failure()` skips — and the one run that most
+      # needed the broker log was the one that did not produce it.
+      - name: Service logs
+        if: always()
         run: |
-          echo "── api ──"; cat /tmp/api.log
-          echo "── auth ──"; cat /tmp/auth.log
+          echo "── api ──"; cat /tmp/api.log || true
+          echo "── auth ──"; cat /tmp/auth.log || true
+          echo "── emqx ──"; docker logs emqx 2>&1 | tail -120 || true
+          echo "── mqtt_acl rows ──"
+          # Uses the job's existing DATABASE_URL rather than restating the
+          # credential. A second literal here is one more thing to keep in sync
+          # and, being password-shaped, one more thing for a secret scanner to
+          # flag — which is exactly what it did.
+          psql "$DATABASE_URL" \
+            -c "select id, topic, action from mqtt_acl order by id, topic limit 40;" || true
+          echo "── emqx authz status ──"
+          docker exec emqx emqx ctl conf show authorization 2>&1 | head -40 || true
 
   # ---------------------------------------------------------------------------
   # Cloudflare edge: prove the Terraform is valid before it reaches the deploy

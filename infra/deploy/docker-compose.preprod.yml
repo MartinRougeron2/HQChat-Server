@@ -9,7 +9,8 @@
 #
 # What still differs from prod is only configuration:
 #   - env files under preprod/ (config + Sentry environment tag)
-#   - ADMISSION_POLICY=open (prod is `stripe`)
+#   - donations off (prod sets DONATIONS_ENABLED=1 on app-api); admission is
+#     `open` on both, which is now the only policy either runs
 #   - APNs disabled (placeholder key file)
 #
 #   # On the pre-prod VM:
@@ -169,10 +170,6 @@ secrets:
     file: ./preprod/secrets/stripe_secret_key
   stripe_webhook_secret:
     file: ./preprod/secrets/stripe_webhook_secret
-  resend_api_key:
-    file: ./preprod/secrets/resend_api_key
-  otp_pepper:
-    file: ./preprod/secrets/otp_pepper
   apns_key_p8:
     file: ./preprod/secrets/apns_key_p8
 

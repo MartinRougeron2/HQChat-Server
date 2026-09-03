@@ -51,7 +51,7 @@ resource "cloudflare_ruleset" "waf_custom" {
   # rules {
   #   ref         = "path_allowlist"
   #   description = "Block any path outside the known app surface."
-  #   expression  = "(http.host eq \"${local.app_fqdn}\" and not (starts_with(http.request.uri.path, \"/ws\") or starts_with(http.request.uri.path, \"/auth\") or starts_with(http.request.uri.path, \"/blob\") or starts_with(http.request.uri.path, \"/stripe\") or starts_with(http.request.uri.path, \"/claim\") or http.request.uri.path in {\"/health\" \"/info\" \"/subscribe\"}))"
+  #   expression  = "(http.host eq \"${local.app_fqdn}\" and not (starts_with(http.request.uri.path, \"/ws\") or starts_with(http.request.uri.path, \"/auth\") or starts_with(http.request.uri.path, \"/blob\") or starts_with(http.request.uri.path, \"/stripe\") or starts_with(http.request.uri.path, \"/donate\") or http.request.uri.path in {\"/health\" \"/info\" \"/supporters\"}))"
   #   action      = "block"
   # }
 }

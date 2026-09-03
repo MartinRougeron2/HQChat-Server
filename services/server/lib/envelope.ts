@@ -158,10 +158,23 @@ export function parseEnvelope(raw: unknown): EnvelopeV2 | null {
 
   // A step needs both halves: a ratchet key with no ciphertext is not something
   // a receiver can act on, and a ciphertext with no key names no chain.
+  //
+  // On an `init` this pairing does NOT apply, and requiring it here was a
+  // cross-implementation divergence. An init has no peer ratchet key to
+  // encapsulate against — its root comes from ctId/ctMt/ctOt — so `kemCt` is
+  // meaningless on one, and the bot omits it (bot.ts builds the init branch
+  // from `initHeader` alone). Swift accepts that and says so in a test:
+  // "an init WITHOUT kemCt is accepted — the bot omits a field an init has no
+  // use for" (apps/apple/tests/EnvelopeTests.swift). This parser rejected it,
+  // so a TypeScript client could not read an init that a TypeScript client had
+  // written — which is why every e2e conversation test failed with the frame
+  // dropped at parse, and why no test caught it: nothing here had ever parsed a
+  // frame this repo produced.
   const hasRk = e.rk !== undefined && e.rk !== null;
   const hasCt = e.kemCt !== undefined && e.kemCt !== null;
-  if (hasRk !== hasCt) return null;
-  if (hasRk && (!isB64(e.rk) || !isB64(e.kemCt))) return null;
+  if (e.t !== "init" && hasRk !== hasCt) return null;
+  if (hasRk && !isB64(e.rk)) return null;
+  if (hasCt && !isB64(e.kemCt)) return null;
 
   if (e.t === "init") {
     // The identity and medium-term encapsulations are what make an init frame

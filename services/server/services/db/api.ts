@@ -299,12 +299,15 @@ const DBImpl = {
    * in-app "Delete Account" flow (App Store Guideline 5.1.1(v)). Removes the
    * identity record, frees the username, tears down both sides of every
    * friendship (and the MQTT grants that went with them), drops invites in both
-   * directions, the push token, and every live session. It also RELEASES the
-   * subscription claim: a deleted account must give its device slot back, or a
-   * user who deletes and re-creates burns through the cap on their own
-   * subscription. The subscription itself survives - it belongs to the payer,
-   * not to this key. End-to-end message content lives only on devices, so this
-   * purges the user's entire server-side footprint.
+   * directions, the push token, and every live session. End-to-end message
+   * content lives only on devices, so this purges the user's entire server-side
+   * footprint.
+   *
+   * It used to also release a subscription claim, freeing the device slot so a
+   * user who deleted and re-created did not burn through their own cap. Nothing
+   * is bound to an identity by payment any more, so there is no slot to give
+   * back — and a supporter's name is not linked to an account, so deleting an
+   * account cannot and should not remove it.
    *
    * One transaction. The Redis version could not be: it ran a pipeline, then
    * revoked sessions separately (because the session keys were only reachable
@@ -348,10 +351,6 @@ const DBImpl = {
       // to appear here is exactly the silent regression it exists to catch.
       await c.query(`DELETE FROM prekeys_medium WHERE id = $1`, [id]);
       await c.query(`DELETE FROM prekeys_onetime WHERE id = $1`, [id]);
-      // Release the subscription claim (and its device slot). The subscription
-      // record itself is deliberately untouched: it belongs to whoever paid, not
-      // to the identity being deleted.
-      await c.query(`DELETE FROM subscription_claims WHERE id = $1`, [id]);
       // Last: the identity — which frees the username AND is the only copy of
       // this account's public key the server held.
       await c.query(`DELETE FROM users WHERE id = $1`, [id]);
@@ -359,174 +358,39 @@ const DBImpl = {
   },
 
   // ============================================================
-  // 2. SUBSCRIPTION CLAIM (web purchase -> device key)
+  // 2. SUPPORTERS (donations -> recognition, and nothing else)
   // ============================================================
   //
-  // A subscription is bought on the website and claimed from the app, and the
-  // two are joined by an email address this server never stores. Stripe holds
-  // the address; here it exists only as H = sha256(lowercased email), so a dump
-  // of this database says which subscriptions exist but not whose.
+  // What stood here was the subscription claim: `subscriptions`, `otp`,
+  // `subscription_customers` and `subscription_claims`, joining a web purchase
+  // to a device key through sha256(email). All four are dropped in
+  // migrations/005_donations.sql.
   //
-  //   subscriptions           state (waiting|active|cancelled) + Stripe customer
-  //   subscription_customers  reverse index, so a webhook carrying only a
-  //                           customer id resolves without calling Stripe
-  //   subscription_claims     the identities that have claimed it (capped) —
-  //                           and, read the other way, the hot path on every
-  //                           paid-door auth
-  //   otp                     the pending code's HASH + its attempt count
-  //
-  // Devices are recorded by client id. Revoking a lapsed subscriber means
-  // editing `mqtt_acl` and kicking that client off the broker, and both address
-  // an id — which, at 64 characters, is finally short enough for the broker's
-  // admin API to accept in a URL.
-  //
-  // Entitlement lives in the claim rather than on the user row: `users`
-  // describes an identity, and an identity is not the thing that was paid for.
+  // One table replaces them, and it does far less on purpose. A donation grants
+  // nothing, so there is no entitlement to record and no device to bind. The
+  // only thing kept is the name a donor chose to be listed under — held with no
+  // customer id, no email, no hash of one, no account id and no amount, so
+  // there is nothing here to join a payment to a person.
 
-  /** Record or update a subscription's state under its email hash. `waiting` is
-   *  written when checkout completes and becomes `active` once Stripe confirms;
-   *  only an `active` one can be claimed. */
-  async setSubscription(
-    emailHash: string,
-    state: 'waiting' | 'active' | 'cancelled',
-    customerId?: string
-  ): Promise<void> {
-    await tx(async (c) => {
-      await c.query(
-        `INSERT INTO subscriptions (email_hash, state, customer_id, updated_at)
-         VALUES ($1, $2, $3, now())
-         ON CONFLICT (email_hash) DO UPDATE SET
-           state = EXCLUDED.state,
-           -- A state-only update (a customer.subscription.* webhook) carries
-           -- no customer id; it must not erase the one already recorded.
-           customer_id = COALESCE(EXCLUDED.customer_id, subscriptions.customer_id),
-           updated_at = now()`,
-        [emailHash, state, customerId ?? null]
-      );
-      if (customerId) {
-        await c.query(
-          `INSERT INTO subscription_customers (customer_id, email_hash) VALUES ($1, $2)
-           ON CONFLICT (customer_id) DO UPDATE SET email_hash = EXCLUDED.email_hash`,
-          [customerId, emailHash]
-        );
-      }
-    });
-  },
-
-  async getSubscription(emailHash: string): Promise<{ state: string; customer?: string } | null> {
-    const row = await one<{ state: string; customer_id: string | null }>(
-      `SELECT state, customer_id FROM subscriptions WHERE email_hash = $1`,
-      [emailHash]
-    );
-    if (!row) return null;
-    return { state: row.state, ...(row.customer_id ? { customer: row.customer_id } : {}) };
-  },
-
-  /** Resolve a Stripe customer back to the email hash everything else is keyed
-   *  by. Written at checkout so a `customer.subscription.*` event - which
-   *  carries a customer id and nothing else useful - costs no Stripe API call. */
-  async emailHashForCustomer(customerId: string): Promise<string | null> {
-    const row = await one<{ email_hash: string }>(
-      `SELECT email_hash FROM subscription_customers WHERE customer_id = $1`,
-      [customerId]
-    );
-    return row?.email_hash ?? null;
-  },
-
-  /** Bind a device (public key) to a subscription, up to `cap` devices.
-   *  Re-claiming a device already bound is a no-op that does NOT spend a slot,
-   *  so a repeated OTP does not lock a user out of their own subscription. */
-  async addClaimedDevice(emailHash: string, id: string, cap: number): Promise<'ok' | 'cap'> {
-    return await tx(async (c) => {
-      // Count-then-insert lets two devices race past the cap, which is why this
-      // was a Lua script. Locking the subscription row is the same guarantee
-      // without the script: concurrent claims against ONE subscription
-      // serialise here, and claims against different ones do not block at all.
-      await c.query(`SELECT 1 FROM subscriptions WHERE email_hash = $1 FOR UPDATE`, [emailHash]);
-
-      const already = await c.query(
-        `SELECT 1 FROM subscription_claims WHERE id = $1 AND email_hash = $2`,
-        [id, emailHash]
-      );
-      if (already.rowCount) return 'ok';
-
-      const { rows } = await c.query<{ n: number }>(
-        `SELECT count(*)::int AS n FROM subscription_claims WHERE email_hash = $1`,
-        [emailHash]
-      );
-      if ((rows[0]?.n ?? 0) >= cap) return 'cap';
-
-      // ON CONFLICT moves a device that was bound to a DIFFERENT subscription,
-      // which also releases the slot it held there — `SET claim:{pk} H` moved
-      // the forward pointer but left the old `sub:pks` set naming a device that
-      // had gone elsewhere.
-      await c.query(
-        `INSERT INTO subscription_claims (id, email_hash, claimed_at) VALUES ($1, $2, now())
-         ON CONFLICT (id) DO UPDATE SET email_hash = EXCLUDED.email_hash, claimed_at = now()`,
-        [id, emailHash]
-      );
-      return 'ok';
-    });
-  },
-
-  /** The subscription a device is bound to, or null. Read on every paid-door
-   *  `/auth/paid/init`, which is why it is one primary-key lookup. */
-  async emailHashForClaim(id: string): Promise<string | null> {
-    const row = await one<{ email_hash: string }>(
-      `SELECT email_hash FROM subscription_claims WHERE id = $1`,
-      [id]
-    );
-    return row?.email_hash ?? null;
-  },
-
-  async claimedDevices(emailHash: string): Promise<string[]> {
-    const res = await q<{ id: string }>(
-      `SELECT id FROM subscription_claims WHERE email_hash = $1 ORDER BY claimed_at, id`,
-      [emailHash]
-    );
-    return res.rows.map((r) => r.id);
-  },
-
-  /** Release every device bound to a subscription. Returns the ids that were
-   *  released, so the caller can also end whatever they still have open. */
-  async forgetClaimedDevices(emailHash: string): Promise<string[]> {
-    const res = await q<{ id: string }>(
-      `DELETE FROM subscription_claims WHERE email_hash = $1 RETURNING id`,
-      [emailHash]
-    );
-    return res.rows.map((r) => r.id);
-  },
-
-  /** Store the HASH of a pending OTP. One live code per address: a resend
-   *  replaces the previous one rather than leaving two valid at once, and
-   *  resets the attempt count with it. */
-  async putOtp(emailHash: string, codeHash: string, ttlSeconds: number): Promise<void> {
+  /** Record an opt-in supporter name. Idempotent: a repeat donor keeps their
+   *  original `first_seen` rather than jumping to the top of the list. */
+  async recordSupporter(displayName: string): Promise<void> {
+    const name = displayName.trim().slice(0, 60);
+    if (!name) return;
     await q(
-      `INSERT INTO otp (email_hash, code_hash, attempts, expires_at)
-       VALUES ($1, $2, 0, now() + $3::interval)
-       ON CONFLICT (email_hash) DO UPDATE SET
-         code_hash = EXCLUDED.code_hash, attempts = 0, expires_at = EXCLUDED.expires_at`,
-      [emailHash, codeHash, secs(ttlSeconds)]
+      `INSERT INTO supporters (name_key, display_name) VALUES ($1, $2)
+       ON CONFLICT (name_key) DO UPDATE SET display_name = EXCLUDED.display_name`,
+      [name.toLowerCase(), name]
     );
   },
 
-  /** Read the pending code hash and count this as an attempt, in one statement.
-   *  Null when no code is live. Counting BEFORE the comparison is what makes
-   *  brute force finite - a caller that increments only on failure can be
-   *  starved by a client that disconnects mid-request. */
-  async takeOtpAttempt(emailHash: string): Promise<{ codeHash: string; attempts: number } | null> {
-    const row = await one<{ code_hash: string; attempts: number }>(
-      `UPDATE otp SET attempts = attempts + 1
-        WHERE email_hash = $1 AND expires_at > now()
-        RETURNING code_hash, attempts`,
-      [emailHash]
+  /** The supporters page, oldest first. */
+  async listSupporters(): Promise<Array<{ name: string; since: string }>> {
+    const res = await q<{ display_name: string; first_seen: string }>(
+      `SELECT display_name, first_seen::text FROM supporters
+        ORDER BY first_seen, name_key`
     );
-    if (!row) return null;
-    return { codeHash: row.code_hash, attempts: row.attempts };
-  },
-
-  async clearOtp(emailHash: string): Promise<void> {
-    await q(`DELETE FROM otp WHERE email_hash = $1`, [emailHash]);
+    return res.rows.map((r) => ({ name: r.display_name, since: r.first_seen }));
   },
 
   /**
@@ -686,6 +550,21 @@ const DBImpl = {
     // null: a shared placeholder name is indistinguishable from a re-keyed
     // contact to the client's username-fallback detection.
     return res.rows.map((r) => ({ id: r.id, username: r.username ?? null }));
+  },
+
+  /**
+   * How many contacts an account has.
+   *
+   * A COUNT rather than `getFriendsList().length`: this runs on the invite and
+   * accept paths to enforce FRIEND_CAP, and those should not pay to marshal
+   * every row and its username just to compare a number.
+   */
+  async countFriends(myId: string): Promise<number> {
+    const row = await one<{ n: string }>(
+      `SELECT count(*)::text AS n FROM friendships WHERE id_lo = $1 OR id_hi = $1`,
+      [myId]
+    );
+    return Number(row?.n ?? 0);
   },
 
   /** Just the peers, for the ACL walks below. */

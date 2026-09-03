@@ -1,10 +1,10 @@
 // Admission, per door.
 //
-// The interesting property is not "does a subscriber get in" — it is that the
-// two doors disagree, and disagree in the right direction. The free door must
-// never refuse for want of payment (that is what makes the App Store build a
-// working app rather than a locked one), and the paid door must never admit an
-// unclaimed key (that is the paywall).
+// The interesting property used to be that the two doors disagreed: the free
+// door never refused for want of payment, and the paid door never admitted an
+// unclaimed key. There is no payment now, so what is left to pin is narrower and
+// more important — that NOTHING refuses anybody on the default policy, and that
+// `allowlist` still refuses at BOTH doors so a private server has no way in.
 //
 // ADMISSION_POLICY is read once, at module load, so each case reloads the
 // module with the policy it wants. `require` rather than a static import for
@@ -16,9 +16,7 @@ import { DB } from "../services/db/api";
 import { peerId } from "../lib/identity";
 import { pgAvailable, closePg, NEEDS_PG } from "./pg-helper";
 import { setLogLevel } from "../lib/logger";
-import { SubscriptionService, emailHash } from "../services/subscription/api";
 
-process.env.OTP_PEPPER = "test-pepper";
 setLogLevel("silent");
 
 type Admission = typeof import("../lib/admission");
@@ -35,23 +33,48 @@ function admissionUnder(policy: string, allowlist = ""): Admission {
 // commits to, and the conversion happens inside lib/admission.ts so that neither
 // an operator (who has keys) nor the schema (which has ids) has to know about
 // the other's form.
-//
-// Which means a test that plants a row has to plant it under the ID, exactly as
-// the production writers do — the same asymmetry EXEMPT_PUBLIC_KEYS and
-// `admission_exempt` have.
 const PK = "cc".repeat(64);
 const OTHER = "dd".repeat(64);
-const PK_ID = peerId(PK);
 const OTHER_ID = peerId(OTHER);
-const EMAIL = "admission@example.com";
-const CUSTOMER = "cus_test_admission";
 
-
-test("an open server admits both doors — self-hosting buys nothing", async (t) => {
+test("an open server admits both doors", async (t) => {
   if (!(await pgAvailable())) return t.skip(NEEDS_PG);
   const { checkAdmission } = admissionUnder("open");
   assert.deepEqual(await checkAdmission(PK, "free"), { ok: true });
   assert.deepEqual(await checkAdmission(PK, "paid"), { ok: true });
+});
+
+test("the full door admits a key that has never paid anything", async (t) => {
+  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
+  // The regression this exists to catch is a paywall coming back by accident —
+  // a policy value, a leftover lookup, an entitlement check reintroduced on the
+  // auth path. A brand-new key with no history anywhere must reach the full
+  // door, because that door is now the whole product.
+  const { checkAdmission } = admissionUnder("open");
+  const stranger = "ab".repeat(64);
+  assert.deepEqual(await checkAdmission(stranger, "paid"), { ok: true });
+});
+
+test("a host still set to the retired stripe policy refuses to boot", () => {
+  // "stripe" was a valid policy until the paywall was removed, and lib/admission
+  // now treats anything unrecognised as `open` — which is the right runtime
+  // behaviour and a terrible way to discover that the policy you configured no
+  // longer exists. assertConfig is what makes it loud, and it does so by exiting
+  // the process, so this has to be a child rather than an assert.throws.
+  const { spawnSync } = require("child_process") as typeof import("child_process");
+  const path = require("path") as typeof import("path");
+  const run = spawnSync(
+    process.execPath,
+    ["--import", "tsx", "-e", 'require("./lib/config").assertConfig([])'],
+    {
+      cwd: path.join(__dirname, ".."),
+      encoding: "utf8",
+      env: { ...process.env, ADMISSION_POLICY: "stripe", DATABASE_URL: "postgres://x/y" },
+    }
+  );
+  assert.equal(run.status, 1, "a retired policy must stop the boot, not be ignored");
+  assert.match(run.stderr, /ADMISSION_POLICY="stripe" is invalid/);
+  assert.match(run.stderr, /DONATIONS_ENABLED/, "and it must say what to do instead");
 });
 
 test("an allowlist server refuses an unlisted key at BOTH doors", async (t) => {
@@ -70,41 +93,12 @@ test("an allowlist server refuses an unlisted key at BOTH doors", async (t) => {
   assert.deepEqual(await checkAdmission(OTHER, "paid"), { ok: false, reason: "denied" });
 });
 
-test("on a selling server the free door never asks about payment", async (t) => {
-  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
-  const { checkAdmission } = admissionUnder("stripe");
-  await DB.forgetClaimedDevices(emailHash(EMAIL));
-  assert.deepEqual(await checkAdmission(OTHER, "free"), { ok: true });
-});
-
-test("the paid door refuses an unclaimed key and admits a claimed one", async (t) => {
-  if (!(await pgAvailable())) return t.skip(NEEDS_PG);
-  const { checkAdmission } = admissionUnder("stripe");
-  await DB.forgetClaimedDevices(emailHash(EMAIL));
-
-  assert.deepEqual(await checkAdmission(PK, "paid"), { ok: false, reason: "not_claimed" });
-
-  await SubscriptionService.recordPurchase(EMAIL, CUSTOMER);
-  // Under the id, which is what `/claim/verify` records and what revocation
-  // (an ACL edit plus a kick) can actually address.
-  await DB.addClaimedDevice(emailHash(EMAIL), PK_ID, 3);
-
-  assert.deepEqual(await checkAdmission(PK, "paid"), { ok: true });
-
-  // And it stops the moment the subscription does.
-  await DB.setSubscription(emailHash(EMAIL), "cancelled");
-  assert.deepEqual(await checkAdmission(PK, "paid"), { ok: false, reason: "not_claimed" });
-});
-
 test("an exempt key passes either door under any policy", async (t) => {
   if (!(await pgAvailable())) return t.skip(NEEDS_PG);
-  // The helper bot registers itself. It has no subscription and never will, and
-  // every new account is auto-friended to it, so a policy that shut it out would
-  // empty the first screen every user sees.
+  // The helper bot registers itself. Every new account is auto-friended to it,
+  // so a policy that shut it out would empty the first screen every user sees.
   // The bot writes its own ID here, not its key — see bot/bot.ts.
   await DB.addAdmissionExempt(OTHER_ID);
-  const { checkAdmission } = admissionUnder("stripe");
-  assert.deepEqual(await checkAdmission(OTHER, "paid"), { ok: true });
 
   const allow = admissionUnder("allowlist", PK);
   assert.deepEqual(await allow.checkAdmission(OTHER, "paid"), { ok: true });
@@ -112,7 +106,6 @@ test("an exempt key passes either door under any policy", async (t) => {
 
 test.after(async () => {
   if (await pgAvailable()) {
-    await DB.forgetClaimedDevices(emailHash(EMAIL));
     // `admission_exempt` outlives the process, so leaving OTHER in it would
     // make the allowlist case above pass for the wrong reason on the next run.
     await DB.removeAdmissionExempt(OTHER_ID);

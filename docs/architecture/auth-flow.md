@@ -15,20 +15,27 @@ with a flag:
 
 | | `/auth/free/*` | `/auth/paid/*` |
 |---|---|---|
-| Who gets in | anyone holding a key pair | only a key bound to a live subscription |
-| Refused with | — | `402 NOT_CLAIMED`, **before** the KEM encapsulation |
+| Who gets in | anyone holding a key pair | anyone holding a key pair |
+| Refused with | — | `403 NOT_ADMITTED`, on an `allowlist` server only |
 | Session scope | `free` | `premium` |
 | Can do | talk to the helper bot | everything, including adding contacts |
 
-The paid door answers before doing any work: an unclaimed key costs one
-primary-key lookup and never reaches the native HQC library. That is only safe to do because
-the free door exists — refusing at the paid door denies nobody access to the
-app, so it is a gate rather than a subscriber-status oracle bolted to the only
-way in.
+**The full door is not a paywall and its name is historical.** It used to admit
+only a key bound to a live subscription and refuse everything else with
+`402 NOT_CLAIMED` before spending an encapsulation. The product is free and
+donation-funded now, so on the default `open` policy both doors admit anyone who
+proves key possession. The wire name stays `paid` because the apps, the bot and
+every deployed server speak it, and renaming a live path buys nothing but a
+migration.
 
-The entitlement is decided once, at the door, and **stored in the session**. No
-later request re-derives it: `/friends/invite` reads one column, not the
-subscription tables and certainly not Stripe.
+The split survives the paywall because it still earns its keep: the free door is
+what a client falls back to when the full door refuses it, which is how the app
+keeps working against an `allowlist` deployment instead of failing shut. Clients
+still handle `402` on the way to that fallback — deliberately, so a current
+build works against a server that has not been updated yet.
+
+The scope is decided once, at the door, and **stored in the session**. No later
+request re-derives it.
 
 There is no door-less `/auth/init`. It was one endpoint once; anything still
 calling that path gets a 404, not a fallback.
@@ -40,16 +47,15 @@ and is nonetheless the only door that works for it.
 
 Admission is not the reason. The bot registers its own public key in
 `admission_exempt` at startup, so `checkAdmission` waves it through either door.
-The **scope** is the reason: the bot's job is accepting invites, and
-`POST /friends/accept` refuses a `free` session with 402 `PREMIUM_REQUIRED`. On
-the free door the bot would authenticate, report itself healthy, and silently
-never accept an invite again. The paid door also re-runs
-`regrantAllFriendTopics`, which is what restores the bot's conversation ACLs
-after a restart.
+The **scope** is the reason, and it still is: the free door grants only the
+bot's own topics, so a bot on the free door would authenticate, report itself
+healthy, and hold no ACL for any conversation it was supposed to join. The full
+door also re-runs `regrantAllFriendTopics`, which is what restores the bot's
+conversation ACLs after a restart.
 
 So: exemption decides *whether* a caller gets in, the door decides *what it may
-then do*, and a privileged non-paying client needs the paid door for the second
-of those.
+then do*. That was the argument when the door was a paywall and it is unchanged
+now that it is not — which is why the door survived the paywall.
 
 ## The flow
 
@@ -71,12 +77,11 @@ sequenceDiagram
     participant EMQX
     participant API as app-api<br/>(api/main.ts)
 
-    Note over App,Auth: 1 — knock on the paid door first
+    Note over App,Auth: 1 — knock on the full door first
     App->>Auth: POST /auth/paid/init { pk }
-    Auth->>PG: subscription_claims → subscriptions.state
-    alt not claimed
-        Auth-->>App: 402 NOT_CLAIMED (no encapsulation performed)
-        App->>Auth: POST /auth/free/init { pk }
+    Auth->>Auth: checkAdmission(pk, "paid")
+    alt allowlist server, key not listed
+        Auth-->>App: 403 NOT_ADMITTED (no encapsulation performed)
     end
 
     Note over App,Auth: 2 — prove possession of the private key
@@ -90,7 +95,7 @@ sequenceDiagram
 
     Note over Auth: 3 — re-check admission after the proof
     Auth->>PG: checkAdmission(pk, door)
-    Note right of Auth: a subscription can lapse inside<br/>the 60s challenge window
+    Note right of Auth: the allowlist can change inside<br/>the 60s challenge window
 
     Note over Auth,PG: 4 — mint credentials at the door's scope
     Auth->>Auth: id = sha256(hex(pk))
@@ -113,80 +118,41 @@ sequenceDiagram
     Note over App,API: everything else is REST with the session bearer
     App->>API: GET /friends, POST /username, …
     App->>API: POST /friends/invite
-    API->>API: session.scope === "premium"?  else 402 PREMIUM_REQUIRED
+    API->>API: countFriends < FRIEND_CAP?  else 409 FRIEND_LIMIT
+    API->>API: invites today < INVITES_PER_DAY?  else 429 RATE_LIMITED
 ```
 
-## Claiming a subscription
+## What replaced the paywall
 
-A subscription is bought on the website and claimed from the app. The two have
-nothing in common — one is a Stripe customer, the other an HQC key pair — so an
-email address bridges them, and a code sent to it is the only proof accepted
-that the person holding the device is the person who paid.
+Adding contacts used to require a subscription, bought on the website and bound
+to a device key by a code emailed to the buyer. That whole apparatus is gone:
+`/claim/*`, the OTP table, the device cap, `subscriptions`,
+`subscription_claims` and `subscription_customers` (dropped in
+`005_donations.sql`). The product is free and funded by donations, which grant
+nothing and are never looked up.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Web as Website<br/>(/subscribe)
-    participant Stripe
-    participant API as app-api<br/>(webhook)
-    participant PG as Postgres
-    participant Auth as auth<br/>(/claim/*)
-    participant Mail as Resend
-    participant App
+What stands in its place are **QoS caps**, on `/friends/invite` and
+`/friends/accept`:
 
-    Web->>Stripe: Checkout (Stripe collects the email)
-    Stripe->>API: checkout.session.completed
-    API->>API: H = sha256(lowercased email)
-    API->>PG: subscriptions(H) = active · subscription_customers(cus_…) = H
-    API->>Mail: "open the app and enter this address"
-    Note over API: the plaintext address is used here and discarded
+| Cap | Default | Refusal |
+|---|---|---|
+| `FRIEND_CAP` | 150 contacts | `409 FRIEND_LIMIT` |
+| `INVITES_PER_DAY` | 20 | `429 RATE_LIMITED` |
 
-    App->>Auth: POST /claim/start { email }
-    Auth->>PG: subscriptions(H) — active?
-    Auth->>PG: otp(H) = sha256(code + OTP_PEPPER), expires in 10m
-    Auth->>Mail: 6-digit code
-    Auth-->>App: 200 { ok: true }
-    Note right of Auth: identical whether or not that<br/>address bought anything
+They are ceilings for everyone rather than a gate for some. The bill is fixed
+monthly, so a user costs capacity rather than money, and what actually threatens
+the deployment is a script rather than a popular account.
 
-    App->>Auth: POST /claim/verify { email, code, pk }
-    Auth->>PG: INSERT subscription_claims (id, H) — under the device cap
-    App->>App: sign in again — the paid door now admits this key
-```
+Deliberately **not** 402: a client reads 402 as "fall back to the free door" and
+re-authenticates, so a user who merely hit a daily invite limit would tear down
+every friend topic they hold for the trouble.
 
-**The server never stores an email address.** Everything is keyed by
-`H = sha256(lowercased, trimmed email)`, so a dump of this database says which
-subscriptions exist but not whose. Stripe remains the only system holding the
-plaintext.
+One consequence worth stating on its own. `/auth/paid/init` runs an HQC
+encapsulation, and an unclaimed key used to be turned away in front of it for
+the cost of one primary-key lookup — payment was, incidentally, a CPU
+amplification defence. Nothing stands there now except `AUTH_INIT_IP_LIMIT`
+(20/min) and `AUTH_INIT_PK_LIMIT` (6/min), which is why both were lowered.
 
-**`OTP_PEPPER` is why the stored hash is worth anything.** A six-digit code has
-a million preimages; without a server-side secret in the hash, anyone reading a
-database dump inverts every pending code with a for-loop.
-
-### The test account
-
-One address short-circuits all of the above: `TEST_ACCOUNT_EMAIL`
-(`test@test.test` by default) links **any number of devices** with the fixed code
-`TEST_ACCOUNT_CODE` (`000000`), with no purchase behind it and no mail sent — the
-address is not deliverable and the code never changes. It exists because the
-claim screen is otherwise untestable without a card: App Review cannot buy a
-subscription, and a fresh preprod stack has no Stripe data in it.
-
-It lives alone in `services/subscription/test-account.ts` and touches the rest of
-the flow in exactly two places (`startClaim`, `verifyClaim`). The paid door knows
-nothing about it: the branch writes a real `subscriptions` row, so `isClaimed()`
-finds an active subscription the same way it would for a buyer.
-
-This is a **deliberate hole**, and both halves of it are in the public tree. What
-it grants is the premium *scope* and nothing more — every device still holds its
-own keypair and its own conversations — so the cost is a subscription that was
-not paid for, not a route into anyone's messages. Two things keep it honest:
-every boot with it enabled prints a config warning, and every new device that
-links this way mails `TEST_ACCOUNT_ALERT_TO`.
-
-Closing it is `TEST_ACCOUNT_EMAIL=` (empty) plus a restart. That stops new links
-only — a device bound earlier holds an ordinary claim row by then, and revoking
-it means cancelling the subscription and deleting the claims (the alert mail
-carries both statements).
 
 ## Why it is shaped like this
 
@@ -208,16 +174,15 @@ use — the refresh 401'd and the client fell back to a full handshake. Each use
 extends the idle window, with a 30-day absolute cap so a stolen bearer in
 continuous use cannot live forever.
 
-**Scope in the session needs revocation that acts.** A `premium` bearer would
-otherwise outlive a cancelled subscription by up to its 30-day cap, which is not
-a refund policy. `sessions.id` indexes live bearers so the cancellation webhook
-can end them, alongside `EMQX.kick` and the friend-topic revocation.
+**Revocation still has to act, even though nothing revokes for payment now.**
+`sessions.id` indexes live bearers so an account deletion or an unfriend can end
+them immediately, alongside `EMQX.kick` and the friend-topic revocation. The
+cancellation webhook that used the same machinery is gone — a lapsed donation
+removes no access, because it granted none.
 
-**A lapse revokes topics but never deletes anything.** Friendships and message
-history survive; `regrantAllFriendTopics` puts the ACL back on the next paid
-login. The free door deliberately does *not* revoke — a client that landed there
-because a database read blipped would otherwise tear down every conversation it
-has.
+**The free door deliberately does not revoke topics.** A client that landed
+there because a database read blipped would otherwise tear down every
+conversation it has and rebuild them on the next full-door login.
 
 **Expiry is enforced by the broker, not by politeness.** `/mqtt/authn` hands EMQX
 the token's `expire_at`, and EMQX disconnects the client when it lapses.
@@ -231,26 +196,26 @@ top for the MQTT leg.
 | Component | Trusted with | Not trusted with |
 |---|---|---|
 | `AuthService.swift` | the private key, in the Keychain behind biometrics | — |
-| `auth/main.ts` | minting scoped tokens, admission, mailing claim codes | reading messages (it never sees one), talking to Stripe |
-| `api/main.ts` | the friend graph, the Stripe webhook, the paywall | anything about a session it did not resolve |
-| Postgres | token *hashes*, the challenge, the ACL, claim state | plaintext tokens, private keys, email addresses |
-| Stripe | the customer's email and card | the crypto identity — no public key is ever sent |
+| `auth/main.ts` | minting scoped tokens, admission | reading messages (it never sees one), talking to Stripe, sending mail — it does none of these |
+| `api/main.ts` | the friend graph, the QoS caps, the Stripe webhook | anything about a session it did not resolve |
+| Postgres | token *hashes*, the challenge, the ACL | plaintext tokens, private keys, **email addresses in any form — not even a hash** |
+| Stripe | the donor's email and card | the crypto identity, and any link to an account — no public key, id or hash is ever sent |
 | EMQX | enforcing authn/authz per packet | decrypting payloads |
 
 ## Failure modes worth recognising
 
 | Symptom | Usually means |
 |---|---|
-| `/auth/paid/init` returns 402 `NOT_CLAIMED` | no live subscription for this key — the client falls back to the free door, which is a normal signed-in state |
 | `/auth/*/init` returns 403 `NOT_ADMITTED` | an allowlist server that does not want this key. Retrying the other door asks the same question |
-| `/friends/invite` returns 402 `PREMIUM_REQUIRED` | a free session. The user must claim a subscription, then sign in again |
-| The subscribe button 302s and the browser does nothing | the page's CSP `form-action` does not permit the redirect target. It is enforced across redirects, so a cross-origin 302 out of a form POST needs the destination listed — see `CHECKOUT_ORIGIN` in `services/web/subscribe.ts`. The server log looks perfectly healthy |
-| The app reports "Couldn't reach the server (404)" on a claim | the client built the URL from the `/auth` prefix. `/claim/*` is served BY the auth service but mounted at the ROOT by nginx, so `/auth/claim/start` is a 404. `ServerConfig.claimBaseURL` is the origin for exactly this reason |
-| `/claim/start` returns 200 but no code arrives | either that address bought nothing, or mail is failing. The response cannot tell you which — check the server log, which can |
-| `/claim/verify` returns `NO_CODE` after wrong guesses | the code was burned at 5 attempts. Request a new one |
+| `/auth/paid/init` returns 402 | nothing produces this any more. A client still falls back to the free door on it, so an out-of-date server that still has the paywall keeps working |
+| The service exits at boot on `ADMISSION_POLICY="stripe" is invalid` | that policy was removed with the paywall. Use `open` and set `DONATIONS_ENABLED=1`. It refuses rather than falling back on purpose — silently ignoring a configured policy is worse |
+| `/friends/invite` returns 409 `FRIEND_LIMIT` | the account is at `FRIEND_CAP` (150). On accept, it may be the *other* side that is full — the body carries `peer: true` when so |
+| `/friends/invite` returns 429 `RATE_LIMITED` | more than `INVITES_PER_DAY` (20) invites in 24h |
+| The donate button 302s and the browser does nothing | the page's CSP `form-action` does not permit the redirect target. It is enforced across redirects, so a cross-origin 302 out of a form POST needs the destination listed — see `CHECKOUT_ORIGIN` in `services/web/donate.ts`. The server log looks perfectly healthy |
+| A donation completes but no name appears on `/supporters` | expected when the optional name field was left blank — recognition is opt-in and a blank one stores nothing at all |
 | CONNACK returns code 5 (not authorised) | the MQTT token expired or was already consumed — refresh and reconnect |
 | `/auth/verify` returns 401 | the challenge expired (60 s) or the device holds the wrong key for that identity |
 | `/auth/refresh` returns 401 | the session lapsed — a full handshake is needed, and the user sees a prompt |
 | `/auth/init` returns 404, on repeat, from a service | that caller predates the two-door split and was never moved. There is no un-doored init path; pick `/auth/free/*` or `/auth/paid/*` by the scope the caller needs |
 | A service authenticates fine, then 402s on every write | it authenticated through the free door but needs `premium`. The door, not the admission exemption, is what to change |
-| Premium user suddenly cannot message friends | the subscription lapsed and the webhook revoked the topics. Resubscribing restores them on the next paid login |
+| A user suddenly cannot message friends | not a billing problem — nothing revokes for payment any more. Check the ACL and the broker: an unfriend, an account deletion, or an `mqtt_acl` row that never landed |
